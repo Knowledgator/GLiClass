@@ -1,4 +1,5 @@
 import torch
+from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from .model import GLiClassModel
@@ -36,10 +37,15 @@ class ZeroShotClassificationPipeline():
         input_text = ''.join(input_text)+text
         return input_text
 
-    def prepare_inputs(self, texts, labels):
+    def prepare_inputs(self, texts, labels, same_labels = False):
         inputs = []
-        for text, labels_ in zip(texts, labels):
-            inputs.append(self.prepare_input(text, labels_))
+        
+        if same_labels:
+            for text in texts:
+                inputs.append(self.prepare_input(text, labels))
+        else:
+            for text, labels_ in zip(texts, labels):
+                inputs.append(self.prepare_input(text, labels_))
         
         tokenized_inputs = self.tokenizer(inputs, truncation=True, 
                                             max_length=self.max_length, 
@@ -48,34 +54,44 @@ class ZeroShotClassificationPipeline():
         return tokenized_inputs
     
     @torch.no_grad()
-    def __call__(self, texts, labels, threshold = 0.5):
+    def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
         if isinstance(texts, str):
             texts = [texts]
         if isinstance(labels[0], str):
-            labels = [labels]
-
-        tokenized_inputs = self.prepare_inputs(texts, labels)
-        model_output = self.model(**tokenized_inputs)
-        logits = model_output.logits
-
-        print(logits)
-        results = []
-        if self.classification_type == 'single-label':
-            for i in range(len(texts)):
-                score = torch.softmax(logits[i], dim=-1)
-                pred_label = labels[i][torch.argmax(score).item()]
-                results.append([{'label': pred_label, 'score': score.max().item()}])
-        elif self.classification_type == 'multi-label':
-            sigmoid = torch.nn.Sigmoid()
-            probs = sigmoid(logits)
-            for i in range(len(texts)):
-                text_results = []
-                for j, prob in enumerate(probs[i]):
-                    score = prob.item()
-                    if score>threshold:
-                        text_results.append({'label': labels[i][j], 'score': score})
-                results.append(text_results)
+            same_labels = True
         else:
-            raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
+            same_labels = False
+
+        results = []
+        for idx in tqdm(range(0, len(texts), batch_size)):
+            batch_texts = texts[idx:idx+batch_size]
+            tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
+            model_output = self.model(**tokenized_inputs)
+            logits = model_output.logits
+            if self.classification_type == 'single-label':
+                for i in range(len(batch_texts)):
+                    score = torch.softmax(logits[i], dim=-1)
+                    if same_labels:
+                        curr_labels = labels
+                    else:
+                        curr_labels = labels[i]
+                    pred_label = curr_labels[torch.argmax(score).item()]
+                    results.append([{'label': pred_label, 'score': score.max().item()}])
+            elif self.classification_type == 'multi-label':
+                sigmoid = torch.nn.Sigmoid()
+                probs = sigmoid(logits)
+                for i in range(len(batch_texts)):
+                    text_results = []
+                    if same_labels:
+                        curr_labels = labels
+                    else:
+                        curr_labels = labels[i]
+                    for j, prob in enumerate(probs[i]):
+                        score = prob.item()
+                        if score>threshold:
+                            text_results.append({'label': curr_labels[j], 'score': score})
+                    results.append(text_results)
+            else:
+                raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
         
         return results
