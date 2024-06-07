@@ -87,7 +87,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.scorer = SCORER2OBJECT[config.scorer_type](config.hidden_size)
 
         if config.use_lstm:
-            self.lstm = LstmSeq2SeqEncoder(config.hidden_size, config.hidden_size, bidirectional=True)
+            self.lstm = LstmSeq2SeqEncoder(config.hidden_size, config.hidden_size, bidirectional=False)
         
         drop_out = getattr(config.encoder_config, "cls_dropout", None)
         drop_out = self.config.encoder_config.hidden_dropout_prob if drop_out is None else drop_out

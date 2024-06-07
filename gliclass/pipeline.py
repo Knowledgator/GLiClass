@@ -49,7 +49,7 @@ class ZeroShotClassificationPipeline():
         
         tokenized_inputs = self.tokenizer(inputs, truncation=True, 
                                             max_length=self.max_length, 
-                                                    padding="max_length", return_tensors="pt").to(self.device)
+                                                    padding="longest", return_tensors="pt").to(self.device)
 
         return tokenized_inputs
     
