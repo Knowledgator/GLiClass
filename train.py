@@ -9,72 +9,22 @@ from transformers import AutoTokenizer, AutoConfig
 
 import random
 import torch
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 
 
 from gliclass import GLiClassModelConfig, GLiClassModel
 from gliclass.training import TrainingArguments, Trainer
+from gliclass.data_processing import DataCollatorWithPadding
 
-def pad_2d_tensor(key_data):
-    """
-    Pad a list of 2D tensors to have the same size along both dimensions.
-    
-    :param key_data: List of 2D tensors to pad.
-    :return: Tensor of padded tensors stacked along a new batch dimension.
-    """
-    if not key_data:
-        raise ValueError("The input list 'key_data' should not be empty.")
+def prepare_labels(example, label2idx, problem_type):
+    if problem_type == 'single_label_classification':
+        labels = label2idx[example['true_labels'][0]]
+    elif problem_type == 'multi_label_classification':
+        labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
+    else:
+        raise NotImplementedError(f"{problem_type} is not implemented.")
+    return torch.tensor(labels)
 
-    # Determine the maximum size along both dimensions
-    max_rows = max(tensor.shape[0] for tensor in key_data)
-    max_cols = max(tensor.shape[1] for tensor in key_data)
-    
-    tensors = []
-
-    for tensor in key_data:
-        rows, cols = tensor.shape
-        row_padding = max_rows - rows
-        col_padding = max_cols - cols
-
-        # Pad the tensor along both dimensions
-        padded_tensor = torch.nn.functional.pad(tensor, (0, col_padding, 0, row_padding),
-                                                                 mode='constant', value=0)
-        tensors.append(padded_tensor)
-
-    # Stack the tensors into a single tensor along a new batch dimension
-    padded_tensors = torch.stack(tensors)
-
-    return padded_tensors
-
-class DataCollatorWithPadding:
-    def __init__(self, device = 'cuda:0'):
-        self.device = device
-
-    def __call__(self, batch):
-        keys = batch[0].keys()
-        padded_batch = {key: [] for key in keys}
-        
-        for key in keys:
-            key_data = [item[key] for item in batch]
-            
-            if isinstance(key_data[0], torch.Tensor):
-                if  key_data[0].dim() == 1:
-                    padded_batch[key] = pad_sequence(key_data, batch_first=True)
-                elif key_data[0].dim() == 2: # span_idx case
-                    padded_batch[key] = pad_2d_tensor(key_data)
-            elif isinstance(key_data[0], list):
-                max_length = max(len(seq) for seq in key_data)
-                padded_batch[key] = torch.tensor([seq + [0] * (max_length - len(seq)) 
-                                                    for seq in key_data])
-            elif type(key_data[0]) in {int, float}:
-                padded_batch[key] = torch.tensor(key_data)
-            else:
-                raise TypeError(f"Unsupported data type: {type(key_data[0])}")
-        
-        return padded_batch
-
-    
 def tokenize_and_prepare_labels_for_uniencoder(example, tokenizer, max_length, problem_type='multi_label_classification'):
     input_text = []
     random.shuffle(example['all_labels'])
@@ -88,14 +38,26 @@ def tokenize_and_prepare_labels_for_uniencoder(example, tokenizer, max_length, p
     label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
 
     tokenized_inputs = tokenizer(input_text, truncation=True, max_length=max_length, padding="max_length")
+    tokenized_inputs['labels'] = prepare_labels(example, label2idx, problem_type)
+    return tokenized_inputs
 
-    if problem_type == 'single_label_classification':
-        labels = label2idx[example['true_labels'][0]]
-    elif problem_type == 'multi_label_classification':
-        labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
-    else:
-        raise NotImplementedError(f"{problem_type} is not implemented.")
-    tokenized_inputs["labels"] = torch.tensor(labels)
+def tokenize_and_prepare_labels_for_encoder_decoder(example, tokenizer, max_length, problem_type='multi_label_classification'):
+    class_texts = []
+    random.shuffle(example['all_labels'])
+    random.shuffle(example['true_labels'])
+    for label in example['all_labels']:
+        label_tag = f"<<LABEL>>{label}"
+        class_texts.append(label_tag)
+    class_texts.append('<<SEP>>')
+    class_texts = ''.join(class_texts)
+
+    label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
+
+    tokenized_inputs = tokenizer(example['text'], truncation=True, max_length=max_length, padding="max_length")
+    tokenized_classes = tokenizer(class_texts, truncation=True, max_length=max_length, padding="longest")
+    tokenized_inputs["class_input_ids"] = tokenized_classes["input_ids"]
+    tokenized_inputs["class_attention_mask"] = tokenized_classes["attention_mask"]   
+    tokenized_inputs['labels'] = prepare_labels(example, label2idx, problem_type)
     return tokenized_inputs
 
 def tokenize_and_prepare_labels_for_biencoder(example, tokenizer, max_length, problem_type='multi_label_classification'):
@@ -111,15 +73,7 @@ def tokenize_and_prepare_labels_for_biencoder(example, tokenizer, max_length, pr
     label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
 
     tokenized_inputs['labels_mask'] = torch.ones(len(class_texts))
-    
-    if problem_type == 'single_label_classification':
-        labels = label2idx[example['true_labels'][0]]
-    elif problem_type == 'multi_label_classification':
-        labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
-    else:
-        raise NotImplementedError(f"{problem_type} is not implemented.")
-    
-    tokenized_inputs["labels"] = torch.tensor(labels)
+    tokenized_inputs['labels'] = prepare_labels(example, label2idx, problem_type)
     return tokenized_inputs
 
 class GLiClassDataset(Dataset):
@@ -139,6 +93,8 @@ class GLiClassDataset(Dataset):
 
         if self.architecture_type == 'uni-encoder':
             model_inputs = tokenize_and_prepare_labels_for_uniencoder(example, self.tokenizer, self.max_length, self.problem_type)
+        elif self.architecture_type == 'encoder-decoder':
+            model_inputs = tokenize_and_prepare_labels_for_encoder_decoder(example, self.tokenizer, self.max_length, self.problem_type)
         elif self.architecture_type == 'bi-encoder':
             model_inputs = tokenize_and_prepare_labels_for_biencoder(example, self.tokenizer, self.max_length, self.problem_type)
         else:
@@ -176,22 +132,22 @@ def compute_metrics(p):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default= None)
-    parser.add_argument('--encoder_model_name', type=str, default = 'MoritzLaurer/deberta-v3-base-zeroshot-v2.0-c')#BAAI/bge-small-en-v1.5')
-    parser.add_argument('--save_path', type=str, default = 'models/gliclass/deberta_new_base')
+    parser.add_argument('--encoder_model_name', type=str, default = 'google/flan-t5-small')
+    parser.add_argument('--save_path', type=str, default = 'models/gliclass/t5_small')
     parser.add_argument('--data_path', type=str, default = '../data/zero-cats.json')
     parser.add_argument('--problem_type', type=str, default='multi_label_classification')
-    parser.add_argument('--pooler_type', type=str, default='avg')
+    parser.add_argument('--pooler_type', type=str, default='first')
     parser.add_argument('--scorer_type', type=str, default='simple')
-    parser.add_argument('--architecture_type', type=str, default='uni-encoder')
+    parser.add_argument('--architecture_type', type=str, default='encoder-decoder')
     parser.add_argument('--normalize_features', type=bool, default=False)
-    parser.add_argument('--extract_text_features', type=bool, default=True)
+    parser.add_argument('--extract_text_features', type=bool, default=False)
     parser.add_argument('--use_lstm', type=bool, default=False)
     parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=16)
-    parser.add_argument('--encoder_lr', type=float, default=1e-5)
+    parser.add_argument('--encoder_lr', type=float, default=2e-5)
     parser.add_argument('--others_lr', type=float, default=3e-5)
-    parser.add_argument('--encoder_weight_decay', type=float, default=0.1)
-    parser.add_argument('--others_weight_decay', type=float, default=0.1)
+    parser.add_argument('--encoder_weight_decay', type=float, default=0.01)
+    parser.add_argument('--others_weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--lr_scheduler_type', type=str, default='cosine')
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
@@ -199,7 +155,7 @@ if __name__ == '__main__':
     parser.add_argument('--contrastive_loss_coef', type=float, default=0.5)
     parser.add_argument('--max_length', type=int, default=512)
     parser.add_argument('--save_steps', type=int, default=1000)
-    parser.add_argument('--save_total_limit', type=int, default=5)
+    parser.add_argument('--save_total_limit', type=int, default=10)
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)
     args = parser.parse_args()
@@ -233,7 +189,7 @@ if __name__ == '__main__':
         glicalss_config.problem_type = args.problem_type
         model = GLiClassModel(glicalss_config, from_pretrained=True)
 
-        if args.architecture_type=='uni-encoder':
+        if args.architecture_type in  {'uni-encoder', 'encoder-decoder'}:
             new_words = ["<<LABEL>>", "<<SEP>>"]
             tokenizer.add_tokens(new_words)
             model.resize_token_embeddings(len(tokenizer))

@@ -79,7 +79,12 @@ class GLiClassBaseModel(nn.Module):#):
             self.lstm = LstmSeq2SeqEncoder(config.hidden_size, config.hidden_size//2, bidirectional=True)
         
         drop_out = getattr(config.encoder_config, "cls_dropout", None)
-        drop_out = self.config.encoder_config.hidden_dropout_prob if drop_out is None else drop_out
+        if drop_out is None:
+            if hasattr(self.config.encoder_config, 'hidden_dropout_prob'):
+                drop_out = self.config.encoder_config.hidden_dropout_prob 
+            elif hasattr(self.config.encoder_config, 'dropout_rate'):
+                drop_out = self.config.encoder_config.dropout_rate
+
         self.dropout = StableDropout(drop_out)
         
         self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value))
@@ -144,6 +149,127 @@ class GLiClassBaseModel(nn.Module):#):
             text_tokens_mask = attention_mask
         return classes_embedding, classes_embedding_mask, text_tokens_embeddings, text_tokens_mask
 
+    def get_loss(self, logits, labels, classes_embedding=None, classes_embedding_mask=None):
+        loss = None
+        if labels is not None:
+            if self.config.problem_type is None:
+                if self.num_labels == 1:
+                    # regression task
+                    loss_fn = nn.MSELoss()
+                    logits = logits.view(-1).to(labels.dtype)
+                    loss = loss_fn(logits, labels.view(-1))
+                elif labels.dim() == 1 or labels.size(-1) == 1:
+                    label_index = (labels >= 0).nonzero()
+                    labels = labels.long()
+                    if label_index.size(0) > 0:
+                        labeled_logits = torch.gather(
+                            logits, 0, label_index.expand(label_index.size(0), logits.size(1))
+                        )
+                        labels = torch.gather(labels, 0, label_index.view(-1))
+                        loss_fct = nn.CrossEntropyLoss()
+                        loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
+                    else:
+                        loss = torch.tensor(0).to(logits)
+                else:
+                    log_softmax = nn.LogSoftmax(-1)
+                    loss = -((log_softmax(logits) * labels).sum(-1)).mean()
+            elif self.config.problem_type == "regression":
+                loss_fct = nn.MSELoss()
+                if self.num_labels == 1:
+                    loss = loss_fct(logits.squeeze(), labels.squeeze())
+                else:
+                    loss = loss_fct(logits, labels)
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
+            elif self.config.problem_type == "multi_label_classification":
+                all_losses = focal_loss_with_logits(logits, labels, 
+                                    self.config.focal_loss_alpha, self.config.focal_loss_gamma)
+                if classes_embedding_mask is not None:
+                    all_losses = all_losses * classes_embedding_mask.float()
+                loss = all_losses.mean()
+
+            if self.config.contrastive_loss_coef>0 and classes_embedding is not None:
+                contrastive_loss = sequence_contrastive_loss(classes_embedding, classes_embedding_mask)
+                loss = loss+contrastive_loss*self.config.contrastive_loss_coef
+        return loss
+    
+class GLiClassUniEncoder(GLiClassBaseModel):
+    def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
+        super().__init__(config)
+        if config.encoder_config is None:
+            if config.encoder_model_name is None:
+                raise ValueError("You need to specify encoder model name to use it as a backbone.")
+            config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
+        if from_pretrained:
+            self.encoder_model = AutoModel.from_pretrained(
+                config.encoder_model_name
+            )
+        else:
+            self.encoder_model = AutoModel.from_config(
+                config.encoder_config
+            )
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs
+    ) -> Union[Tuple, SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.encoder_model(
+            input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs
+        )
+
+        encoder_layer = outputs[0]
+
+        classes_embedding, classes_embedding_mask, text_token_embeddongs, text_mask = self._extract_class_features(encoder_layer, 
+                                                                                                            input_ids, attention_mask)
+        if self.config.use_lstm:
+            text_token_embeddongs = self.lstm(text_token_embeddongs, text_mask)
+        
+        pooled_output = self.pooler(text_token_embeddongs)
+        pooled_output = self.text_projector(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        if self.config.normalize_features:
+            pooled_output = pooled_output / (pooled_output.norm(p=2, dim=-1, keepdim=True)+self.epsilon)
+
+        classes_embedding = self.classes_projector(classes_embedding)
+        if self.config.normalize_features:
+            classes_embedding = classes_embedding / (classes_embedding.norm(p=2, dim=-1, keepdim=True)+self.epsilon)
+
+        logits = self.scorer(pooled_output, classes_embedding)
+
+        if self.config.normalize_features:
+            logits = logits*self.logit_scale.to(classes_embedding.device)
+        
+        loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+        )
 
 class GLiClassUniEncoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
@@ -212,47 +338,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         if self.config.normalize_features:
             logits = logits*self.logit_scale.to(classes_embedding.device)
         
-        loss = None
-        if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    # regression task
-                    loss_fn = nn.MSELoss()
-                    logits = logits.view(-1).to(labels.dtype)
-                    loss = loss_fn(logits, labels.view(-1))
-                elif labels.dim() == 1 or labels.size(-1) == 1:
-                    label_index = (labels >= 0).nonzero()
-                    labels = labels.long()
-                    if label_index.size(0) > 0:
-                        labeled_logits = torch.gather(
-                            logits, 0, label_index.expand(label_index.size(0), logits.size(1))
-                        )
-                        labels = torch.gather(labels, 0, label_index.view(-1))
-                        loss_fct = nn.CrossEntropyLoss()
-                        loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
-                    else:
-                        loss = torch.tensor(0).to(logits)
-                else:
-                    log_softmax = nn.LogSoftmax(-1)
-                    loss = -((log_softmax(logits) * labels).sum(-1)).mean()
-            elif self.config.problem_type == "regression":
-                loss_fct = nn.MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                all_losses = focal_loss_with_logits(logits, labels, 
-                                    self.config.focal_loss_alpha, self.config.focal_loss_gamma)
-                all_losses = all_losses * classes_embedding_mask.float()
-                loss = all_losses.mean()
-
-            if self.config.contrastive_loss_coef>0:
-                contrastive_loss = sequence_contrastive_loss(classes_embedding, classes_embedding_mask)
-                loss = loss+contrastive_loss*self.config.contrastive_loss_coef
+        loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -261,7 +347,95 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         return SequenceClassifierOutput(
             loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
         )
+    
 
+class GLiClassEncoderDecoder(GLiClassBaseModel):
+    def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
+        super().__init__(config)
+        if config.encoder_config is None:
+            if config.encoder_model_name is None:
+                raise ValueError("You need to specify encoder model name to use it as a backbone.")
+            config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
+
+        if not config.encoder_config.is_encoder_decoder:
+            raise ValueError("You need to choose encoder-decoder model as a backbone.")
+        
+        if from_pretrained:
+            self.encoder_decoder_model = AutoModel.from_pretrained(
+                config.encoder_model_name
+            )
+        else:
+            self.encoder_decoder_model = AutoModel.from_config(
+                config.encoder_config
+            )
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        class_input_ids: Optional[torch.Tensor] = None,
+        class_attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+        **kwargs
+    ) -> Union[Tuple, SequenceClassifierOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        outputs = self.encoder_decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            decoder_input_ids=class_input_ids,
+            decoder_attention_mask=class_attention_mask,
+            inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs
+        )
+
+        text_token_embeddongs = outputs.encoder_last_hidden_state
+
+        decoder_token_embeddings = outputs.last_hidden_state
+
+        classes_embedding, classes_embedding_mask, _, _ = self._extract_class_features(decoder_token_embeddings, 
+                                                                                class_input_ids, class_attention_mask)
+        if self.config.use_lstm:
+            text_token_embeddongs = self.lstm(text_token_embeddongs, attention_mask)
+        
+        pooled_output = self.pooler(text_token_embeddongs)
+        pooled_output = self.text_projector(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        if self.config.normalize_features:
+            pooled_output = nn.functional.normalize(pooled_output, p=2, dim=-1, eps=self.epsilon)
+
+        classes_embedding = self.classes_projector(classes_embedding)
+        if self.config.normalize_features:
+            classes_embedding = nn.functional.normalize(classes_embedding, p=2, dim=-1, eps=self.epsilon)
+
+        logits = self.scorer(pooled_output, classes_embedding)
+
+        if self.config.normalize_features:
+            logits = logits*self.logit_scale.to(classes_embedding.device)
+        
+        loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return SequenceClassifierOutput(
+            loss=loss, logits=logits, hidden_states=outputs.encoder_last_hidden_state, attentions=outputs.encoder_attentions
+        )
+    
 class GLiClassBiEncoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
         super().__init__(config)
@@ -321,43 +495,8 @@ class GLiClassBiEncoder(GLiClassBaseModel):
         if labels_mask is not None: 
             logits = torch.where(labels_mask == 0, -1e3, logits)
 
-        loss = None
-        if labels is not None:
-            if self.config.problem_type is None:
-                if self.num_labels == 1:
-                    # regression task
-                    loss_fn = nn.MSELoss()
-                    logits = logits.view(-1).to(labels.dtype)
-                    loss = loss_fn(logits, labels.view(-1))
-                elif labels.dim() == 1 or labels.size(-1) == 1:
-                    label_index = (labels >= 0).nonzero()
-                    labels = labels.long()
-                    if label_index.size(0) > 0:
-                        labeled_logits = torch.gather(
-                            logits, 0, label_index.expand(label_index.size(0), logits.size(1))
-                        )
-                        labels = torch.gather(labels, 0, label_index.view(-1))
-                        loss_fct = nn.CrossEntropyLoss()
-                        loss = loss_fct(labeled_logits.view(-1, self.num_labels).float(), labels.view(-1))
-                    else:
-                        loss = torch.tensor(0).to(logits)
-                else:
-                    log_softmax = nn.LogSoftmax(-1)
-                    loss = -((log_softmax(logits) * labels).sum(-1)).mean()
-            elif self.config.problem_type == "regression":
-                loss_fct = nn.MSELoss()
-                if self.num_labels == 1:
-                    loss = loss_fct(logits.squeeze(), labels.squeeze())
-                else:
-                    loss = loss_fct(logits, labels)
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
-            elif self.config.problem_type == "multi_label_classification":
-                all_losses = focal_loss_with_logits(logits, labels, 
-                                    self.config.focal_loss_alpha, self.config.focal_loss_gamma)
-                all_losses = all_losses
-                loss = all_losses.mean()
+        loss = self.get_loss(logits, labels, classes_embedding_mask=labels_mask)
+
         if not return_dict:
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
@@ -373,11 +512,15 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.model = GLiClassUniEncoder(config, from_pretrained)
         elif config.architecture_type == 'bi-encoder':
             self.model = GLiClassBiEncoder(config, from_pretrained)
+        elif config.architecture_type == 'encoder-decoder':
+            self.model = GLiClassEncoderDecoder(config, from_pretrained)
         self.post_init()
 
     def get_input_embeddings(self):
         if self.config.architecture_type == 'uni-encoder':
             return self.model.encoder_model.get_input_embeddings()
+        elif self.config.architecture_type == 'encoder-decoder':
+            return self.model.encoder_decoder_model.get_input_embeddings()
         else:
             raise NotImplementedError('Getting input embeddings is not implemented for bi-encoder architecture')
         
@@ -385,27 +528,31 @@ class GLiClassModel(GLiClassPreTrainedModel):
         if self.config.architecture_type == 'uni-encoder':
             self.model.encoder_model.set_input_embeddings(value)
             return None
+        elif self.config.architecture_type == 'encoder-decoder':
+            self.model.encoder_decoder_model.set_input_embeddings(value)
         else:
             raise NotImplementedError('Setting input embeddings is not implemented for bi-encoder architecture')
         
     def tie_weights(self):
         if self.config.architecture_type == 'uni-encoder':
             return self.model.encoder_model.tie_weights()
+        elif self.config.architecture_type == 'encoder-decoder':
+            return self.model.encoder_decoder_model.tie_weights()
         else:
             pass
             # raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
-        
 
     def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
         if self.config.architecture_type == 'uni-encoder':
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-            # update vocab size
-            self.config.encoder_config.vocab_size = model_embeds.num_embeddings
-            self.config.vocab_size = model_embeds.num_embeddings
-            self.vocab_size = model_embeds.num_embeddings
-            return model_embeds
+        elif self.config.architecture_type == 'encoder-decoder':
+            model_embeds = self.model.encoder_decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError('Resizing is not implemented for bi-encoder architecture')
+        self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+        self.config.vocab_size = model_embeds.num_embeddings
+        self.vocab_size = model_embeds.num_embeddings
+        return model_embeds
     
     def forward(self, *args, **kwargs):
         outputs = self.model(*args, **kwargs)
