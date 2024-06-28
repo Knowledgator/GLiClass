@@ -64,4 +64,14 @@ class SimpleScorer(nn.Module):
         scores = torch.einsum('BD,BCD->BC', text_rep, label_rep)
         return scores
     
+# class SimpleScorer(nn.Module):
+#     def __init__(self, hidden_size):
+#         super().__init__()
+#         self.fc = nn.Linear(hidden_size, 1)
+
+#     def forward(self, text_rep, label_rep):
+#         # dot product with einsum
+#         scores = self.fc(label_rep).squeeze(-1)
+#         return scores
+    
 SCORER2OBJECT = {"weighted-dot": ScorerWeightedDot, 'dot': ScorerDot, 'simple': SimpleScorer}

@@ -7,7 +7,7 @@ from gliclass import GLiClassModel, ZeroShotClassificationPipeline
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-model_path = "models/gliclass/deberta_small/checkpoint-40000"
+model_path = "models/gliclass/deberta_small/checkpoint-35000"
 model = GLiClassModel.from_pretrained(model_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
@@ -71,7 +71,8 @@ def classification(
 
     results = pipeline(text, labels, threshold=threshold)[0] #because we have one text
     
-    predicts = '\n'.join([f"{result['label']} => {result['score']}" for result in results])
+    predicts = {result['label']:float(result['score']) for result in results}
+    # predicts = '\n'.join([f"{result['label']} => {result['score']}" for result in results])
     return predicts
 
 
@@ -134,7 +135,7 @@ for result in results:
             info="Allow for multi-label classification?",
             scale=0,
         )
-    output = gr.TextArea(label="Output")
+    output = gr.Label(label="Output", color="#4b5563")
     submit_btn = gr.Button("Submit")
     examples = gr.Examples(
         examples,

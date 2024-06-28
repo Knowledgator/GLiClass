@@ -6,10 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+#custom
 models/
 wandb/
 gradio_cached_examples/
 test.ipynb
+demo1.py
 
 # Distribution / packaging
 .Python

@@ -173,3 +173,54 @@ class StableDropout(nn.Module):
             return ctx
         else:
             return self.drop_prob
+
+class SelfAttentionBlock(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, mask=None):
+        attn_output, _ = self.self_attn(x, x, x, attn_mask=mask)
+        return self.norm(x + self.dropout(attn_output))
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, d_model, num_heads, dropout=0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, query, key, value, mask=None):
+        attn_output, _ = self.cross_attn(query, key, value, attn_mask=mask)
+        return self.norm(query + self.dropout(attn_output))
+
+class Fuser(nn.Module):
+    def __init__(self, d_model, num_heads, num_layers, dropout=0.1):
+        super().__init__()
+        self.d_model = d_model
+        self.layers = nn.ModuleList([
+            nn.ModuleList([
+                SelfAttentionBlock(d_model, num_heads, dropout),
+                CrossAttentionBlock(d_model, num_heads, dropout)
+            ])
+            for _ in range(num_layers)
+        ])
+        self.fc = nn.Linear(d_model, d_model)
+
+    def forward(self, query, key, query_mask=None, key_mask=None):
+        if query_mask is not None and key_mask is not None:
+            self_attn_mask = query_mask.unsqueeze(1) * query_mask.unsqueeze(2)
+            cross_attn_mask = query_mask.unsqueeze(-1) * key_mask.unsqueeze(1)
+        else:
+            self_attn_mask = None
+            cross_attn_mask = None
+
+        value = self.fc(key)
+
+        for self_attn, cross_attn in self.layers:
+            query = self_attn(query, mask=self_attn_mask)
+            query = cross_attn(query, key, value, mask=cross_attn_mask)
+
+        return query
