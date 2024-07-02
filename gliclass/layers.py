@@ -224,3 +224,46 @@ class Fuser(nn.Module):
             query = cross_attn(query, key, value, mask=cross_attn_mask)
 
         return query
+
+class LayerwiseAttention(nn.Module):
+    def __init__(self, num_layers, hidden_size, output_size=None):
+        super().__init__()
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.output_size = output_size if output_size is not None else hidden_size
+        
+        # Squeeze operation
+        self.squeeze = nn.Linear(hidden_size, 1)
+        
+        # Excitation operation
+        self.W1 = nn.Linear(num_layers, num_layers // 2)
+        self.W2 = nn.Linear(num_layers // 2, num_layers)
+        
+        # Final projection
+        self.output_projection = nn.Linear(self.hidden_size, self.output_size)
+        
+    def forward(self, encoder_outputs):
+        # encoder_outputs is a list of tensors, each of shape [B, L, D]
+        B, L, D = encoder_outputs[0].shape
+        
+        # Concatenate all layers
+        U = torch.stack(encoder_outputs, dim=1)  # [B, K, L, D]
+        
+        # Squeeze operation
+        Z = self.squeeze(U).squeeze(-1)  # [B, K, L]
+        Z = Z.mean(dim=2)  # [B, K]
+        
+        # Excitation operation
+        s = self.W2(F.relu(self.W1(Z)))  # [B, K]
+        s = torch.sigmoid(s)  # [B, K]
+        
+        # Apply attention weights
+        U_weighted = U * s.unsqueeze(-1).unsqueeze(-1)  # [B, K, L, D]
+        
+        # Sum across layers
+        U_sum = U_weighted.sum(dim=1)  # [B, L, D]
+        
+        # Final projection
+        output = self.output_projection(U_sum)  # [B, L, output_size]
+        
+        return output

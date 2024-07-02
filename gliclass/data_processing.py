@@ -1,5 +1,120 @@
+import random
 import torch
 from torch.nn.utils.rnn import pad_sequence
+from torch.utils.data import Dataset
+
+
+class GLiClassDataset(Dataset):
+    def __init__(self, examples, tokenizer, max_length=512, 
+                            problem_type='multi_label_classification', 
+                            architecture_type = 'uni-encoder',
+                            prompt_first=False,
+                            get_negatives = False,
+                            max_labels = 50):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self._data = examples
+        self.problem_type = problem_type
+        self.architecture_type = architecture_type
+        self.prompt_first = prompt_first
+        self.dataset_labels = self.collect_dataset_labels()
+        self.get_negatives = get_negatives
+        self.max_labels = max_labels
+        print('Total labels: ', len(self.dataset_labels))
+
+    def collect_dataset_labels(self):
+        dataset_labels = set()
+        for example in self._data:
+            dataset_labels.update(set(example['all_labels']))
+        return dataset_labels
+    
+    def prepare_labels(self, example, label2idx, problem_type):
+        if problem_type == 'single_label_classification':
+            labels = label2idx[example['true_labels'][0]]
+        elif problem_type == 'multi_label_classification':
+            labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
+        else:
+            raise NotImplementedError(f"{problem_type} is not implemented.")
+        return torch.tensor(labels)
+
+    def prepare_prompt(self, example):
+        prompt_texts = []
+        for label in example['all_labels']:
+            label_tag = f"<<LABEL>>{str(label)}"
+            prompt_texts.append(label_tag)
+        prompt_texts.append('<<SEP>>')
+        return prompt_texts
+    
+    def tokenize(self, texts):
+        tokenized_inputs = self.tokenizer(texts, truncation=True, max_length=self.max_length, padding="longest")
+        return tokenized_inputs
+    
+    def tokenize_and_prepare_labels_for_uniencoder(self, example):
+        random.shuffle(example['all_labels'])
+        random.shuffle(example['true_labels'])
+        input_text = self.prepare_prompt(example)
+        if self.prompt_first:
+            input_text = ''.join(input_text)+str(example['text'])
+        else:
+            input_text = str(example['text'])+''.join(input_text)
+        label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
+
+        tokenized_inputs = self.tokenize(input_text)
+        tokenized_inputs['labels'] = self.prepare_labels(example, label2idx, self.problem_type)
+        return tokenized_inputs
+
+    def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
+        random.shuffle(example['all_labels'])
+        random.shuffle(example['true_labels'])
+        class_texts = self.prepare_prompt(example)
+        class_texts = ''.join(class_texts)
+
+        label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
+
+        tokenized_inputs = self.tokenize(example['text'])
+        tokenized_classes = self.tokenize(class_texts)
+        tokenized_inputs["class_input_ids"] = tokenized_classes["input_ids"]
+        tokenized_inputs["class_attention_mask"] = tokenized_classes["attention_mask"]   
+        tokenized_inputs['labels'] = self.prepare_labels(example, label2idx, self.problem_type)
+        return tokenized_inputs
+
+    def tokenize_and_prepare_labels_for_biencoder(self, example):
+        input_text = example['text']
+        class_texts = example['all_labels']
+
+        tokenized_inputs = self.tokenize(input_text)
+        tokenized_classes = self.tokenize(class_texts)
+
+        tokenized_inputs["class_input_ids"] = tokenized_classes["input_ids"]
+        tokenized_inputs["class_attention_mask"] = tokenized_classes["attention_mask"]
+
+        label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
+
+        tokenized_inputs['labels_mask'] = torch.ones(len(class_texts))
+        tokenized_inputs['labels'] = self.prepare_labels(example, label2idx, self.problem_type)
+        return tokenized_inputs
+
+    def __len__(self):
+        return len(self._data)
+
+    def __getitem__(self, idx):
+        example = self._data[idx]
+
+        if self.get_negatives and random.randint(0, 1):
+            max_negatives = max(self.max_labels-len(example['all_labels']), 1)
+            new_negatives = random.sample(self.dataset_labels, k=random.randint(1, max_negatives))
+            example['all_labels'].extend(new_negatives)
+
+        if self.architecture_type == 'uni-encoder':
+            model_inputs = self.tokenize_and_prepare_labels_for_uniencoder(example)
+        elif self.architecture_type in {'encoder-decoder', 'bi-encoder'}:
+            model_inputs = self.tokenize_and_prepare_labels_for_encoder_decoder(example)
+        elif self.architecture_type == 'bi-encoder':
+            model_inputs = self.tokenize_and_prepare_labels_for_biencoder(example)
+        else:
+            raise NotImplementedError('This architecture type is not implemented.')
+        return model_inputs
+    
 
 def pad_2d_tensor(key_data):
     """

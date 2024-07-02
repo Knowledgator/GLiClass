@@ -85,7 +85,10 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
             label_tag = f"<<LABEL>>{label.lower()}"
             input_text.append(label_tag)
         input_text.append('<<SEP>>')
-        input_text = ''.join(input_text)+text
+        if self.model.config.prompt_first:
+            input_text = ''.join(input_text)+text
+        else:
+            input_text = text+''.join(input_text)
         return input_text
 
     def prepare_inputs(self, texts, labels, same_labels = False):
@@ -190,15 +193,17 @@ class ZeroShotClassificationPipeline:
         if model.config.architecture_type == 'uni-encoder':
             self.pipe = UniEncoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
                                                                     max_length, classification_type, device)
-        if model.config.architecture_type == 'encoder-decoder':
+        elif model.config.architecture_type in {'encoder-decoder'}:
             self.pipe = EncoderDecoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
                                                                     max_length, classification_type, device)
-        if model.config.architecture_type == 'bi-encoder':
+        elif model.config.architecture_type == 'bi-encoder':
             self.pipe = BiEncoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
                                                                     max_length, classification_type, device)
-
+        else:
+            raise NotImplementedError("This artchitecture is not implemented")
+        
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
-        results = self.pipe(texts, labels, threshold = 0.5, batch_size=8)
+        results = self.pipe(texts, labels, threshold = threshold, batch_size=batch_size)
         return results
     
 class ZeroShotClassificationWithLabelsChunkingPipeline(BaseZeroShotClassificationPipeline):

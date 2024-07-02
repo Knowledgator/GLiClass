@@ -11,7 +11,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.utils import (logging)
 from transformers.models.auto import AutoModel
 from .config import GLiClassModelConfig
-from .layers import FeaturesProjector, LstmSeq2SeqEncoder, StableDropout
+from .layers import FeaturesProjector, LstmSeq2SeqEncoder, StableDropout, LayerwiseAttention
 from .poolings import POOLING2OBJECT
 from .scorers import SCORER2OBJECT
 from .loss_functions import focal_loss_with_logits, sequence_contrastive_loss
@@ -78,6 +78,10 @@ class GLiClassBaseModel(nn.Module):#):
         if config.use_lstm:
             self.lstm = LstmSeq2SeqEncoder(config.hidden_size, config.hidden_size//2, bidirectional=True)
         
+        if config.squeeze_layers:
+            self.layer_wise_attention = LayerwiseAttention(config.encoder_config.num_hidden_layers,
+                                                           config.encoder_config.hidden_size)
+            
         drop_out = getattr(config.encoder_config, "cls_dropout", None)
         if drop_out is None:
             if hasattr(self.config.encoder_config, 'hidden_dropout_prob'):
@@ -229,6 +233,10 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if self.config.squeeze_layers:
+            output_hidden_states = True
+            return_dict = True
+
         outputs = self.encoder_model(
             input_ids,
             attention_mask=attention_mask,
@@ -239,7 +247,10 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             **kwargs
         )
 
-        encoder_layer = outputs[0]
+        if self.config.squeeze_layers:
+            encoder_layer = self.layer_wise_attention(outputs.hidden_states)
+        else:
+            encoder_layer = outputs[0]
 
         classes_embedding, classes_embedding_mask, text_token_embeddongs, text_mask = self._extract_class_features(encoder_layer, 
                                                                                                             input_ids, attention_mask)
@@ -401,13 +412,11 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
             return_dict=return_dict,
             **kwargs
         )
-
         text_token_embeddongs = outputs.encoder_last_hidden_state
-
         decoder_token_embeddings = outputs.last_hidden_state
-
         classes_embedding, classes_embedding_mask, _, _ = self._extract_class_features(decoder_token_embeddings, 
                                                                                 class_input_ids, class_attention_mask)
+        
         if self.config.use_lstm:
             text_token_embeddongs = self.lstm(text_token_embeddongs, attention_mask)
         
@@ -435,7 +444,7 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
         return SequenceClassifierOutput(
             loss=loss, logits=logits, hidden_states=outputs.encoder_last_hidden_state, attentions=outputs.encoder_attentions
         )
-    
+ 
 class GLiClassBiEncoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
         super().__init__(config)
@@ -517,7 +526,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self):
-        if self.config.architecture_type == 'uni-encoder':
+        if self.config.architecture_type in {'uni-encoder'}:
             return self.model.encoder_model.get_input_embeddings()
         elif self.config.architecture_type == 'encoder-decoder':
             return self.model.encoder_decoder_model.get_input_embeddings()
@@ -525,28 +534,36 @@ class GLiClassModel(GLiClassPreTrainedModel):
             raise NotImplementedError('Getting input embeddings is not implemented for bi-encoder architecture')
         
     def set_input_embeddings(self, value):
-        if self.config.architecture_type == 'uni-encoder':
+        if self.config.architecture_type in {'uni-encoder'}:
             self.model.encoder_model.set_input_embeddings(value)
             return None
         elif self.config.architecture_type == 'encoder-decoder':
             self.model.encoder_decoder_model.set_input_embeddings(value)
+        elif self.config.architecture_type == 'bi-encoder':
+            self.model.text_encoder.set_input_embeddings(value)
+            self.model.class_encoder.set_input_embeddings(value)
         else:
             raise NotImplementedError('Setting input embeddings is not implemented for bi-encoder architecture')
         
     def tie_weights(self):
-        if self.config.architecture_type == 'uni-encoder':
+        if self.config.architecture_type in {'uni-encoder'}:
             return self.model.encoder_model.tie_weights()
         elif self.config.architecture_type == 'encoder-decoder':
             return self.model.encoder_decoder_model.tie_weights()
+        elif self.config.architecture_type == 'bi-encoder':
+            self.model.class_encoder.tie_weights()
+            return self.model.text_encoder.tie_weights()
         else:
-            pass
-            # raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
+            raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
 
     def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
-        if self.config.architecture_type == 'uni-encoder':
+        if self.config.architecture_type in {'uni-encoder', 'bi-encoder'}:
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         elif self.config.architecture_type == 'encoder-decoder':
             model_embeds = self.model.encoder_decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        elif self.config.architecture_type == 'bi-encoder':
+            _ = self.model.class_encoder.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+            model_embeds = self.model.text_encoder.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError('Resizing is not implemented for bi-encoder architecture')
         self.config.encoder_config.vocab_size = model_embeds.num_embeddings

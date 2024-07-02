@@ -32,6 +32,8 @@ class GLiClassModelConfig(PretrainedConfig):
         extract_text_features=False,
         contrastive_loss_coef=0,
         architecture_type = 'uni-encoder',
+        prompt_first = False,
+        squeeze_layers = False,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -80,5 +82,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.normalize_features=normalize_features
         self.extract_text_features = extract_text_features
         self.architecture_type = architecture_type
+        self.prompt_first = prompt_first
+        self.squeeze_layers = squeeze_layers
         super().__init__(**kwargs)
 
