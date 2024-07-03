@@ -7,12 +7,12 @@ from gliclass import GLiClassModel, ZeroShotClassificationPipeline
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-model_path = "models/gliclass/deberta_small/checkpoint-40000"
+model_path = "models/gliclass/deberta_base/checkpoint-3000"
 model = GLiClassModel.from_pretrained(model_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
 
-pipeline = ZeroShotClassificationPipeline(model, tokenizer, classification_type='single-label', device=device)
+pipeline = ZeroShotClassificationPipeline(model, tokenizer, classification_type='multi-label', device='cuda')
 
 text1 = """
 "I recently purchased the Sony WH-1000XM4 Wireless Noise-Canceling Headphones from Amazon and I must say, I'm thoroughly impressed. The package arrived in New York within 2 days, thanks to Amazon Prime's expedited shipping.
@@ -65,13 +65,14 @@ def classification(
 ) -> str:
     labels = labels.split(",")
     if multi_label:
-        pipeline.classification_type = 'multi-label'
+        pipeline.pipe.classification_type = 'multi-label'
     else:
-        pipeline.classification_type = 'single-label'
+        pipeline.pipe.classification_type = 'single-label'
 
     results = pipeline(text, labels, threshold=threshold)[0] #because we have one text
     
-    predicts = '\n'.join([f"{result['label']} => {result['score']}" for result in results])
+    predicts = {result['label']:float(result['score']) for result in results}
+    # predicts = '\n'.join([f"{result['label']} => {result['score']}" for result in results])
     return predicts
 
 
@@ -134,7 +135,7 @@ for result in results:
             info="Allow for multi-label classification?",
             scale=0,
         )
-    output = gr.TextArea(label="Output")
+    output = gr.Label(label="Output", color="#4b5563")
     submit_btn = gr.Button("Submit")
     examples = gr.Examples(
         examples,

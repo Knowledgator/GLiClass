@@ -14,6 +14,7 @@ class GLiClassModelConfig(PretrainedConfig):
         encoder_config = None,
         encoder_model=None,
         class_token_index = -1,
+        text_token_index = -1,
         ignore_index=-100,
         hidden_size=None,
         projector_hidden_act="gelu",
@@ -24,6 +25,15 @@ class GLiClassModelConfig(PretrainedConfig):
         initializer_range=0.03,
         scorer_type='simple',
         pooling_strategy='first',
+        focal_loss_alpha=0.5,
+        focal_loss_gamma=2,
+        logit_scale_init_value=2.6592,
+        normalize_features=False,
+        extract_text_features=False,
+        contrastive_loss_coef=0,
+        architecture_type = 'uni-encoder',
+        prompt_first = False,
+        squeeze_layers = False,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -51,6 +61,11 @@ class GLiClassModelConfig(PretrainedConfig):
             self.class_token_index = vocab_size
         else:
             self.class_token_index = class_token_index
+        
+        if text_token_index == -1:
+            self.text_token_index = vocab_size+1
+        else:
+            self.text_token_index = text_token_index
 
         self.ignore_index = ignore_index
         self.projector_hidden_act = projector_hidden_act
@@ -60,5 +75,14 @@ class GLiClassModelConfig(PretrainedConfig):
         self.scorer_type = scorer_type
         self.pooling_strategy=pooling_strategy
         self.use_lstm = use_lstm
+        self.focal_loss_alpha=focal_loss_alpha
+        self.focal_loss_gamma=focal_loss_gamma
+        self.contrastive_loss_coef=contrastive_loss_coef
+        self.logit_scale_init_value = logit_scale_init_value
+        self.normalize_features=normalize_features
+        self.extract_text_features = extract_text_features
+        self.architecture_type = architecture_type
+        self.prompt_first = prompt_first
+        self.squeeze_layers = squeeze_layers
         super().__init__(**kwargs)
 
