@@ -14,8 +14,8 @@ pip install gliclass
 from gliclass import GLiClassModel, ZeroShotClassificationPipeline
 from transformers import AutoTokenizer
 
-model = GLiClassModel.from_pretrained("knowledgator/gliclass-small-v1")
-tokenizer = AutoTokenizer.from_pretrained("knowledgator/gliclass-small-v1")
+model = GLiClassModel.from_pretrained("knowledgator/gliclass-small-v1.0")
+tokenizer = AutoTokenizer.from_pretrained("knowledgator/gliclass-small-v1.0")
 
 pipeline = ZeroShotClassificationPipeline(model, tokenizer, classification_type='multi-label', device='cuda:0')
 
