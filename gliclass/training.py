@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple, Dict, List, Union, Any
 
 from dataclasses import dataclass, field
 import torch
@@ -68,7 +68,62 @@ class Trainer(transformers.Trainer):
             print(f"Skipping iteration due to error: {e}")
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
-            return torch.tensor(0.0, requires_grad=True).to(model.device) 
+            return torch.tensor(0.0, requires_grad=True).to(model.device)
+        
+    def prediction_step(
+        self,
+        model: torch.nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        Perform an evaluation step on model using inputs.
+        Subclass and override to inject custom behavior.
+        Args:
+            model (nn.Module):
+                The model to evaluate.
+            inputs (Dict[str, Union[torch.Tensor, Any]]):
+                The inputs and targets of the model.
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument labels. Check your model's documentation for all accepted arguments.
+            prediction_loss_only (bool):
+                Whether or not to return the loss only.
+            ignore_keys (List[str], *optional*):
+                A list of keys in the output of your model (if it is a dictionary) that should be ignored when
+                gathering predictions.
+        Return:
+            Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
+            logits and labels (each being optional).
+        """
+        try:
+            with torch.no_grad():
+                loss = None
+                with self.compute_loss_context_manager():
+                    try:
+                        outputs = model(**inputs)
+                    except Exception as e:
+                        raise RuntimeError(f"Error during model forward pass: {str(e)}")
+
+                if not hasattr(outputs, 'loss'):
+                    raise AttributeError("Model output does not contain 'loss' attribute")
+                loss = outputs.loss
+
+                if not hasattr(outputs, 'logits'):
+                    raise AttributeError("Model output does not contain 'logits' attribute")
+                logits = outputs.logits
+
+                if 'labels' not in inputs:
+                    raise KeyError("'labels' not found in input dictionary")
+                labels = inputs['labels']
+
+            if prediction_loss_only:
+                return (loss, None, None)
+            return (loss, logits, labels)
+
+        except Exception as e:
+            print(f"An error occurred during prediction step: {str(e)}")
+            return (None, None, None)
         
     def create_optimizer(self):
         """
