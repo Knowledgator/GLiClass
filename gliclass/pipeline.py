@@ -1,5 +1,6 @@
 import torch
 from tqdm import tqdm
+import numpy as np
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
 
@@ -30,6 +31,36 @@ class BaseZeroShotClassificationPipeline(ABC):
     def prepare_inputs(self, texts, labels, same_labels = False):
         pass
     
+    @torch.no_grad()
+    def get_embeddings(self, texts, labels, batch_size=8):
+        if isinstance(texts, str):
+            texts = [texts]
+        if isinstance(labels[0], str):
+            same_labels = True
+        else:
+            same_labels = False
+        
+        results = []
+        for idx in tqdm(range(0, len(texts), batch_size)):
+            batch_texts = texts[idx:idx+batch_size]
+            tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
+            model_output = self.model(**tokenized_inputs, output_text_embeddings=True,
+                                    output_class_embeddings=True)
+            logits = model_output.logits
+            text_embeddings = model_output.text_embeddings
+            class_embeddings = model_output.class_embeddings
+            batch_size = logits.shape[0]
+            
+            for i in range(batch_size):
+                result = {
+                    'logits': logits[i].cpu().numpy(),
+                    'text_embedding': text_embeddings[i].cpu().numpy(),
+                    'class_embeddings': class_embeddings[i].cpu().numpy()
+                }
+                results.append(result)
+        
+        return results
+
     @torch.no_grad()
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
         if isinstance(texts, str):
@@ -201,7 +232,11 @@ class ZeroShotClassificationPipeline:
                                                                     max_length, classification_type, device)
         else:
             raise NotImplementedError("This artchitecture is not implemented")
-        
+    
+    def get_embeddings(self, *args, **kwargs):
+        results = self.pipe.get_embeddings(*args, **kwargs)
+        return results
+    
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
         results = self.pipe(texts, labels, threshold = threshold, batch_size=batch_size)
         return results
