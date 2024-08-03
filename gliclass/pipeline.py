@@ -1,11 +1,7 @@
 import torch
-from tqdm import tqdm
-import numpy as np
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
-
 from .model import GLiClassModel, GLiClassBiEncoder
-from .config import GLiClassModelConfig
 
 class BaseZeroShotClassificationPipeline(ABC):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
@@ -41,7 +37,7 @@ class BaseZeroShotClassificationPipeline(ABC):
             same_labels = False
         
         results = []
-        for idx in tqdm(range(0, len(texts), batch_size)):
+        for idx in range(0, len(texts), batch_size):
             batch_texts = texts[idx:idx+batch_size]
             tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
             model_output = self.model(**tokenized_inputs, output_text_embeddings=True,
@@ -71,7 +67,7 @@ class BaseZeroShotClassificationPipeline(ABC):
             same_labels = False
             
         results = []
-        for idx in tqdm(range(0, len(texts), batch_size)):
+        for idx in range(0, len(texts), batch_size):
             batch_texts = texts[idx:idx+batch_size]
 
             tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
@@ -276,7 +272,7 @@ class ZeroShotClassificationWithLabelsChunkingPipeline(BaseZeroShotClassificatio
     @torch.no_grad()
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8, labels_chunk_size=4): #labels - List[str]            
         results = []
-        for idx in tqdm(range(0, len(texts), batch_size)):
+        for idx in range(0, len(texts), batch_size):
             batch_texts = texts[idx:idx+batch_size]
 
             batch_results = []
