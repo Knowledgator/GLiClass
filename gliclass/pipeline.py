@@ -2,7 +2,6 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
-
 from .model import GLiClassModel, GLiClassBiEncoder
 
 class BaseZeroShotClassificationPipeline(ABC):
