@@ -281,9 +281,14 @@ class ZeroShotClassificationWithLabelsChunkingPipeline(BaseZeroShotClassificatio
         return tokenized_inputs
     
     @torch.no_grad()
-    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, labels_chunk_size=4): #labels - List[str]            
+    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, labels_chunk_size=4): #labels - List[str]
         results = []
-        for idx in range(0, len(texts), batch_size):
+
+        iterable = range(0, len(texts), batch_size)
+        if self.progress_bar:
+            iterable = tqdm(iterable)
+
+        for idx in iterable:
             batch_texts = texts[idx:idx+batch_size]
 
             batch_results = []
