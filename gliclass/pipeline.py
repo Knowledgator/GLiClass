@@ -1,5 +1,5 @@
 import torch
-import tqdm
+from tqdm import tqdm
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
 from .model import GLiClassModel, GLiClassBiEncoder
