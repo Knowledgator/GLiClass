@@ -76,7 +76,7 @@ def main(args):
 
         if args.architecture_type in  {'uni-encoder', 'bi-encoder', 'encoder-decoder'}:
             new_words = ["<<LABEL>>", "<<SEP>>"]
-            tokenizer.add_tokens(new_words)
+            tokenizer.add_tokens(new_words, special_tokens=True)
             model.resize_token_embeddings(len(tokenizer))
 
     model.to(device)
