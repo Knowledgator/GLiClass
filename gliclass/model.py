@@ -1,3 +1,6 @@
+import os
+import warnings
+from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -15,10 +18,28 @@ from .layers import FeaturesProjector, LstmSeq2SeqEncoder, StableDropout, Layerw
 from .poolings import POOLING2OBJECT
 from .scorers import SCORER2OBJECT
 from .loss_functions import focal_loss_with_logits, sequence_contrastive_loss
+from .utils import is_module_available, MissedPackageException
+
+IS_LLM2VEC = is_module_available('llm2vec')
+IS_PEFT = is_module_available('peft')
 
 logger = logging.get_logger(__name__)
 
-@dataclass
+if IS_LLM2VEC:
+    from llm2vec.models import MistralBiModel, LlamaBiModel, GemmaBiModel, Qwen2BiModel
+    DECODER_MODEL_MAPPING = {
+        "MistralConfig": MistralBiModel,
+        "LlamaConfig": LlamaBiModel,
+        "GemmaConfig": GemmaBiModel,
+        "Qwen2Config": Qwen2BiModel
+    }
+else:
+    DECODER_MODEL_MAPPING = {}
+
+if IS_PEFT:
+    from peft import LoraConfig, get_peft_model
+
+    @dataclass
 class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: Optional[torch.Tensor] = None
     class_embeddings: Optional[torch.Tensor] = None
@@ -92,8 +113,11 @@ class GLiClassBaseModel(nn.Module):#):
                 drop_out = self.config.encoder_config.hidden_dropout_prob 
             elif hasattr(self.config.encoder_config, 'dropout_rate'):
                 drop_out = self.config.encoder_config.dropout_rate
+            else:
+                drop_out = 0.15
+        # self.dropout = StableDropout(drop_out)
+        self.dropout = nn.Dropout(drop_out)
 
-        self.dropout = StableDropout(drop_out)
         
         self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value))
 
@@ -109,6 +133,7 @@ class GLiClassBaseModel(nn.Module):#):
         num_class_tokens = torch.sum(class_token_mask, dim=-1, keepdim=True)
 
         max_embed_dim = num_class_tokens.max()
+                
         aranged_class_idx = torch.arange(max_embed_dim, 
                                             dtype=attention_mask.dtype, 
                                             device=token_embeds.device).expand(batch_size, -1)
@@ -209,15 +234,41 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             if config.encoder_model_name is None:
                 raise ValueError("You need to specify encoder model name to use it as a backbone.")
             config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
+
+        config_name = config.encoder_config.__class__.__name__
+
+        if config_name in DECODER_MODEL_MAPPING:
+            if not IS_LLM2VEC:
+                raise MissedPackageException(f"The llm2vec package must be installed to use this decoder model: {config_name}")
+            else:
+                print('Loading decoder model using LLM2Vec...')
+                ModelClass = DECODER_MODEL_MAPPING[config_name]
+            decoder = True
+        else:
+            decoder = False
+            ModelClass = AutoModel
+
         if from_pretrained:
-            self.encoder_model = AutoModel.from_pretrained(
+            self.encoder_model = ModelClass.from_pretrained(
                 config.encoder_model_name
             )
         else:
-            self.encoder_model = AutoModel.from_config(
-                config.encoder_config
-            )
-    
+            if decoder:
+                self.encoder_model = ModelClass(config.encoder_config)
+            else:
+                self.encoder_model = ModelClass.from_config(
+                    config.encoder_config
+                )
+
+        adapter_config_file = Path(config.encoder_model_name) / "adapter_config.json"
+
+        if adapter_config_file.exists():
+            if not IS_PEFT:
+                warnings.warn(f"Adapter configs were detected, if you want to apply them you need to install peft package.")
+            else:
+                adapter_config = LoraConfig.from_pretrained(config.encoder_model_name)
+                self.encoder_model = get_peft_model(self.encoder_model, adapter_config)
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -292,89 +343,6 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             class_embeddings= classes_embedding if output_class_embeddings else None,
         )
 
-class GLiClassUniEncoder(GLiClassBaseModel):
-    def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
-        super().__init__(config)
-        if config.encoder_config is None:
-            if config.encoder_model_name is None:
-                raise ValueError("You need to specify encoder model name to use it as a backbone.")
-            config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
-        if from_pretrained:
-            self.encoder_model = AutoModel.from_pretrained(
-                config.encoder_model_name
-            )
-        else:
-            self.encoder_model = AutoModel.from_config(
-                config.encoder_config
-            )
-    
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_text_embeddings: Optional[bool] = None,
-        output_class_embeddings:  Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs
-    ) -> Union[Tuple, GLiClassOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        outputs = self.encoder_model(
-            input_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs
-        )
-
-        encoder_layer = outputs[0]
-
-        classes_embedding, classes_embedding_mask, text_token_embeddongs, text_mask = self._extract_class_features(encoder_layer, 
-                                                                                                            input_ids, attention_mask)
-        if self.config.use_lstm:
-            text_token_embeddongs = self.lstm(text_token_embeddongs, text_mask)
-        
-        pooled_output = self.pooler(text_token_embeddongs)
-        pooled_output = self.text_projector(pooled_output)
-        pooled_output = self.dropout(pooled_output)
-        if self.config.normalize_features:
-            pooled_output = pooled_output / (pooled_output.norm(p=2, dim=-1, keepdim=True)+self.epsilon)
-
-        classes_embedding = self.classes_projector(classes_embedding)
-        if self.config.normalize_features:
-            classes_embedding = classes_embedding / (classes_embedding.norm(p=2, dim=-1, keepdim=True)+self.epsilon)
-
-        logits = self.scorer(pooled_output, classes_embedding)
-
-        if self.config.normalize_features:
-            logits = logits*self.logit_scale.to(classes_embedding.device)
-        
-        loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
-
-        if not return_dict:
-            output = (logits,) + outputs[1:]
-            return ((loss,) + output) if loss is not None else output
-
-        return GLiClassOutput(
-            loss=loss, logits=logits, 
-            hidden_states=outputs.hidden_states, 
-            attentions=outputs.attentions,
-            text_embeddings= pooled_output if output_text_embeddings else None,
-            class_embeddings= classes_embedding if output_class_embeddings else None,
-        )
-    
 
 class GLiClassEncoderDecoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
