@@ -2,13 +2,11 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
-
 from .model import GLiClassModel, GLiClassBiEncoder
-from .config import GLiClassModelConfig
 
 class BaseZeroShotClassificationPipeline(ABC):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
-                                classification_type='multi-label', device='cuda:0'):
+                                classification_type='multi-label', device='cuda:0', progress_bar=True):
         self.model = model
         if isinstance(tokenizer, str):
             self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
@@ -17,6 +15,7 @@ class BaseZeroShotClassificationPipeline(ABC):
         self.max_classes = max_classes
         self.classification_type = classification_type
         self.max_length = max_length
+        self.progress_bar = progress_bar
 
         if torch.cuda.is_available() and 'cuda' in device:
             self.device = torch.device(device)
@@ -31,6 +30,41 @@ class BaseZeroShotClassificationPipeline(ABC):
         pass
     
     @torch.no_grad()
+    def get_embeddings(self, texts, labels, batch_size=8):
+        if isinstance(texts, str):
+            texts = [texts]
+        if isinstance(labels[0], str):
+            same_labels = True
+        else:
+            same_labels = False
+        
+        results = []
+
+        iterable = range(0, len(texts), batch_size)
+        if self.progress_bar:
+            iterable = tqdm(iterable)
+
+        for idx in iterable:
+            batch_texts = texts[idx:idx+batch_size]
+            tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
+            model_output = self.model(**tokenized_inputs, output_text_embeddings=True,
+                                    output_class_embeddings=True)
+            logits = model_output.logits
+            text_embeddings = model_output.text_embeddings
+            class_embeddings = model_output.class_embeddings
+            batch_size = logits.shape[0]
+            
+            for i in range(batch_size):
+                result = {
+                    'logits': logits[i].cpu().numpy(),
+                    'text_embedding': text_embeddings[i].cpu().numpy(),
+                    'class_embeddings': class_embeddings[i].cpu().numpy()
+                }
+                results.append(result)
+        
+        return results
+
+    @torch.no_grad()
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
         if isinstance(texts, str):
             texts = [texts]
@@ -40,9 +74,13 @@ class BaseZeroShotClassificationPipeline(ABC):
             same_labels = False
             
         results = []
-        for idx in tqdm(range(0, len(texts), batch_size)):
-            batch_texts = texts[idx:idx+batch_size]
 
+        iterable = range(0, len(texts), batch_size)
+        if self.progress_bar:
+            iterable = tqdm(iterable)
+
+        for idx in iterable:
+            batch_texts = texts[idx:idx+batch_size]
             tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
             model_output = self.model(**tokenized_inputs)
             logits = model_output.logits
@@ -76,8 +114,8 @@ class BaseZeroShotClassificationPipeline(ABC):
     
 class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
-                                classification_type='multi-label', device='cuda:0'):
-        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device)
+                                classification_type='multi-label', device='cuda:0', progress_bar=True):
+        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device, progress_bar)
 
     def prepare_input(self, text, labels):
         input_text = []
@@ -109,8 +147,8 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
 
 class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
-                                classification_type='multi-label', device='cuda:0'):
-        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device)
+                                classification_type='multi-label', device='cuda:0', progress_bar=True):
+        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device, progress_bar)
 
     def prepare_labels_prompt(self, labels):
         input_text = []
@@ -144,8 +182,8 @@ class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPip
     
 class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
-                                classification_type='multi-label', device='cuda:0'):
-        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device)
+                                classification_type='multi-label', device='cuda:0', progress_bar=True):
+        super().__init__(model, tokenizer, max_classes, max_length, classification_type, device, progress_bar)
 
     def prepare_inputs(self, texts, labels, same_labels=False):
         if same_labels:
@@ -187,21 +225,25 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
 
 class ZeroShotClassificationPipeline:
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
-                                classification_type='multi-label', device='cuda:0'):
+                                classification_type='multi-label', device='cuda:0', progress_bar=True):
         if isinstance(model, str):
             model = GLiClassBiEncoder.from_pretrained(model)
         if model.config.architecture_type == 'uni-encoder':
             self.pipe = UniEncoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
-                                                                    max_length, classification_type, device)
+                                                                    max_length, classification_type, device, progress_bar)
         elif model.config.architecture_type in {'encoder-decoder'}:
             self.pipe = EncoderDecoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
-                                                                    max_length, classification_type, device)
+                                                                    max_length, classification_type, device, progress_bar)
         elif model.config.architecture_type == 'bi-encoder':
             self.pipe = BiEncoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
-                                                                    max_length, classification_type, device)
+                                                                    max_length, classification_type, device, progress_bar)
         else:
             raise NotImplementedError("This artchitecture is not implemented")
-        
+    
+    def get_embeddings(self, *args, **kwargs):
+        results = self.pipe.get_embeddings(*args, **kwargs)
+        return results
+    
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
         results = self.pipe(texts, labels, threshold = threshold, batch_size=batch_size)
         return results
@@ -239,9 +281,14 @@ class ZeroShotClassificationWithLabelsChunkingPipeline(BaseZeroShotClassificatio
         return tokenized_inputs
     
     @torch.no_grad()
-    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, labels_chunk_size=4): #labels - List[str]            
+    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, labels_chunk_size=4): #labels - List[str]
         results = []
-        for idx in tqdm(range(0, len(texts), batch_size)):
+
+        iterable = range(0, len(texts), batch_size)
+        if self.progress_bar:
+            iterable = tqdm(iterable)
+
+        for idx in iterable:
             batch_texts = texts[idx:idx+batch_size]
 
             batch_results = []

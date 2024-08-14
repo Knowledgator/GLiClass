@@ -39,6 +39,11 @@ else:
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
 
+    @dataclass
+class GLiClassOutput(SequenceClassifierOutput):
+    text_embeddings: Optional[torch.Tensor] = None
+    class_embeddings: Optional[torch.Tensor] = None
+
 class GLiClassPreTrainedModel(PreTrainedModel):
     config_class = GLiClassModelConfig
     base_model_prefix = "model"
@@ -272,9 +277,11 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_text_embeddings: Optional[bool] = None,
+        output_class_embeddings:  Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs
-    ) -> Union[Tuple, SequenceClassifierOutput]:
+    ) -> Union[Tuple, GLiClassOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
@@ -328,9 +335,14 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return SequenceClassifierOutput(
-            loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
+        return GLiClassOutput(
+            loss=loss, logits=logits, 
+            hidden_states=outputs.hidden_states, 
+            attentions=outputs.attentions,
+            text_embeddings= pooled_output if output_text_embeddings else None,
+            class_embeddings= classes_embedding if output_class_embeddings else None,
         )
+
 
 class GLiClassEncoderDecoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
@@ -362,6 +374,8 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
         labels: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
+        output_text_embeddings: Optional[bool] = None,
+        output_class_embeddings:  Optional[bool] = None,
         return_dict: Optional[bool] = True,
         **kwargs
     ) -> Union[Tuple, SequenceClassifierOutput]:
@@ -413,8 +427,12 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
             output = (logits,) + outputs[1:]
             return ((loss,) + output) if loss is not None else output
 
-        return SequenceClassifierOutput(
-            loss=loss, logits=logits, hidden_states=outputs.encoder_last_hidden_state, attentions=outputs.encoder_attentions
+        return GLiClassOutput(
+            loss=loss, logits=logits, 
+            hidden_states = outputs.hidden_states, 
+            attentions = outputs.attentions,
+            text_embeddings = pooled_output if output_text_embeddings else None,
+            class_embeddings = classes_embedding if output_class_embeddings else None,
         )
  
 class GLiClassBiEncoder(GLiClassBaseModel):
@@ -463,6 +481,8 @@ class GLiClassBiEncoder(GLiClassBaseModel):
         class_attention_mask: Optional[torch.Tensor] = None,
         labels_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        output_text_embeddings: Optional[bool] = None,
+        output_class_embeddings:  Optional[bool] = None,
         return_dict: Optional[bool] = None,
         **kwargs
     ) -> Union[Tuple, SequenceClassifierOutput]:
@@ -482,9 +502,12 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             output = (logits,)
             return ((loss,) + output) if loss is not None else output
 
-        return SequenceClassifierOutput(
-                    loss=loss, logits=logits
+        return GLiClassOutput(
+            loss=loss, logits=logits, 
+            text_embeddings = text_embeddings if output_text_embeddings else None,
+            class_embeddings = class_embeddings if output_class_embeddings else None,
         )
+ 
 
 class GLiClassModel(GLiClassPreTrainedModel):
     def __init__(self, config, from_pretrained=False):
