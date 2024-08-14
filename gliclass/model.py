@@ -39,7 +39,7 @@ else:
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
 
-    @dataclass
+@dataclass
 class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: Optional[torch.Tensor] = None
     class_embeddings: Optional[torch.Tensor] = None
