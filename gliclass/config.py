@@ -34,6 +34,7 @@ class GLiClassModelConfig(PretrainedConfig):
         architecture_type = 'uni-encoder',
         prompt_first = False,
         squeeze_layers = False,
+        embed_class_token = True, 
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -84,5 +85,6 @@ class GLiClassModelConfig(PretrainedConfig):
         self.architecture_type = architecture_type
         self.prompt_first = prompt_first
         self.squeeze_layers = squeeze_layers
+        self.embed_class_token = embed_class_token
         super().__init__(**kwargs)
 
