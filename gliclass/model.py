@@ -135,7 +135,7 @@ class GLiClassBaseModel(nn.Module):#):
         
         batch_indices, target_class_idx = torch.where(aranged_class_idx<num_class_tokens)
         _, class_indices = torch.where(class_token_mask)
-        if not self.embed_class_token:
+        if not self.config.embed_class_token:
             class_indices+=1
 
         classes_embedding = torch.zeros(
