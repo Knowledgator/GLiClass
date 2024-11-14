@@ -59,12 +59,12 @@ class GLiClassModelConfig(PretrainedConfig):
             self.vocab_size = vocab_size
         
         if class_token_index == -1:
-            self.class_token_index = vocab_size
+            self.class_token_index = self.vocab_size
         else:
             self.class_token_index = class_token_index
         
         if text_token_index == -1:
-            self.text_token_index = vocab_size+1
+            self.text_token_index = self.vocab_size+1
         else:
             self.text_token_index = text_token_index
 
