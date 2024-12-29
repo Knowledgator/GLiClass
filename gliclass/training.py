@@ -17,7 +17,7 @@ class TrainingArguments(transformers.TrainingArguments):
     others_weight_decay: Optional[float] = 0.0
 
 class Trainer(transformers.Trainer):
-    def training_step(self, model, inputs) -> torch.Tensor:
+    def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
 
