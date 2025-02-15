@@ -13,6 +13,8 @@ class GLiClassModelConfig(PretrainedConfig):
         self,
         encoder_config = None,
         encoder_model=None,
+        label_model_config=None,
+        label_model=None,
         class_token_index = -1,
         text_token_index = -1,
         ignore_index=-100,
@@ -47,6 +49,18 @@ class GLiClassModelConfig(PretrainedConfig):
 
         self.encoder_config = encoder_config
         self.encoder_model_name = encoder_model
+
+        if label_model is not None:
+            if isinstance(label_model_config, dict):
+                label_model_config["model_type"] = (label_model_config["model_type"] 
+                                                    if "model_type" in label_model_config 
+                                                    else "deberta-v2")
+                label_model_config = CONFIG_MAPPING[label_model_config["model_type"]](**label_model_config)
+            elif label_model_config is None:
+                label_model_config = CONFIG_MAPPING["deberta-v2"]()
+
+            self.label_model_config = label_model_config
+            self.label_model_name = label_model
 
         if hidden_size is None:
             self.hidden_size = self.encoder_config.hidden_size

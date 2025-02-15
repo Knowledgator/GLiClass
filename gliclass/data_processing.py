@@ -79,14 +79,29 @@ class GLiClassDataset(Dataset):
         return tokenized_inputs
 
     def tokenize_and_prepare_labels_for_biencoder(self, example):
+        def prepare_prompt(labels):
+            prompt_texts = []
+            for label in labels:
+                label_tag = f"<<LABEL>>"
+                prompt_texts.append(label_tag)
+            prompt_texts.append('<<SEP>>')
+            return ''.join(prompt_texts)
+
         input_text = example['text']
         class_texts = example['all_labels']
+
+        if self.architecture_type == 'bi-encoder-fused':
+            prompt = prepare_prompt(class_texts)
+            if self.prompt_first:
+                input_text = f"{prompt} {input_text}"
+            else:
+                input_text = f"{input_text} {prompt}"
 
         tokenized_inputs = self.tokenize(input_text)
         tokenized_classes = self.tokenize(class_texts)
 
-        tokenized_inputs["class_input_ids"] = tokenized_classes["input_ids"]
-        tokenized_inputs["class_attention_mask"] = tokenized_classes["attention_mask"]
+        tokenized_inputs["class_input_ids"] = torch.tensor(tokenized_classes["input_ids"])
+        tokenized_inputs["class_attention_mask"] = torch.tensor(tokenized_classes["attention_mask"])
 
         label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
 
@@ -107,9 +122,9 @@ class GLiClassDataset(Dataset):
 
         if self.architecture_type == 'uni-encoder':
             model_inputs = self.tokenize_and_prepare_labels_for_uniencoder(example)
-        elif self.architecture_type in {'encoder-decoder', 'bi-encoder'}:
+        elif self.architecture_type == 'encoder-decoder':
             model_inputs = self.tokenize_and_prepare_labels_for_encoder_decoder(example)
-        elif self.architecture_type == 'bi-encoder':
+        elif self.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
             model_inputs = self.tokenize_and_prepare_labels_for_biencoder(example)
         else:
             raise NotImplementedError('This architecture type is not implemented.')
@@ -160,7 +175,7 @@ class DataCollatorWithPadding:
             if isinstance(key_data[0], torch.Tensor):
                 if  key_data[0].dim() == 1:
                     padded_batch[key] = pad_sequence(key_data, batch_first=True)
-                elif key_data[0].dim() == 2: # span_idx case
+                elif key_data[0].dim() == 2: 
                     padded_batch[key] = pad_2d_tensor(key_data)
             elif isinstance(key_data[0], list):
                 max_length = max(len(seq) for seq in key_data)
