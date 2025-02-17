@@ -14,7 +14,7 @@ from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.utils import (logging)
 from transformers.models.auto import AutoModel
 from .config import GLiClassModelConfig
-from .layers import FeaturesProjector, LstmSeq2SeqEncoder, StableDropout, LayerwiseAttention
+from .layers import FeaturesProjector, LstmSeq2SeqEncoder, BiEncoderProjector, LayerwiseAttention
 from .poolings import POOLING2OBJECT
 from .scorers import SCORER2OBJECT
 from .loss_functions import focal_loss_with_logits, sequence_contrastive_loss
@@ -443,20 +443,20 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             if config.encoder_model_name is None:
                 raise ValueError("You need to specify encoder model name to use it as a backbone.")
             config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
-        
+
         if config.label_model_config is None:
             if config.label_model_name is None:
                 raise ValueError("You need to specify label model name to use it as a backbone.")
             config.label_model_config = AutoConfig.from_pretrained(config.label_model_name)
 
-        def initialize_encoder(model_name, from_pretrained):
+        def initialize_encoder(configs, model_name, from_pretrained):
             if from_pretrained:
                 return AutoModel.from_pretrained(model_name)
             else:
-                return AutoModel.from_config(AutoConfig.from_pretrained(model_name))
-
-        self.encoder_model = initialize_encoder(config.encoder_model_name, from_pretrained)
-        self.label_encoder = initialize_encoder(config.label_model_name, from_pretrained)
+                return AutoModel.from_config(configs)
+        self.encoder_model = initialize_encoder(config.encoder_config, config.encoder_model_name, from_pretrained)
+        self.label_encoder = initialize_encoder(config.label_model_config, config.label_model_name, from_pretrained)
+        self.biencoder_projector = BiEncoderProjector(config)
 
     def encode_text(self, input_ids, attention_mask):
         outputs = self.encoder_model(input_ids.squeeze(1), attention_mask=attention_mask.squeeze(1))
@@ -469,7 +469,6 @@ class GLiClassBiEncoder(GLiClassBaseModel):
     def encode_classes(self, class_input_ids, class_attention_mask, labels_mask=None):
         batch_size = class_input_ids.shape[0]
         num_classes = class_input_ids.shape[1]
-
         if labels_mask is not None:
             batch_indices, indices = torch.where(labels_mask==1)
             selected_input_ids = class_input_ids[batch_indices, indices]
@@ -489,7 +488,7 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             outputs = self.label_encoder(class_input_ids, attention_mask=class_attention_mask)
             class_embeddings = self.pooler(outputs[0])
             class_embeddings = class_embeddings.reshape(batch_size, num_classes, -1)
-            
+        class_embeddings = self.biencoder_projector(class_embeddings)
         class_embeddings = self.classes_projector(class_embeddings)
         class_embeddings = nn.functional.normalize(class_embeddings, p=2, dim=-1, eps=self.epsilon)
         return class_embeddings
@@ -545,12 +544,10 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         selected_class_embeddings = class_embeddings[labels_batch_indices, labels_indices]
 
         inputs_embeds[batch_indices, class_token_indices] = selected_class_embeddings
-
         encoder_outputs = self.encoder_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask.squeeze(1))
         
         post_class_embeddings = torch.zeros_like(class_embeddings)
         post_class_embeddings[labels_batch_indices, labels_indices] = encoder_outputs[0][batch_indices, class_token_indices]
-
         return encoder_outputs, post_class_embeddings
 
     def pool_outputs(self, encoder_outputs):
@@ -580,7 +577,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         encoder_outputs, class_embeddings = self.encode_text(input_ids, attention_mask, raw_class_embeddings, labels_mask)
         
         text_embeddings = self.pool_outputs(encoder_outputs)
-        
+
         logits = self.scorer(text_embeddings, class_embeddings) * self.logit_scale.to(class_embeddings.device)
 
         if labels_mask is not None: 
@@ -628,7 +625,6 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.model.encoder_decoder_model.set_input_embeddings(value)
         elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
             self.model.encoder_model.set_input_embeddings(value)
-            self.model.label_encoder.set_input_embeddings(value)
         else:
             raise NotImplementedError('Setting input embeddings is not implemented for bi-encoder architecture')
         
@@ -638,7 +634,6 @@ class GLiClassModel(GLiClassPreTrainedModel):
         elif self.config.architecture_type == 'encoder-decoder':
             return self.model.encoder_decoder_model.tie_weights()
         elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
-            self.model.label_encoder.tie_weights()
             return self.model.encoder_model.tie_weights()
         else:
             raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
@@ -648,8 +643,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         elif self.config.architecture_type == 'encoder-decoder':
             model_embeds = self.model.encoder_decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-        elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
-            _ = self.model.label_encoder.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        elif self.config.architecture_type in {'bi-encoder-fused'}:
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError('Resizing is not implemented for bi-encoder architecture')

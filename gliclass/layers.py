@@ -58,6 +58,20 @@ class FeaturesProjector(nn.Module):
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 
+class BiEncoderProjector(nn.Module):
+    def __init__(self, config: GLiClassModelConfig):
+        super().__init__()
+
+        self.linear_1 = nn.Linear(config.label_model_config.hidden_size, config.hidden_size, bias=True)
+        self.act = ACT2FN[config.projector_hidden_act]
+        self.linear_2 = nn.Linear(config.hidden_size, config.encoder_config.hidden_size, bias=True)
+
+    def forward(self, features):
+        hidden_states = self.linear_1(features)
+        hidden_states = self.act(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
 # Copied from transformers.models.deberta.modeling_deberta.DropoutContext
 class DropoutContext(object):
     def __init__(self):

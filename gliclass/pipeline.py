@@ -184,26 +184,48 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
                                 classification_type='multi-label', device='cuda:0', progress_bar=True):
         super().__init__(model, tokenizer, max_classes, max_length, classification_type, device, progress_bar)
+        self.labels_tokenizer = AutoTokenizer.from_pretrained(model.config.label_model_name)
 
+    def prepare_input(self, text, labels):
+        input_text = []
+        for label in labels:
+            label_tag = f"<<LABEL>>"
+            input_text.append(label_tag)
+        input_text.append('<<SEP>>')
+        if self.model.config.prompt_first:
+            input_text = ''.join(input_text)+text
+        else:
+            input_text = text+''.join(input_text)
+        return input_text
+    
     def prepare_inputs(self, texts, labels, same_labels=False):
+        if self.model.config.architecture_type == 'bi-encoder-fused':
+            inputs = []
+            if same_labels:
+                for text in texts:
+                    inputs.append(self.prepare_input(text, labels))
+            else:
+                for text, labels_ in zip(texts, labels):
+                    inputs.append(self.prepare_input(text, labels_))
+        else:
+            inputs = texts
         if same_labels:
             # If all texts use the same labels
-            tokenized_labels = self.tokenizer(labels, truncation=True,
+            tokenized_inputs = self.tokenizer(inputs, truncation=True,
                                             max_length=self.max_length,
                                             padding="longest", return_tensors="pt").to(self.device)
-            tokenized_labels['input_ids'] = tokenized_labels['input_ids'].expand(len(texts), -1, -1)
-            tokenized_labels['attention_mask'] = tokenized_labels['attention_mask'].expand(len(texts), -1, -1)
-            
-            tokenized_inputs = self.tokenizer(texts, truncation=True,
+
+            tokenized_labels = self.labels_tokenizer(labels, truncation=True,
                                             max_length=self.max_length,
                                             padding="longest", return_tensors="pt").to(self.device)
+            tokenized_inputs['class_input_ids'] = tokenized_labels['input_ids'].expand(len(texts), -1, -1)
+            tokenized_inputs['class_attention_mask'] = tokenized_labels['attention_mask'].expand(len(texts), -1, -1)
             
-            tokenized_inputs["class_input_ids"] = tokenized_labels["input_ids"]
-            tokenized_inputs["class_attention_mask"] = tokenized_labels["attention_mask"]
+            labels_mask = [[1 for i in range(len(labels))] for j in range(len(texts))]
+            tokenized_inputs["labels_mask"] = torch.tensor(labels_mask).to(self.device)
         else:
             # If each text has its own set of labels
-            max_label_length = max(len(l) for l in labels)
-            tokenized_inputs = self.tokenizer(texts, truncation=True,
+            tokenized_inputs = self.tokenizer(inputs, truncation=True,
                                             max_length=self.max_length,
                                             padding="longest", return_tensors="pt").to(self.device)
             
@@ -211,7 +233,7 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             class_attention_mask = []
             
             for labels_set in labels:
-                tokenized_labels = self.tokenizer(labels_set, truncation=True,
+                tokenized_labels = self.labels_tokenizer(labels_set, truncation=True,
                                                 max_length=self.max_length,
                                                 padding="max_length",
                                                 return_tensors="pt").to(self.device)
@@ -220,7 +242,9 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             
             tokenized_inputs["class_input_ids"] = torch.stack(class_input_ids)
             tokenized_inputs["class_attention_mask"] = torch.stack(class_attention_mask)
-        
+
+            labels_mask = [[1 for i in range(len(labels[j]))] for j in range(len(texts))]
+            tokenized_inputs["labels_mask"] = torch.tensor(labels_mask).to(self.device)
         return tokenized_inputs
 
 class ZeroShotClassificationPipeline:
@@ -234,7 +258,7 @@ class ZeroShotClassificationPipeline:
         elif model.config.architecture_type in {'encoder-decoder'}:
             self.pipe = EncoderDecoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
                                                                     max_length, classification_type, device, progress_bar)
-        elif model.config.architecture_type == 'bi-encoder':
+        elif model.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
             self.pipe = BiEncoderZeroShotClassificationPipeline(model, tokenizer, max_classes, 
                                                                     max_length, classification_type, device, progress_bar)
         else:

@@ -10,8 +10,10 @@ class GLiClassDataset(Dataset):
                             architecture_type = 'uni-encoder',
                             prompt_first=False,
                             get_negatives = False,
-                            max_labels = 50):
+                            max_labels = 50,
+                            labels_tokenizer=None):
         self.tokenizer = tokenizer
+        self.labels_tokenizer = labels_tokenizer
         self.max_length = max_length
         self._data = examples
         self.problem_type = problem_type
@@ -48,6 +50,10 @@ class GLiClassDataset(Dataset):
     def tokenize(self, texts):
         tokenized_inputs = self.tokenizer(texts, truncation=True, max_length=self.max_length, padding="longest")
         return tokenized_inputs
+
+    def tokenize_labels(self, labels):
+        tokenized_inputs = self.labels_tokenizer(labels, truncation=True, max_length=self.max_length, padding="longest")
+        return tokenized_inputs
     
     def tokenize_and_prepare_labels_for_uniencoder(self, example):
         random.shuffle(example['all_labels'])
@@ -79,6 +85,8 @@ class GLiClassDataset(Dataset):
         return tokenized_inputs
 
     def tokenize_and_prepare_labels_for_biencoder(self, example):
+        random.shuffle(example['all_labels'])
+        random.shuffle(example['true_labels'])
         def prepare_prompt(labels):
             prompt_texts = []
             for label in labels:
@@ -98,7 +106,7 @@ class GLiClassDataset(Dataset):
                 input_text = f"{input_text} {prompt}"
 
         tokenized_inputs = self.tokenize(input_text)
-        tokenized_classes = self.tokenize(class_texts)
+        tokenized_classes = self.tokenize_labels(class_texts)
 
         tokenized_inputs["class_input_ids"] = torch.tensor(tokenized_classes["input_ids"])
         tokenized_inputs["class_attention_mask"] = torch.tensor(tokenized_classes["attention_mask"])
