@@ -49,14 +49,18 @@ def main(args):
         model = GLiClassModel.from_pretrained(args.model_name, focal_loss_alpha=args.focal_loss_alpha,
                                                                 focal_loss_gamma=args.focal_loss_gamma)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
-
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.encoder_model_name)
         encoder_config = AutoConfig.from_pretrained(args.encoder_model_name)
 
+        if args.label_model_name is not None:
+            label_model_config = AutoConfig.from_pretrained(args.label_model_name)
+
         glicalss_config = GLiClassModelConfig(
             encoder_config=encoder_config,
             encoder_model=args.encoder_model_name,
+            label_model_name=args.label_model_name,
+            label_model_config=label_model_config,
             class_token_index=len(tokenizer),
             text_token_index=len(tokenizer)+1,
             pooling_strategy=args.pooler_type,
@@ -71,10 +75,17 @@ def main(args):
             prompt_first=args.prompt_first,
             squeeze_layers=args.squeeze_layers
         )
+
+        if args.label_model_name is not None:
+            labels_tokenizer = AutoTokenizer.from_pretrained(args.label_model_name)
+        else:
+            labels_tokenizer = None
+
         glicalss_config.problem_type = args.problem_type
+
         model = GLiClassModel(glicalss_config, from_pretrained=True)
 
-        if args.architecture_type in  {'uni-encoder', 'bi-encoder', 'encoder-decoder'}:
+        if args.architecture_type in  {'uni-encoder', 'bi-encoder-fused', 'encoder-decoder'}:
             new_words = ["<<LABEL>>", "<<SEP>>"]
             tokenizer.add_tokens(new_words, special_tokens=True)
             model.resize_token_embeddings(len(tokenizer))
@@ -85,7 +96,6 @@ def main(args):
         data = json.load(f)
 
     print('Dataset size:', len(data))
-    #shuffle
     random.shuffle(data)    
     print('Dataset is shuffled...')
 
@@ -94,8 +104,12 @@ def main(args):
 
     print('Dataset is splitted...')
 
-    train_dataset = GLiClassDataset(train_data, tokenizer, args.max_length, args.problem_type, args.architecture_type, args.prompt_first)
-    test_dataset = GLiClassDataset(test_data, tokenizer, args.max_length, args.problem_type, args.architecture_type, args.prompt_first)
+    train_dataset = GLiClassDataset(train_data, tokenizer, args.max_length, 
+                                    args.problem_type, args.architecture_type, 
+                                    args.prompt_first, labels_tokenizer=labels_tokenizer)
+    test_dataset = GLiClassDataset(test_data, tokenizer, args.max_length, args.problem_type, 
+                                        args.architecture_type, args.prompt_first,
+                                        labels_tokenizer = labels_tokenizer)
 
     data_collator = DataCollatorWithPadding(device=device)
 
@@ -134,11 +148,12 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--model_name', type=str, default= None)
-    parser.add_argument('--encoder_model_name', type=str, default = 'microsoft/deberta-v3-base')
-    parser.add_argument('--save_path', type=str, default = 'models/gliclass/deberta_base')
-    parser.add_argument('--data_path', type=str, default = '../data/zero-class.json')
+    parser.add_argument('--encoder_model_name', type=str, default = 'microsoft/deberta-v3-small')
+    parser.add_argument('--label_model_name', type=str, default = "BAAI/bge-small-en-v1.5")
+    parser.add_argument('--save_path', type=str, default = 'models/biencoder')
+    parser.add_argument('--data_path', type=str, default = 'zero-cats.json')
     parser.add_argument('--problem_type', type=str, default='multi_label_classification')
-    parser.add_argument('--pooler_type', type=str, default='first')
+    parser.add_argument('--pooler_type', type=str, default='avg')
     parser.add_argument('--scorer_type', type=str, default='simple')
     parser.add_argument('--architecture_type', type=str, default='uni-encoder')
     parser.add_argument('--normalize_features', type=bool, default=False)
@@ -146,20 +161,20 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_first', type=bool, default=True)
     parser.add_argument('--use_lstm', type=bool, default=False)
     parser.add_argument('--squeeze_layers', type=bool, default=False)
-    parser.add_argument('--num_epochs', type=int, default=2)
+    parser.add_argument('--num_epochs', type=int, default=5)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--encoder_lr', type=float, default=1e-5)
-    parser.add_argument('--others_lr', type=float, default=3e-5)
-    parser.add_argument('--encoder_weight_decay', type=float, default=0.1)
-    parser.add_argument('--others_weight_decay', type=float, default=0.1)
+    parser.add_argument('--encoder_lr', type=float, default=3e-5)
+    parser.add_argument('--others_lr', type=float, default=5e-5)
+    parser.add_argument('--encoder_weight_decay', type=float, default=0.01)
+    parser.add_argument('--others_weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
     parser.add_argument('--focal_loss_gamma', type=float, default=-1)
     parser.add_argument('--contrastive_loss_coef', type=float, default=0.)
     parser.add_argument('--max_length', type=int, default=1024)
-    parser.add_argument('--save_steps', type=int, default=500)
-    parser.add_argument('--save_total_limit', type=int, default=10)
+    parser.add_argument('--save_steps', type=int, default=1000)
+    parser.add_argument('--save_total_limit', type=int, default=3)
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)
     args = parser.parse_args()
