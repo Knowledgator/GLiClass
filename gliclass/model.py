@@ -49,7 +49,7 @@ class GLiClassPreTrainedModel(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _keys_to_ignore_on_load_unexpected = ["position_embeddings"]
-
+    
     def _init_weights(self, module):
         std = (
             self.config.initializer_range
@@ -84,7 +84,7 @@ class GLiClassPreTrainedModel(PreTrainedModel):
 
 
 class GLiClassBaseModel(nn.Module):#):
-    def __init__(self, config: GLiClassModelConfig):
+    def __init__(self, config: GLiClassModelConfig, device='cpu', **kwargs):
         super().__init__()
         self.config = config
         self.text_projector = FeaturesProjector(config)
@@ -125,7 +125,9 @@ class GLiClassBaseModel(nn.Module):#):
         self.vocab_size = config.vocab_size
         self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
         self.num_labels = -1
-    
+        
+        self.device = torch.device(device)
+
     def _extract_class_features(self, token_embeds, input_ids, attention_mask):
         batch_size, sequence_length, embed_dim = token_embeds.shape
 
