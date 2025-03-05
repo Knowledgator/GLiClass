@@ -275,8 +275,8 @@ class ZeroShotClassificationPipeline:
         results = self.pipe.get_embeddings(*args, **kwargs)
         return results
     
-    def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
-        results = self.pipe(texts, labels, threshold = threshold, batch_size=batch_size)
+    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, rac_examples=None):
+        results = self.pipe(texts, labels, threshold = threshold, batch_size=batch_size, rac_examples=rac_examples)
         return results
     
 class ZeroShotClassificationWithLabelsChunkingPipeline(BaseZeroShotClassificationPipeline):
