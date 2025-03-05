@@ -1,8 +1,10 @@
 import torch
 from tqdm import tqdm
+from typing import List, Dict, Union
 from transformers import AutoTokenizer
 from abc import ABC, abstractmethod
 from .model import GLiClassModel, GLiClassBiEncoder
+from .utils import retrieval_augmented_text
 
 class BaseZeroShotClassificationPipeline(ABC):
     def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
@@ -65,9 +67,14 @@ class BaseZeroShotClassificationPipeline(ABC):
         return results
 
     @torch.no_grad()
-    def __call__(self, texts, labels, threshold = 0.5, batch_size=8):
+    def __call__(self, texts, labels, threshold = 0.5, batch_size=8, rac_examples=None):
         if isinstance(texts, str):
+            if rac_examples:
+                texts = retrieval_augmented_text(text, rac_examples)
             texts = [texts]
+        else:
+            if rac_examples:
+                texts = [retrieval_augmented_text(text, examples) for text, examples in zip(texts, rac_examples)]
         if isinstance(labels[0], str):
             same_labels = True
         else:
