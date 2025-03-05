@@ -70,7 +70,7 @@ class BaseZeroShotClassificationPipeline(ABC):
     def __call__(self, texts, labels, threshold = 0.5, batch_size=8, rac_examples=None):
         if isinstance(texts, str):
             if rac_examples:
-                texts = retrieval_augmented_text(text, rac_examples)
+                texts = retrieval_augmented_text(texts, rac_examples)
             texts = [texts]
         else:
             if rac_examples:
