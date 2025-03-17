@@ -1,3 +1,5 @@
+import torch
+
 def is_module_available(module_name):
     """
     Checks whether the specified Python module is available.
@@ -54,3 +56,22 @@ def retrieval_augmented_text(text: str, examples: list) -> str:
     augmented_text = f"{text} {' '.join(retrieved_examples)}" if retrieved_examples else text
 
     return augmented_text
+
+def default_f1_reward(
+    probs: torch.Tensor,
+    actions: torch.Tensor,
+    original_targets: torch.Tensor,
+    valid_mask: torch.Tensor
+) -> torch.Tensor:
+    valid_preds = actions * valid_mask
+    valid_targets = original_targets * valid_mask
+
+    TP = torch.sum((valid_preds * valid_targets), dim=-1)
+    FP = torch.sum((valid_preds * (1 - valid_targets)), dim=-1)
+    FN = torch.sum(((1 - valid_preds) * valid_targets), dim=-1)
+
+    eps = 1e-8
+    precision = TP / (TP + FP + eps)
+    recall = TP / (TP + FN + eps)
+    f1 = 2 * (precision * recall) / (precision + recall + eps)
+    return f1.detach().unsqueeze(1)
