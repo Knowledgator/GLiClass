@@ -231,7 +231,7 @@ class GLiClassBaseModel(nn.Module):#):
         return loss
     
 class GLiClassUniEncoder(GLiClassBaseModel):
-    def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
+    def __init__(self, config: GLiClassModelConfig, from_pretrained = True):
         super().__init__(config)
         if config.encoder_config is None:
             if config.encoder_model_name is None:
@@ -253,8 +253,9 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         if from_pretrained:
             self.encoder_model = ModelClass.from_pretrained(
-                config.encoder_model_name
+                config.encoder_model_name, reference_compile=False,
             )
+            self.encoder_model.resize_token_embeddings(self.encoder_model.config.vocab_size+2)
         else:
             if decoder:
                 self.encoder_model = ModelClass(config.encoder_config)
@@ -599,7 +600,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
  
 
 class GLiClassModel(GLiClassPreTrainedModel):
-    def __init__(self, config, from_pretrained=False):
+    def __init__(self, config, from_pretrained=True):
         super().__init__(config)
         if config.architecture_type == 'uni-encoder':
             self.model = GLiClassUniEncoder(config, from_pretrained)
