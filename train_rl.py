@@ -100,11 +100,6 @@ def main(args):
             squeeze_layers=args.squeeze_layers
         )
 
-        if args.label_model_name is not None:
-            labels_tokenizer = AutoTokenizer.from_pretrained(args.label_model_name)
-        else:
-            labels_tokenizer = None
-
         glicalss_config.problem_type = args.problem_type
 
         model = GLiClassModel(glicalss_config, from_pretrained=True)
@@ -113,6 +108,11 @@ def main(args):
             new_words = ["<<LABEL>>", "<<SEP>>"]
             tokenizer.add_tokens(new_words, special_tokens=True)
             model.resize_token_embeddings(len(tokenizer))
+
+    if args.label_model_name is not None:
+        labels_tokenizer = AutoTokenizer.from_pretrained(args.label_model_name)
+    else:
+        labels_tokenizer = None
 
     model.to(device)
         
