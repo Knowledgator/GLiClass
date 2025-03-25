@@ -263,9 +263,14 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             if decoder:
                 self.encoder_model = ModelClass(config.encoder_config)
             else:
-                self.encoder_model = ModelClass.from_config(
-                    config.encoder_config
-                )
+                if config_name in {'T5Config', 'MT5Config'}:
+                    self.encoder_model = ModelClass._from_config(
+                        config.encoder_config
+                    )
+                else:
+                    self.encoder_model = ModelClass.from_config(
+                        config.encoder_config
+                    )
 
         adapter_config_file = Path(config.encoder_model_name) / "adapter_config.json"
 
