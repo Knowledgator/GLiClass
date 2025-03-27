@@ -327,11 +327,16 @@ class RLTrainer(Trainer):
 
                 prev_logps = None
                 for iter in range(args.num_rl_iters):
-                    outputs = model(**inputs)
-                    logits = outputs.logits
-
-                    loss, current_logps = self.compute_loss(logits, labels, log_prob_prev=prev_logps)
-
+                    try:
+                        outputs = model(**inputs)
+                        logits = outputs.logits
+                        loss, current_logps = self.compute_loss(logits, labels, log_prob_prev=prev_logps)
+                    except:
+                        del inputs
+                        model.zero_grad(set_to_none=True)
+                        torch.cuda.empty_cache()
+                        break
+                        
                     accelerator.backward(loss)
                     if self.args.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
