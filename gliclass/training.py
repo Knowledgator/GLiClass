@@ -212,6 +212,10 @@ class RLTrainerConfig(TrainingArguments):
         default=-1,
         metadata={"help": "Focal loss alpha."},
     )
+    threshokd: float = field(
+        default=0.5,
+        metadata={"help": "Threshold value for predictions."},
+    )
 
 class RLTrainer(Trainer):
     def __init__(
@@ -264,21 +268,20 @@ class RLTrainer(Trainer):
 
         probs = torch.sigmoid(inputs)
 
-        # actions = torch.bernoulli(probs)
-
-        actions = (probs>0.5).float()
+        actions = (probs>self.args.threshold).float() #torch.bernoulli(probs)
 
         with torch.no_grad():
             metrics = self.compute_rewards(probs, actions, original_targets, valid_mask)
         reward = metrics['total_reward']
-        advantages = reward  # Consider normalization
+        mean_reward = torch.mean(reward)
+        advantages = reward-mean_reward  # Consider normalization
         self.metrics['advantages'].append(advantages.mean().item())
 
         for name, _ in self.reward_components.items():
             key = f'reward_{name}'
             self.metrics[key].append(metrics[name].mean().item())
 
-        log_prob_current = original_targets * torch.log(probs + 1e-8) + (1 - original_targets) * torch.log(1 - probs + 1e-8)
+        log_prob_current = actions * torch.log(probs + 1e-8) + (1 - actions) * torch.log(1 - probs + 1e-8)
 
 
         if log_prob_prev is None:
@@ -303,7 +306,8 @@ class RLTrainer(Trainer):
             alpha_t = self.args.alpha * original_targets + (1 - self.args.alpha) * (1 - original_targets)
             loss_elements = alpha_t * loss_elements
 
-        loss = loss_elements.sum() / valid_mask.sum()
+        # loss = loss_elements.sum() / valid_mask.sum()
+        loss = loss_elements.sum() / valid_mask.shape[0]
         return loss, log_prob_current
 
     def _inner_training_loop(self, *args, **kwargs):
@@ -321,7 +325,7 @@ class RLTrainer(Trainer):
             self._init_metrics()
             model.train()
 
-            for step, inputs in enumerate(dataloader):
+            for step, inputs in tqdm(enumerate(dataloader)):
                 inputs = self._prepare_inputs(inputs)
                 labels = inputs.pop('labels').to(device)
 
@@ -336,7 +340,7 @@ class RLTrainer(Trainer):
                         model.zero_grad(set_to_none=True)
                         torch.cuda.empty_cache()
                         break
-                        
+
                     accelerator.backward(loss)
                     if self.args.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)

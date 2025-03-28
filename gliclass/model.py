@@ -13,6 +13,7 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.utils import (logging)
 from transformers.models.auto import AutoModel
+from transformers import T5EncoderModel
 from .config import GLiClassModelConfig
 from .layers import FeaturesProjector, LstmSeq2SeqEncoder, BiEncoderProjector, LayerwiseAttention
 from .poolings import POOLING2OBJECT
@@ -247,6 +248,9 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                 print('Loading decoder model using LLM2Vec...')
                 ModelClass = DECODER_MODEL_MAPPING[config_name]
             decoder = True
+        elif config_name in {'T5Config', 'MT5Config'}:
+            decoder = False
+            ModelClass = T5EncoderModel
         else:
             decoder = False
             ModelClass = AutoModel
@@ -259,9 +263,14 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             if decoder:
                 self.encoder_model = ModelClass(config.encoder_config)
             else:
-                self.encoder_model = ModelClass.from_config(
-                    config.encoder_config
-                )
+                if config_name in {'T5Config', 'MT5Config'}:
+                    self.encoder_model = ModelClass._from_config(
+                        config.encoder_config
+                    )
+                else:
+                    self.encoder_model = ModelClass.from_config(
+                        config.encoder_config
+                    )
 
         adapter_config_file = Path(config.encoder_model_name) / "adapter_config.json"
 
@@ -460,12 +469,17 @@ class GLiClassBiEncoder(GLiClassBaseModel):
         self.label_encoder = initialize_encoder(config.label_model_config, config.label_model_name, from_pretrained)
         self.biencoder_projector = BiEncoderProjector(config)
 
-    def encode_text(self, input_ids, attention_mask):
-        outputs = self.encoder_model(input_ids.squeeze(1), attention_mask=attention_mask.squeeze(1))
-        text_embeddings = self.pooler(outputs[0])
+    def pool_outputs(self, encoder_outputs):
+        text_embeddings = self.pooler(encoder_outputs[0])
         text_embeddings = self.text_projector(text_embeddings)
         text_embeddings = self.dropout(text_embeddings)
-        text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=-1, eps=self.epsilon)
+        if self.config.normalize_features:
+            text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=-1, eps=self.epsilon)
+        return text_embeddings
+
+    def encode_text(self, input_ids, attention_mask):
+        outputs = self.encoder_model(input_ids.squeeze(1), attention_mask=attention_mask.squeeze(1))
+        text_embeddings = self.pool_outputs(outputs)
         return text_embeddings
 
     def encode_classes(self, class_input_ids, class_attention_mask, labels_mask=None):
@@ -492,7 +506,8 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             class_embeddings = class_embeddings.reshape(batch_size, num_classes, -1)
         class_embeddings = self.biencoder_projector(class_embeddings)
         class_embeddings = self.classes_projector(class_embeddings)
-        class_embeddings = nn.functional.normalize(class_embeddings, p=2, dim=-1, eps=self.epsilon)
+        if self.config.normalize_features:
+            class_embeddings = nn.functional.normalize(class_embeddings, p=2, dim=-1, eps=self.epsilon)
         return class_embeddings
 
     def forward(
@@ -551,13 +566,6 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         post_class_embeddings = torch.zeros_like(class_embeddings)
         post_class_embeddings[labels_batch_indices, labels_indices] = encoder_outputs[0][batch_indices, class_token_indices]
         return encoder_outputs, post_class_embeddings
-
-    def pool_outputs(self, encoder_outputs):
-        text_embeddings = self.pooler(encoder_outputs[0])
-        text_embeddings = self.text_projector(text_embeddings)
-        text_embeddings = self.dropout(text_embeddings)
-        text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=-1, eps=self.epsilon)
-        return text_embeddings
 
     def forward(
         self,
