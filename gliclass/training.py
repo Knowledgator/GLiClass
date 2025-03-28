@@ -10,7 +10,7 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
 )
 import transformers
-
+from .utils import default_f1_reward
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
@@ -212,7 +212,7 @@ class RLTrainerConfig(TrainingArguments):
         default=-1,
         metadata={"help": "Focal loss alpha."},
     )
-    threshokd: float = field(
+    threshold: float = field(
         default=0.5,
         metadata={"help": "Threshold value for predictions."},
     )
