@@ -5,12 +5,12 @@ import argparse
 import json
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoModelForSequenceClassification
 
 import random
 import torch
 
-from gliclass import GLiClassModelConfig, GLiClassModel
+from gliclass import GLiClassModelConfig, GLiClassModel, ZeroShotClassificationPipeline
 from gliclass.training import TrainingArguments, Trainer, RLTrainerConfig, RLTrainer
 from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset
 from gliclass.utils import default_f1_reward
@@ -92,6 +92,9 @@ def main(args):
             use_lstm=args.use_lstm,
             focal_loss_alpha=args.focal_loss_alpha,
             focal_loss_gamma=args.focal_loss_gamma,
+            labels_smoothing=args.labels_smoothing,
+            entropy_beta=args.entropy_beta,
+            kl_beta=args.kl_beta,
             contrastive_loss_coef=args.contrastive_loss_coef,
             normalize_features=args.normalize_features,
             extract_text_features=args.extract_text_features,
@@ -109,6 +112,21 @@ def main(args):
             tokenizer.add_tokens(new_words, special_tokens=True)
             model.resize_token_embeddings(len(tokenizer))
 
+    if args.set_value_model:
+        value_model = AutoModelForSequenceClassification.from_pretrained(model.config.encoder_model_name, num_labels=1)
+        value_model.resize_token_embeddings(len(tokenizer))
+    else:
+        value_model = None
+
+    if args.reference_model is not None:
+        refrence_model = GLiClassModel.from_pretrained(args.reference_model)
+        reference_tokenizer = AutoTokenizer.from_pretrained(args.reference_model)
+        reference_pipe = ZeroShotClassificationPipeline(refrence_model, reference_tokenizer, 
+                                                                classification_type='multi-label', 
+                                                                progress_bar=False, device=device)
+    else:
+        reference_pipe = None
+
     if args.label_model_name is not None:
         labels_tokenizer = AutoTokenizer.from_pretrained(args.label_model_name)
     else:
@@ -117,7 +135,19 @@ def main(args):
     model.to(device)
         
     with open(args.data_path, 'r') as f:
-        data = json.load(f)[:10000]
+        data = json.load(f)[:]
+    init_ld = len(data)*1
+
+    with open('data/gliclass_v2.json', 'r') as f:
+        add_data = json.load(f)
+        random.shuffle(add_data)
+        data.extend(add_data[:init_ld])
+        # data = add_data[:init_ld]
+
+    with open('data/multilang_nli_gliclass.json', 'r') as f:
+        add_data = json.load(f)
+        random.shuffle(add_data)
+        data.extend(add_data[:init_ld])
 
     print('Dataset size:', len(data))
     random.shuffle(data)    
@@ -162,6 +192,8 @@ def main(args):
 
     trainer = RLTrainer(
         model=model,
+        value_model=value_model, 
+        reference_model=reference_pipe,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=test_dataset,
@@ -169,19 +201,19 @@ def main(args):
         data_collator=data_collator,
         reward_components={
             'micro_f1': default_f1_reward,
-            # 'accuracy': accuracy_reward,
-            "recall": recall_reward,
         },
     )
     trainer.train()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_name', type=str, default= None)
+    parser.add_argument('--model_name', type=str, default= "knowledgator/gliclass-modern-base-v2.0-init")
     parser.add_argument('--encoder_model_name', type=str, default = 'microsoft/deberta-v3-small')
     parser.add_argument('--label_model_name', type=str, default = "BAAI/bge-small-en-v1.5")
+    parser.add_argument('--reference_model', type=str, default = None)
+    parser.add_argument('--set_value_model', type=bool, default = True)
     parser.add_argument('--save_path', type=str, default = 'models/')
-    parser.add_argument('--data_path', type=str, default = 'zero-cats.json')
+    parser.add_argument('--data_path', type=str, default = 'data/zero-cats.json')
     parser.add_argument('--problem_type', type=str, default='multi_label_classification')
     parser.add_argument('--pooler_type', type=str, default='avg')
     parser.add_argument('--scorer_type', type=str, default='simple')
@@ -191,21 +223,24 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_first', type=bool, default=True)
     parser.add_argument('--use_lstm', type=bool, default=False)
     parser.add_argument('--squeeze_layers', type=bool, default=False)
-    parser.add_argument('--num_epochs', type=int, default=3)
-    parser.add_argument('--batch_size', type=int, default=2)
-    parser.add_argument('--encoder_lr', type=float, default=1e-5)
-    parser.add_argument('--others_lr', type=float, default=1e-5)
+    parser.add_argument('--num_epochs', type=int, default=1)
+    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--encoder_lr', type=float, default=2e-6)
+    parser.add_argument('--others_lr', type=float, default=3e-6)
     parser.add_argument('--encoder_weight_decay', type=float, default=0.01)
     parser.add_argument('--others_weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
     parser.add_argument('--focal_loss_gamma', type=float, default=-1)
+    parser.add_argument('--labels_smoothing', type=float, default=-1)
+    parser.add_argument('--entropy_beta', type=float, default=-1)
+    parser.add_argument('--kl_beta', type=float, default=0.1)
     parser.add_argument('--clip_range', type=float, default=0.2)
-    parser.add_argument('--num_rl_iters', type=int, default=3)
+    parser.add_argument('--num_rl_iters', type=int, default=2)
     parser.add_argument('--contrastive_loss_coef', type=float, default=0.)
-    parser.add_argument('--max_length', type=int, default=1024)
-    parser.add_argument('--save_steps', type=int, default=1000)
+    parser.add_argument('--max_length', type=int, default=2048)
+    parser.add_argument('--save_steps', type=int, default=300)
     parser.add_argument('--save_total_limit', type=int, default=3)
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)

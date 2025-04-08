@@ -10,6 +10,9 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
 )
 import transformers
+from transformers import ZeroShotClassificationPipeline as TransformersClassificationPipeline
+from .utils import default_f1_reward
+from .pipeline import ZeroShotClassificationPipeline
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -39,6 +42,10 @@ class Trainer(transformers.Trainer):
         """
         model.train()
         try:
+            if "labels_text" in inputs:
+                labels_text = inputs.pop('labels_text')
+            if "input_texts" in inputs:
+                input_texts = inputs.pop('input_texts')
             inputs = self._prepare_inputs(inputs)
             if is_sagemaker_mp_enabled():
                 loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
@@ -212,7 +219,23 @@ class RLTrainerConfig(TrainingArguments):
         default=-1,
         metadata={"help": "Focal loss alpha."},
     )
-    threshokd: float = field(
+    labels_smoothing: float = field(
+        default=-1,
+        metadata={"help": "Labels smoothing factor."}
+    )
+    entropy_beta: float = field(
+        default=-1,
+        metadata={"help": "Coeficient of entropy factor."}
+    )
+    kl_beta: float = field(
+        default=-1,
+        metadata={"help": "Coeficient of KL-divergence factor."}
+    )
+    get_actions: str = field(
+        default="bernoulli",
+        metadata={"help": "How to get actions of a model, default is `bernoulli`, another option is `threshold`"},
+    )
+    threshold: float = field(
         default=0.5,
         metadata={"help": "Threshold value for predictions."},
     )
@@ -220,13 +243,17 @@ class RLTrainerConfig(TrainingArguments):
 class RLTrainer(Trainer):
     def __init__(
         self,
+        value_model: Optional[torch.nn.Module] = None,
+        reference_model: Optional[Union[ZeroShotClassificationPipeline|TransformersClassificationPipeline]] = None,
         reward_components: Optional[List[Tuple[str, Callable]]] = None,
         *args,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
+        if value_model is not None:
+            self.value_model = value_model.to(self.model.device)
+        self.reference_model = reference_model
         if reward_components is None:
-            # Default to F1 score as the sole reward component
             reward_components = [('f1', default_f1_reward)]
         self.reward_components = reward_components
         self._init_metrics()
@@ -255,12 +282,38 @@ class RLTrainer(Trainer):
             total_reward += component
         rewards['total_reward'] = total_reward
         return rewards
-
+    
+    def get_reference_scores(self, input_texts, labels_text):
+        if input_texts is None or labels_text is None:
+            return None
+        all_scores = []
+        with torch.no_grad():
+            if isinstance(self.reference_model, ZeroShotClassificationPipeline):
+                results = self.reference_model(input_texts, labels_text, threshold=0.)
+                for id, result in enumerate(results):
+                    label2score = {item['label']: item['score'] for item in result}
+                    label_scores = [label2score[label] for label in labels_text[id]]
+                    all_scores.append(label_scores)
+            elif isinstance(self.reference_model, TransformersClassificationPipeline):
+                for text, labels in zip(input_texts, labels_text):
+                    result = self.reference_model(text, labels)
+                    label2score = {label:score for label, score in zip(result['labels'], result['scores'])}
+                    label_scores = [label2score[label] for label in labels_text[id]]
+                    all_scores.append(label_scores)
+            else:
+                raise NotImplementedError("This classification pipelines is not supported as a reference model.")
+        max_length = max(len(seq) for seq in all_scores)
+        all_scores = torch.FloatTensor([seq + [0] * (max_length - len(seq)) 
+                                            for seq in all_scores]).to(self.model.device)
+        return all_scores
+    
     def compute_loss(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
         log_prob_prev: Optional[torch.Tensor] = None,
+        value_outputs: Optional[torch.Tensor] = None,
+        reference_probs: Optional[torch.Tensor] = None,
         **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         valid_mask = targets != -100
@@ -268,21 +321,41 @@ class RLTrainer(Trainer):
 
         probs = torch.sigmoid(inputs)
 
-        actions = (probs>self.args.threshold).float() #torch.bernoulli(probs)
+        if self.args.get_actions == 'bernoulli':
+            actions = torch.bernoulli(probs).detach()
+        else:
+            actions = (probs > self.args.threshold).float().detach()
 
         with torch.no_grad():
             metrics = self.compute_rewards(probs, actions, original_targets, valid_mask)
+
         reward = metrics['total_reward']
-        mean_reward = torch.mean(reward)
-        advantages = reward-mean_reward  # Consider normalization
+
+        if value_outputs is not None:
+            state_values = value_outputs.logits[:, 0].unsqueeze(-1)  # Using first token logits as value prediction
+            value_loss = torch.nn.functional.mse_loss(state_values, reward.detach())
+        else:
+            state_values = reward.mean()
+            value_loss = torch.tensor(0.0).to(inputs.device)
+
+        advantages = (reward - state_values).detach()
         self.metrics['advantages'].append(advantages.mean().item())
 
         for name, _ in self.reward_components.items():
             key = f'reward_{name}'
             self.metrics[key].append(metrics[name].mean().item())
 
-        log_prob_current = actions * torch.log(probs + 1e-8) + (1 - actions) * torch.log(1 - probs + 1e-8)
-
+        if self.args.label_smoothing_factor > 0:
+            smoothed_actions = actions * (1 - self.args.label_smoothing_factor) + 0.5 * self.args.label_smoothing_factor
+            log_prob_current = (
+                smoothed_actions * torch.log(probs + 1e-8) +
+                (1 - smoothed_actions) * torch.log(1 - probs + 1e-8)
+            )
+        else:
+            log_prob_current = (
+                actions * torch.log(probs + 1e-8) +
+                (1 - actions) * torch.log(1 - probs + 1e-8)
+            )
 
         if log_prob_prev is None:
             log_prob_prev = log_prob_current.detach()
@@ -291,9 +364,9 @@ class RLTrainer(Trainer):
         ratio = torch.exp(log_probs_diff)
 
         cliprange = self.args.cliprange
-        per_label_loss1 = -ratio * advantages
-        per_label_loss2 = -torch.clamp(ratio, 1 - cliprange, 1 + cliprange) * advantages
-        loss_elements = torch.min(per_label_loss1, per_label_loss2)
+        per_label_loss1 = ratio * advantages
+        per_label_loss2 = torch.clamp(ratio, 1 - cliprange, 1 + cliprange) * advantages
+        loss_elements = -torch.min(per_label_loss1, per_label_loss2)
 
         loss_elements = loss_elements * valid_mask
         self.metrics['total_loss'].append(loss_elements.mean().item())
@@ -306,12 +379,28 @@ class RLTrainer(Trainer):
             alpha_t = self.args.alpha * original_targets + (1 - self.args.alpha) * (1 - original_targets)
             loss_elements = alpha_t * loss_elements
 
-        # loss = loss_elements.sum() / valid_mask.sum()
-        loss = loss_elements.sum() / valid_mask.shape[0]
+        loss = loss_elements.sum() / valid_mask.shape[0] + value_loss
+
+        if reference_probs is not None:
+            ref_per_token_logps = torch.log(reference_probs + 1e-8)
+            per_token_logps = log_prob_current  
+            per_label_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            per_label_kl = per_label_kl * valid_mask
+            kl_loss = self.args.kl_beta * per_label_kl.mean()
+            loss = loss + kl_loss
+
+        if self.args.entropy_beta:
+            entropy = - (probs * torch.log(probs + 1e-8) +
+                        (1 - probs) * torch.log(1 - probs + 1e-8))
+            loss = loss + self.args.entropy_beta * entropy.mean()
+
         return loss, log_prob_current
+
 
     def _inner_training_loop(self, *args, **kwargs):
         self.create_optimizer()
+        if self.value_model is not None:
+            value_optimizer = torch.optim.Adam(self.value_model.parameters(), lr=self.args.learning_rate)
         args = self.args
         accelerator = self.accelerator
         optimizer = self.optimizer
@@ -319,23 +408,48 @@ class RLTrainer(Trainer):
         dataloader = self.get_train_dataloader()
         device = accelerator.device
 
+        num_local_steps = len(dataloader)
+        num_iters = args.num_train_epochs*num_local_steps
+        pbar = tqdm(total=num_iters, desc="Training iterations")
         self._init_metrics()
 
-        for epoch in tqdm(range(args.num_train_epochs), desc="Epochs"):
+        for epoch in range(args.num_train_epochs):
             self._init_metrics()
             model.train()
+            if self.value_model is not None:
+                self.value_model.train()
 
-            for step, inputs in tqdm(enumerate(dataloader)):
+            for step, inputs in enumerate(dataloader):
+                global_step = step+epoch*num_local_steps
+
                 inputs = self._prepare_inputs(inputs)
                 labels = inputs.pop('labels').to(device)
-
+                if "labels_text" in inputs:
+                    labels_text = inputs.pop('labels_text')
+                else:
+                    labels_text = None
+                if "input_texts" in inputs:
+                    input_texts = inputs.pop('input_texts')
+                else:
+                    input_texts = None
                 prev_logps = None
                 for iter in range(args.num_rl_iters):
                     try:
                         outputs = model(**inputs)
                         logits = outputs.logits
-                        loss, current_logps = self.compute_loss(logits, labels, log_prob_prev=prev_logps)
-                    except:
+                        if self.value_model is not None:
+                            value_outputs = self.value_model(**inputs)
+                        else:
+                            value_outputs = None
+                        if self.reference_model is not None:
+                            reference_probs = self.get_reference_scores(input_texts, labels_text)
+                        else:
+                            reference_probs = None
+                        loss, current_logps = self.compute_loss(logits, labels, log_prob_prev=prev_logps, 
+                                                                                value_outputs=value_outputs,
+                                                                                reference_probs=reference_probs)
+                    except Exception as e:
+                        print(f"An error occurred during training step: {str(e)}")
                         del inputs
                         model.zero_grad(set_to_none=True)
                         torch.cuda.empty_cache()
@@ -344,16 +458,25 @@ class RLTrainer(Trainer):
                     accelerator.backward(loss)
                     if self.args.max_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
+                        if self.value_model is not None:
+                            torch.nn.utils.clip_grad_norm_(self.value_model.parameters(), self.args.max_grad_norm)
+
                     optimizer.step()
                     optimizer.zero_grad()
+                    if self.value_model is not None:
+                        value_optimizer.step()
+                        value_optimizer.zero_grad()
 
                     prev_logps = current_logps.detach()
 
-                if step % args.logging_steps == 0:
+                if global_step % args.logging_steps == 0:
                     self.log_metrics()
 
-                if args.save_steps is not None and step % args.save_steps == 0:
-                    self._save_checkpoint(model, step=step)
+                if args.save_steps is not None and global_step % args.save_steps == 0:
+                    self._save_checkpoint(model, step=global_step)
+
+                pbar.set_postfix(epoch=epoch, step=step)
+                pbar.update(1)
 
             if args.evaluation_strategy == "epoch":
                 self.evaluate()

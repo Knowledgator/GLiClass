@@ -63,15 +63,55 @@ def default_f1_reward(
     original_targets: torch.Tensor,
     valid_mask: torch.Tensor
 ) -> torch.Tensor:
-    valid_preds = actions * valid_mask
-    valid_targets = original_targets * valid_mask
+    """
+    A variant that extracts list-of-indices sets and then calculates
+    the F1 score in a classical manner. Returns shape (N, 1).
+    
+    Args:
+        probs:              (N, T) Tensor of probabilities (not used here but left for interface consistency).
+        actions:            (N, T) Tensor of predicted labels in {0, 1}.
+        original_targets:   (N, T) Tensor of ground-truth labels in {0, 1}.
+        valid_mask:         (N, T) Tensor indicating which positions are valid (1) vs. invalid (0).
 
-    TP = torch.sum((valid_preds * valid_targets), dim=-1)
-    FP = torch.sum((valid_preds * (1 - valid_targets)), dim=-1)
-    FN = torch.sum(((1 - valid_preds) * valid_targets), dim=-1)
+    Returns:
+        f1_scores: (N, 1) Tensor containing the F1 score for each row.
+    """
+    N = actions.shape[0]
+    f1_scores = []
 
-    eps = 1e-8
-    precision = TP / (TP + FP + eps)
-    recall = TP / (TP + FN + eps)
-    f1 = 2 * (precision * recall) / (precision + recall + eps)
-    return f1.detach().unsqueeze(1)
+    for i in range(N):
+        # Filter valid positions
+        valid_preds_i = actions[i] * valid_mask[i]
+        valid_targets_i = original_targets[i] * valid_mask[i]
+
+        # Get the set of indices where we predicted 1
+        predicted_set = set((valid_preds_i == 1).nonzero(as_tuple=True)[0].tolist())
+        # Get the set of indices where the ground truth is 1
+        target_set = set((valid_targets_i == 1).nonzero(as_tuple=True)[0].tolist())
+
+        # Compute intersection
+        intersection = predicted_set.intersection(target_set)
+
+        # Precision
+        if len(predicted_set) > 0:
+            precision = len(intersection) / len(predicted_set)
+        else:
+            precision = 0.0
+
+        # Recall
+        if len(target_set) > 0:
+            recall = len(intersection) / len(target_set)
+        else:
+            recall = 0.0
+
+        # F1 score
+        if (precision + recall) > 0:
+            f1 = 2 * precision * recall / (precision + recall)
+        else:
+            f1 = 0.0
+
+        f1_scores.append(f1)
+    
+    # Convert list to tensor shape (N, 1)
+    f1_scores = torch.tensor(f1_scores, dtype=torch.float).unsqueeze(-1)
+    return f1_scores.detach().to(probs.device)
