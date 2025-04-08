@@ -107,6 +107,10 @@ class Trainer(transformers.Trainer):
         """
         try:
             with torch.no_grad():
+                if "labels_text" in inputs:
+                    labels_text = inputs.pop('labels_text')
+                if "input_texts" in inputs:
+                    input_texts = inputs.pop('input_texts')
                 loss = None
                 with self.compute_loss_context_manager():
                     try:
