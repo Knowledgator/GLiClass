@@ -9,7 +9,7 @@
     <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
     <a href="https://huggingface.co/spaces/knowledgator/GLiClass_SandBox">📺 Demo</a>
     <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="https://huggingface.co/models?library=gliclass&sort=trending">🤗 Available models</a>
+    <a href="https://huggingface.co/models?sort=trending&search=gliclass">🤗 Available models</a>
     <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
     <a href="https://colab.research.google.com/github/Knowledgator/GLiClass/blob/main/finetuning.ipynb">
         <img align="center" src="https://colab.research.google.com/assets/colab-badge.svg" />
@@ -24,7 +24,7 @@ Install GLiClass easily using pip:
 pip install gliclass
 ```
 
-### Install from Source
+#### Install from Source
 
 Clone and install directly from GitHub:
 
@@ -46,7 +46,7 @@ import gliclass
 print(gliclass.__version__)
 ```
 
-## 🧑‍💻 Usage Example
+### 🧑‍💻 Usage Example
 
 ```python
 from gliclass import GLiClassModel, ZeroShotClassificationPipeline
@@ -87,7 +87,7 @@ for predict in results:
     print(f"{predict['label']} => {predict['score']:.3f}")
 ```
 
-## 🎯 Key Use Cases
+### 🎯 Key Use Cases
 
 - **Sentiment Analysis:** Rapidly classify texts as positive, negative, or neutral.
 - **Document Classification:** Efficiently organize and categorize large document collections.
@@ -95,7 +95,7 @@ for predict in results:
 - **News Categorization:** Automatically tag and organize news articles into predefined categories.
 - **Fact Checking:** Quickly validate and categorize statements based on factual accuracy.
 
-## 🛠️ How to Train
+### 🛠️ How to Train
 
 Prepare your training data as follows:
 
