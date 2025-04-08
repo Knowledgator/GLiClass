@@ -7,7 +7,7 @@ from gliclass import GLiClassModel, ZeroShotClassificationPipeline
 
 device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-model_path = "models/gliclass/deberta_base/checkpoint-3000"
+model_path = "models/checkpoint-1000"
 model = GLiClassModel.from_pretrained(model_path)
 tokenizer = AutoTokenizer.from_pretrained(model_path)
 
