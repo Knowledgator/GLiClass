@@ -12,6 +12,7 @@ wandb/
 gradio_cached_examples/
 test.ipynb
 demo1.py
+.gradio/
 
 # Distribution / packaging
 .Python

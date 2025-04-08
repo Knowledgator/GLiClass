@@ -11,7 +11,8 @@ class GLiClassDataset(Dataset):
                             prompt_first=False,
                             get_negatives = False,
                             max_labels = 50,
-                            labels_tokenizer=None):
+                            labels_tokenizer=None,
+                            shuffle_labels = True):
         self.tokenizer = tokenizer
         self.labels_tokenizer = labels_tokenizer
         self.max_length = max_length
@@ -22,6 +23,7 @@ class GLiClassDataset(Dataset):
         self.dataset_labels = self.collect_dataset_labels()
         self.get_negatives = get_negatives
         self.max_labels = max_labels
+        self.shuffle_labels = shuffle_labels
         print('Total labels: ', len(self.dataset_labels))
 
     def collect_dataset_labels(self):
@@ -34,7 +36,10 @@ class GLiClassDataset(Dataset):
         if problem_type == 'single_label_classification':
             labels = label2idx[example['true_labels'][0]]
         elif problem_type == 'multi_label_classification':
-            labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
+            if isinstance(example['true_labels'], dict):
+                labels = [example['true_labels'][label] if label in example['true_labels'] else 0. for label in example['all_labels']]
+            else:
+                labels = [1. if label in example['true_labels'] else 0. for label in example['all_labels']]
         else:
             raise NotImplementedError(f"{problem_type} is not implemented.")
         return torch.tensor(labels)
@@ -56,8 +61,8 @@ class GLiClassDataset(Dataset):
         return tokenized_inputs
     
     def tokenize_and_prepare_labels_for_uniencoder(self, example):
-        random.shuffle(example['all_labels'])
-        random.shuffle(example['true_labels'])
+        if self.shuffle_labels:
+            random.shuffle(example['all_labels'])
         input_text = self.prepare_prompt(example)
         if self.prompt_first:
             input_text = ''.join(input_text)+str(example['text'])
@@ -70,8 +75,8 @@ class GLiClassDataset(Dataset):
         return tokenized_inputs
 
     def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
-        random.shuffle(example['all_labels'])
-        random.shuffle(example['true_labels'])
+        if self.shuffle_labels:
+            random.shuffle(example['all_labels'])
         class_texts = self.prepare_prompt(example)
         class_texts = ''.join(class_texts)
 
@@ -85,8 +90,8 @@ class GLiClassDataset(Dataset):
         return tokenized_inputs
 
     def tokenize_and_prepare_labels_for_biencoder(self, example):
-        random.shuffle(example['all_labels'])
-        random.shuffle(example['true_labels'])
+        if self.shuffle_labels:
+            random.shuffle(example['all_labels'])
         def prepare_prompt(labels):
             prompt_texts = []
             for label in labels:

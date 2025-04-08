@@ -31,6 +31,7 @@ def compute_metrics(p):
     elif args.problem_type == 'multi_label_classification':
         predictions = predictions.reshape(-1)
         preds = (predictions > 0.5).astype(int)
+        labels = np.where(labels>0.5, 1, 0)
         precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
         accuracy = accuracy_score(labels, preds)
         return {
@@ -73,15 +74,9 @@ def main(args):
             extract_text_features=args.extract_text_features,
             architecture_type=args.architecture_type,
             prompt_first=args.prompt_first,
-            squeeze_layers=args.squeeze_layers
+            squeeze_layers=args.squeeze_layers,
+            shuffle_labels=args.shuffle_labels
         )
-
-        if args.label_model_name is not None:
-            labels_tokenizer = AutoTokenizer.from_pretrained(args.label_model_name)
-        else:
-            labels_tokenizer = None
-
-        glicalss_config.problem_type = args.problem_type
 
         model = GLiClassModel(glicalss_config, from_pretrained=True)
 
@@ -91,7 +86,14 @@ def main(args):
             model.resize_token_embeddings(len(tokenizer))
 
     model.to(device)
-        
+
+    if model.config.label_model_name is not None:
+        labels_tokenizer = AutoTokenizer.from_pretrained(model.config.label_model_name)
+    else:
+        labels_tokenizer = None
+
+    model.config.problem_type = args.problem_type
+
     with open(args.data_path, 'r') as f:
         data = json.load(f)
 
@@ -150,7 +152,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_name', type=str, default= None)
     parser.add_argument('--encoder_model_name', type=str, default = 'microsoft/deberta-v3-small')
     parser.add_argument('--label_model_name', type=str, default = "BAAI/bge-small-en-v1.5")
-    parser.add_argument('--save_path', type=str, default = 'models/biencoder')
+    parser.add_argument('--save_path', type=str, default = 'models/')
     parser.add_argument('--data_path', type=str, default = 'zero-cats.json')
     parser.add_argument('--problem_type', type=str, default='multi_label_classification')
     parser.add_argument('--pooler_type', type=str, default='avg')
@@ -161,10 +163,11 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_first', type=bool, default=True)
     parser.add_argument('--use_lstm', type=bool, default=False)
     parser.add_argument('--squeeze_layers', type=bool, default=False)
-    parser.add_argument('--num_epochs', type=int, default=5)
+    parser.add_argument('--shuffle_labels', type=bool, default=True)
+    parser.add_argument('--num_epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=8)
-    parser.add_argument('--encoder_lr', type=float, default=3e-5)
-    parser.add_argument('--others_lr', type=float, default=5e-5)
+    parser.add_argument('--encoder_lr', type=float, default=1e-5)
+    parser.add_argument('--others_lr', type=float, default=3e-5)
     parser.add_argument('--encoder_weight_decay', type=float, default=0.01)
     parser.add_argument('--others_weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
