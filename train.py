@@ -153,7 +153,7 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_model_name', type=str, default = 'microsoft/deberta-v3-small')
     parser.add_argument('--label_model_name', type=str, default = "BAAI/bge-small-en-v1.5")
     parser.add_argument('--save_path', type=str, default = 'models/')
-    parser.add_argument('--data_path', type=str, default = 'zero-cats.json')
+    parser.add_argument('--data_path', type=str, default = 'data/zero-cats.json')
     parser.add_argument('--problem_type', type=str, default='multi_label_classification')
     parser.add_argument('--pooler_type', type=str, default='avg')
     parser.add_argument('--scorer_type', type=str, default='simple')

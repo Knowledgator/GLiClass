@@ -138,17 +138,6 @@ def main(args):
         data = json.load(f)[:]
     init_ld = len(data)*1
 
-    with open('data/gliclass_v2.json', 'r') as f:
-        add_data = json.load(f)
-        random.shuffle(add_data)
-        data.extend(add_data[:init_ld])
-        # data = add_data[:init_ld]
-
-    with open('data/multilang_nli_gliclass.json', 'r') as f:
-        add_data = json.load(f)
-        random.shuffle(add_data)
-        data.extend(add_data[:init_ld])
-
     print('Dataset size:', len(data))
     random.shuffle(data)    
     print('Dataset is shuffled...')
