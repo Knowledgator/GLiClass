@@ -11,7 +11,7 @@
     <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
     <a href="https://huggingface.co/models?library=gliclass&sort=trending">🤗 Available models</a>
     <span>&nbsp;&nbsp;•&nbsp;&nbsp;</span>
-    <a href="https://colab.research.google.com/drive/1mhalKWzmfSTqMnR0wQBZvt9-ktTsATHB?usp=sharing">
+    <a href="https://colab.research.google.com/github/Knowledgator/GLiClass/blob/main/finetuning.ipynb">
         <img align="center" src="https://colab.research.google.com/assets/colab-badge.svg" />
     </a>
 </p>
@@ -114,3 +114,5 @@ Optionally, specify confidence scores explicitly:
   ...
 ]
 ```
+
+Please, refer to the `train.py` script to set up your training from scratch or fine-tune existing models.
