@@ -19,10 +19,13 @@ class BaseZeroShotClassificationPipeline(ABC):
         self.max_length = max_length
         self.progress_bar = progress_bar
 
-        if torch.cuda.is_available() and 'cuda' in device:
-            self.device = torch.device(device)
+        if not isinstance(device, torch.device):
+            if torch.cuda.is_available() and 'cuda' in device:
+                self.device = torch.device(device)
+            else:
+                self.device = torch.device('cpu')
         else:
-            self.device = torch.device('cpu')
+            self.device = device
 
         if self.model.device != self.device:
             self.model.to(self.device)
@@ -81,23 +84,26 @@ class BaseZeroShotClassificationPipeline(ABC):
             same_labels = False
             
         results = []
-
         iterable = range(0, len(texts), batch_size)
         if self.progress_bar:
             iterable = tqdm(iterable)
 
         for idx in iterable:
             batch_texts = texts[idx:idx+batch_size]
-            tokenized_inputs = self.prepare_inputs(batch_texts, labels, same_labels)
+            if not same_labels:
+                batch_labels = labels[idx:idx+batch_size]
+            else:
+                batch_labels = labels
+            tokenized_inputs = self.prepare_inputs(batch_texts, batch_labels, same_labels)
             model_output = self.model(**tokenized_inputs)
             logits = model_output.logits
             if self.classification_type == 'single-label':
                 for i in range(len(batch_texts)):
                     score = torch.softmax(logits[i], dim=-1)
                     if same_labels:
-                        curr_labels = labels
+                        curr_labels = batch_labels
                     else:
-                        curr_labels = labels[i]
+                        curr_labels = batch_labels[i]
                     pred_label = curr_labels[torch.argmax(score).item()]
                     results.append([{'label': pred_label, 'score': score.max().item()}])
             elif self.classification_type == 'multi-label':
@@ -106,17 +112,16 @@ class BaseZeroShotClassificationPipeline(ABC):
                 for i in range(len(batch_texts)):
                     text_results = []
                     if same_labels:
-                        curr_labels = labels
+                        curr_labels = batch_labels
                     else:
-                        curr_labels = labels[i]
-                    for j, prob in enumerate(probs[i]):
+                        curr_labels = batch_labels[i]
+                    for j, prob in enumerate(probs[i][:len(curr_labels)]):
                         score = prob.item()
-                        if score>threshold:
+                        if score>=threshold and len(curr_labels):
                             text_results.append({'label': curr_labels[j], 'score': score})
                     results.append(text_results)
             else:
                 raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
-        
         return results
     
 class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):

@@ -67,6 +67,8 @@ class GLiClassDataset(Dataset):
 
         tokenized_inputs = self.tokenize(input_text)
         tokenized_inputs['labels'] = self.prepare_labels(example, label2idx, self.problem_type)
+        tokenized_inputs['labels_text'] =  example['all_labels']
+        tokenized_inputs['input_texts'] = example['text']
         return tokenized_inputs
 
     def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
@@ -179,18 +181,25 @@ class DataCollatorWithPadding:
         
         for key in keys:
             key_data = [item[key] for item in batch]
-            
             if isinstance(key_data[0], torch.Tensor):
                 if  key_data[0].dim() == 1:
                     padded_batch[key] = pad_sequence(key_data, batch_first=True)
                 elif key_data[0].dim() == 2: 
                     padded_batch[key] = pad_2d_tensor(key_data)
             elif isinstance(key_data[0], list):
-                max_length = max(len(seq) for seq in key_data)
-                padded_batch[key] = torch.tensor([seq + [0] * (max_length - len(seq)) 
-                                                    for seq in key_data])
+                data_el = "string"
+                if len(key_data[0]):
+                    data_el = key_data[0][0]
+                if isinstance(data_el, str):
+                    padded_batch[key] = key_data
+                else:
+                    max_length = max(len(seq) for seq in key_data)
+                    padded_batch[key] = torch.tensor([seq + [0] * (max_length - len(seq)) 
+                                                        for seq in key_data])
             elif type(key_data[0]) in {int, float}:
                 padded_batch[key] = torch.tensor(key_data)
+            elif isinstance(key_data[0], str):
+                padded_batch[key] = key_data
             else:
                 raise TypeError(f"Unsupported data type: {type(key_data[0])}")
         
