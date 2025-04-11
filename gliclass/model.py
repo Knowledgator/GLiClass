@@ -277,7 +277,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             if decoder:
                 self.encoder_model = ModelClass(config.encoder_config)
             else:
-                if config_name in {'T5Config', 'MT5Config'}:
+                if config_name in {'T5Config', 'MT5Config', 'DebertaV2Config'}:
                     self.encoder_model = ModelClass._from_config(
                         config.encoder_config
                     )

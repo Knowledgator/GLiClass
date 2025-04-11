@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gliclass"
-version = "0.1.10"
+version = "0.1.11"
 description = "Generalist and Lightweight Model for Text Classification"
 authors = ["knowledgator.com"]
 readme = "README.md"
