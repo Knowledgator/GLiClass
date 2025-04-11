@@ -13,7 +13,6 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.utils import (logging)
 from transformers.models.auto import AutoModel
-from transformers import T5EncoderModel
 from .config import GLiClassModelConfig
 from .layers import FeaturesProjector, LstmSeq2SeqEncoder, BiEncoderProjector, LayerwiseAttention
 from .poolings import POOLING2OBJECT
@@ -23,6 +22,8 @@ from .utils import is_module_available, MissedPackageException
 
 IS_LLM2VEC = is_module_available('llm2vec')
 IS_PEFT = is_module_available('peft')
+IS_TURBOT5 = is_module_available('turbot5')
+IS_FLASHDEBERTA = is_module_available('flashdeberta')
 
 logger = logging.get_logger(__name__)
 
@@ -36,6 +37,16 @@ if IS_LLM2VEC:
     }
 else:
     DECODER_MODEL_MAPPING = {}
+
+if IS_TURBOT5:
+    from turbot5.model.modeling import T5EncoderModel
+else:
+    from transformers import T5EncoderModel
+
+if IS_FLASHDEBERTA:
+    from flashdeberta import FlashDebertaV2Model as DebertaV2Model
+else:
+    from transformers import DebertaV2Model
 
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
@@ -251,6 +262,9 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         elif config_name in {'T5Config', 'MT5Config'}:
             decoder = False
             ModelClass = T5EncoderModel
+        elif config_name in {'DebertaV2Config'}:
+            decoder = False
+            ModelClass = DebertaV2Model
         else:
             decoder = False
             ModelClass = AutoModel
