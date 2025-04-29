@@ -34,8 +34,10 @@ class GLiClassModelConfig(PretrainedConfig):
         extract_text_features=False,
         contrastive_loss_coef=0,
         architecture_type = 'uni-encoder',
-        prompt_first = False,
+        prompt_first = True,
         squeeze_layers = False,
+        layer_wise = False,
+        encoder_layer_id = -1,
         embed_class_token = True, 
         **kwargs,
     ):
@@ -102,5 +104,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.prompt_first = prompt_first
         self.squeeze_layers = squeeze_layers
         self.embed_class_token = embed_class_token
+        self.layer_wise = layer_wise
+        self.encoder_layer_id = encoder_layer_id
         super().__init__(**kwargs)
 
