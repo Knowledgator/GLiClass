@@ -36,6 +36,8 @@ class GLiClassModelConfig(PretrainedConfig):
         architecture_type = 'uni-encoder',
         prompt_first = False,
         squeeze_layers = False,
+        layer_wise = False,
+        encoder_layer_id = -1,
         embed_class_token = True, 
         **kwargs,
     ):
@@ -101,6 +103,8 @@ class GLiClassModelConfig(PretrainedConfig):
         self.architecture_type = architecture_type
         self.prompt_first = prompt_first
         self.squeeze_layers = squeeze_layers
+        self.layer_wise = layer_wise
+        self.encoder_layer_id = encoder_layer_id
         self.embed_class_token = embed_class_token
         super().__init__(**kwargs)
 

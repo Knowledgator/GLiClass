@@ -75,6 +75,8 @@ def main(args):
             architecture_type=args.architecture_type,
             prompt_first=args.prompt_first,
             squeeze_layers=args.squeeze_layers,
+            layer_wise=args.layer_wise,
+            encoder_layer_id=args.encoder_layer_id,
             shuffle_labels=args.shuffle_labels
         )
 
@@ -163,6 +165,8 @@ if __name__ == '__main__':
     parser.add_argument('--prompt_first', type=bool, default=True)
     parser.add_argument('--use_lstm', type=bool, default=False)
     parser.add_argument('--squeeze_layers', type=bool, default=False)
+    parser.add_argument('--layer_wise', type=bool, default=False)
+    parser.add_argument('--encoder_layer_id', type=int, default=-1)
     parser.add_argument('--shuffle_labels', type=bool, default=True)
     parser.add_argument('--num_epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=8)
