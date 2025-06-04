@@ -29,6 +29,7 @@ class GLiClassModelConfig(PretrainedConfig):
         pooling_strategy='first',
         focal_loss_alpha=0.5,
         focal_loss_gamma=2,
+        focal_loss_reduction=None,
         logit_scale_init_value=2.6592,
         normalize_features=False,
         extract_text_features=False,
@@ -94,6 +95,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.use_lstm = use_lstm
         self.focal_loss_alpha=focal_loss_alpha
         self.focal_loss_gamma=focal_loss_gamma
+        self.focal_loss_reduction = focal_loss_reduction
         self.contrastive_loss_coef=contrastive_loss_coef
         self.logit_scale_init_value = logit_scale_init_value
         self.normalize_features=normalize_features
