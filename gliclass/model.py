@@ -295,46 +295,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                 adapter_config = LoraConfig.from_pretrained(config.encoder_model_name)
                 self.encoder_model = get_peft_model(self.encoder_model, adapter_config)
 
-    def forward(
-        self,
-        input_ids: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
-        labels: Optional[torch.Tensor] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        output_text_embeddings: Optional[bool] = None,
-        output_class_embeddings:  Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        **kwargs
-    ) -> Union[Tuple, GLiClassOutput]:
-        r"""
-        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
-            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
-            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
-            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
-        """
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
-
-        if self.config.squeeze_layers:
-            output_hidden_states = True
-            return_dict = True
-
-        outputs = self.encoder_model(
-            input_ids,
-            attention_mask=attention_mask,
-            # inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs
-        )
-
-        if self.config.squeeze_layers:
-            encoder_layer = self.layer_wise_attention(outputs.hidden_states)
-        else:
-            encoder_layer = outputs[0]
-
+    def process_encoder_output(self, input_ids, attention_mask, encoder_layer, labels = None):
         classes_embedding, classes_embedding_mask, text_token_embeddings, text_mask = self._extract_class_features(encoder_layer, 
                                                                                                             input_ids, attention_mask)
         if self.config.use_lstm:
@@ -356,6 +317,58 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             logits = logits*self.logit_scale.to(classes_embedding.device)
         
         loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
+        return (logits, loss, pooled_output, classes_embedding)
+    
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_text_embeddings: Optional[bool] = None,
+        output_class_embeddings:  Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs
+    ) -> Union[Tuple, GLiClassOutput]:
+        r"""
+        labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
+            Labels for computing the sequence classification/regression loss. Indices should be in `[0, ...,
+            config.num_labels - 1]`. If `config.num_labels == 1` a regression loss is computed (Mean-Square loss), If
+            `config.num_labels > 1` a classification loss is computed (Cross-Entropy).
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.config.squeeze_layers or self.config.layer_wise:
+            output_hidden_states = True
+            return_dict = True
+
+        outputs = self.encoder_model(
+            input_ids,
+            attention_mask=attention_mask,
+            # inputs_embeds=inputs_embeds,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs
+        )
+
+        if self.config.layer_wise and labels is not None:
+            hidden_states = outputs.hidden_states
+            loss = 0
+            for encoder_layer in hidden_states:
+                logits, layer_loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels)
+                loss+=layer_loss
+        else:
+            if self.config.encoder_layer_id==-1:
+                if self.config.squeeze_layers:
+                    encoder_layer = self.layer_wise_attention(outputs.hidden_states)
+                else:
+                    encoder_layer = outputs[0]
+            else:
+                encoder_layer = outputs.hidden_states[self.config.encoder_layer_id]
+            logits, loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
