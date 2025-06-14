@@ -71,7 +71,8 @@ def main(args):
 
     if args.model_name is not None:
         model = GLiClassModel.from_pretrained(args.model_name, focal_loss_alpha=args.focal_loss_alpha,
-                                                                focal_loss_gamma=args.focal_loss_gamma)
+                                                                focal_loss_gamma=args.focal_loss_gamma,
+                                                                focal_loss_reduction=args.focal_loss_reduction)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.encoder_model_name)
@@ -92,6 +93,7 @@ def main(args):
             use_lstm=args.use_lstm,
             focal_loss_alpha=args.focal_loss_alpha,
             focal_loss_gamma=args.focal_loss_gamma,
+            focal_loss_reduction=args.focal_loss_reduction,
             labels_smoothing=args.labels_smoothing,
             entropy_beta=args.entropy_beta,
             kl_beta=args.kl_beta,
@@ -156,6 +158,8 @@ def main(args):
 
     data_collator = DataCollatorWithPadding(device=device)
 
+    compute_metrics_func = compute_metrics if args.use_compute_metrics else None
+
     training_args = RLTrainerConfig(
         output_dir=args.save_path,
         learning_rate=args.encoder_lr,
@@ -188,6 +192,7 @@ def main(args):
         eval_dataset=test_dataset,
         tokenizer=tokenizer,
         data_collator=data_collator,
+        compute_metrics=compute_metrics_func,
         reward_components={
             'micro_f1': default_f1_reward,
         },
@@ -222,6 +227,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
     parser.add_argument('--focal_loss_gamma', type=float, default=-1)
+    parser.add_argument('--focal_loss_reduction', type=str, default='none', choices=['none', 'mean', 'sum'])
     parser.add_argument('--labels_smoothing', type=float, default=-1)
     parser.add_argument('--entropy_beta', type=float, default=-1)
     parser.add_argument('--kl_beta', type=float, default=0.1)
@@ -233,6 +239,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_total_limit', type=int, default=3)
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)
+    parser.add_argument('--use_compute_metrics', type=bool, default=False)
     args = parser.parse_args()
 
     main(args)

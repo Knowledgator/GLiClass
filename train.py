@@ -48,7 +48,8 @@ def main(args):
 
     if args.model_name is not None:
         model = GLiClassModel.from_pretrained(args.model_name, focal_loss_alpha=args.focal_loss_alpha,
-                                                                focal_loss_gamma=args.focal_loss_gamma)
+                                                                focal_loss_gamma=args.focal_loss_gamma,
+                                                                focal_loss_reduction=args.focal_loss_reduction)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     else:
         tokenizer = AutoTokenizer.from_pretrained(args.encoder_model_name)
@@ -69,6 +70,7 @@ def main(args):
             use_lstm=args.use_lstm,
             focal_loss_alpha=args.focal_loss_alpha,
             focal_loss_gamma=args.focal_loss_gamma,
+            focal_loss_reduction=args.focal_loss_reduction,
             contrastive_loss_coef=args.contrastive_loss_coef,
             normalize_features=args.normalize_features,
             extract_text_features=args.extract_text_features,
@@ -178,6 +180,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
     parser.add_argument('--focal_loss_gamma', type=float, default=-1)
+    parser.add_argument('--focal_loss_reduction', type=str, default='none', choices=['none', 'mean', 'sum'])
     parser.add_argument('--contrastive_loss_coef', type=float, default=0.)
     parser.add_argument('--max_length', type=int, default=1024)
     parser.add_argument('--save_steps', type=int, default=1000)
