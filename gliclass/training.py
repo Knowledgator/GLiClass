@@ -4,15 +4,24 @@ import numpy as np
 import os
 from dataclasses import dataclass, field
 import torch
+from torch import nn
 from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
-    ALL_LAYERNORM_LAYERS,
 )
 import transformers
 from transformers import ZeroShotClassificationPipeline as TransformersClassificationPipeline
-from .utils import default_f1_reward
+from .utils import default_f1_reward, is_module_available
 from .pipeline import ZeroShotClassificationPipeline
+
+if is_module_available("apex"):
+    from apex import amp
+    _has_apex = True
+else:
+    _has_apex = False
+    amp = None
+
+ALL_LAYERNORM_LAYERS = [nn.LayerNorm, nn.RMSNorm]
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -43,13 +52,10 @@ class Trainer(transformers.Trainer):
         model.train()
         try:
             if "labels_text" in inputs:
-                labels_text = inputs.pop('labels_text')
+                inputs.pop('labels_text')
             if "input_texts" in inputs:
-                input_texts = inputs.pop('input_texts')
+                inputs.pop('input_texts')
             inputs = self._prepare_inputs(inputs)
-            if is_sagemaker_mp_enabled():
-                loss_mb = smp_forward_backward(model, inputs, self.args.gradient_accumulation_steps)
-                return loss_mb.reduce_mean().detach().to(self.args.device)
 
             with self.compute_loss_context_manager():
                 loss = self.compute_loss(model, inputs)
@@ -59,14 +65,10 @@ class Trainer(transformers.Trainer):
 
             kwargs = {}
 
-            # For LOMO optimizers you need to explicitly use the learnign rate
-            # if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
-            #     kwargs["learning_rate"] = self._get_learning_rate()
-
             if self.args.n_gpu > 1:
                 loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-            if self.use_apex:
+            if self.use_apex and _has_apex:
                 with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
@@ -108,9 +110,9 @@ class Trainer(transformers.Trainer):
         try:
             with torch.no_grad():
                 if "labels_text" in inputs:
-                    labels_text = inputs.pop('labels_text')
+                    inputs.pop('labels_text')
                 if "input_texts" in inputs:
-                    input_texts = inputs.pop('input_texts')
+                    inputs.pop('input_texts')
                 loss = None
                 with self.compute_loss_context_manager():
                     try:

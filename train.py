@@ -130,7 +130,6 @@ def main(args):
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         num_train_epochs=args.num_epochs,
-        evaluation_strategy="epoch",
         save_steps = args.save_steps,
         save_total_limit=args.save_total_limit,
         dataloader_num_workers = args.num_workers,

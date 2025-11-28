@@ -60,6 +60,7 @@ class GLiClassPreTrainedModel(PreTrainedModel):
     config_class = GLiClassModelConfig
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
+    _supports_sdpa = False
     _keys_to_ignore_on_load_unexpected = ["position_embeddings"]
     
     def _init_weights(self, module):
@@ -86,14 +87,6 @@ class GLiClassPreTrainedModel(PreTrainedModel):
                     nn.init.normal_(param.data, mean=0.0, std=std)
                 elif 'bias' in name:
                     param.data.zero_()
-    @property
-    def _supports_sdpa(self):
-        """
-        Retrieve language_model's attribute to check whether the model supports
-        SDPA or not.
-        """
-        return self.language_model._supports_sdpa
-
 
 class GLiClassBaseModel(nn.Module):#):
     def __init__(self, config: GLiClassModelConfig, device='cpu', **kwargs):
