@@ -10,7 +10,7 @@ python = ">=3.9,<4.0"
 torch = "^2.0.0"
 transformers = ">=4.57.3"
 scikit-learn = "^1.0.0" 
-numpy = "^1.26.4"
+numpy = "^2.0.0"
 
 
 [build-system]
