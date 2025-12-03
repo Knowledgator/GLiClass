@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "gliclass"
-version = "0.1.11"
+version = "0.1.12"
 description = "Generalist and Lightweight Model for Text Classification"
 authors = ["knowledgator.com"]
 readme = "README.md"
@@ -8,7 +8,7 @@ readme = "README.md"
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"
 torch = "^2.0.0"
-transformers = ">=4.37.2,<=4.48.2"
+transformers = ">=4.57.3"
 scikit-learn = "^1.0.0" 
 numpy = "^1.26.4"
 
