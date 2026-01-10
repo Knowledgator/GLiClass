@@ -12,7 +12,7 @@ import torch
 
 from gliclass import GLiClassModelConfig, GLiClassModel
 from gliclass.training import TrainingArguments, Trainer
-from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset
+from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset, AugmentationConfig
 
 
 def compute_metrics(p, problem_type='multi_label_classification'):
@@ -67,40 +67,6 @@ def load_dataset(data_path: str) -> list:
     with open(data_path, 'r') as f:
         data = json.load(f)
     return data
-
-
-def create_gliclass_dataset(
-    data: list,
-    tokenizer,
-    max_length: int,
-    problem_type: str,
-    architecture_type: str,
-    prompt_first: bool,
-    labels_tokenizer=None
-) -> GLiClassDataset:
-    """Create a GLiClassDataset from data.
-    
-    Args:
-        data: List of data samples
-        tokenizer: Tokenizer for text encoding
-        max_length: Maximum sequence length
-        problem_type: Classification problem type
-        architecture_type: Model architecture type
-        prompt_first: Whether prompt comes first
-        labels_tokenizer: Optional separate tokenizer for labels
-        
-    Returns:
-        GLiClassDataset instance
-    """
-    return GLiClassDataset(
-        data, 
-        tokenizer, 
-        max_length,
-        problem_type, 
-        architecture_type,
-        prompt_first, 
-        labels_tokenizer=labels_tokenizer
-    )
 
 
 def main(args):
@@ -174,17 +140,36 @@ def main(args):
     test_data = data[int(len(data) * 0.9):]
     print('Dataset is splitted...')
 
-    # Create datasets
-    train_dataset = create_gliclass_dataset(
-        train_data, tokenizer, args.max_length,
-        args.problem_type, args.architecture_type,
-        args.prompt_first, labels_tokenizer=labels_tokenizer
+    # Create augmentation config with all parameters
+    augment_config = AugmentationConfig(
+        enabled=args.enable_augmentation,
+        random_label_removal_prob=args.random_label_removal_prob,
+        random_label_addition_prob=args.random_label_addition_prob,
+        random_text_addition_prob=args.random_text_addition_prob,
+        random_add_description_prob=args.random_add_description_prob,
+        random_add_synonyms_prob=args.random_add_synonyms_prob,
+        random_add_examples_prob=args.random_add_examples_prob,
+        max_num_examples=args.max_num_examples
     )
-    test_dataset = create_gliclass_dataset(
-        test_data, tokenizer, args.max_length,
-        args.problem_type, args.architecture_type,
-        args.prompt_first, labels_tokenizer=labels_tokenizer
-    )
+    
+    if args.labels_desc_path is not None:
+        labels_descriptions = load_dataset(args.labels_desc_path)
+        label_to_description = {item.get("label"): item for item in labels_descriptions}
+    else:
+        label_to_description = {}
+
+    train_dataset = GLiClassDataset(train_data, tokenizer, augment_config, 
+                                    label_to_description, args.max_length, 
+                                    args.problem_type, args.architecture_type, 
+                                    args.prompt_first, labels_tokenizer=labels_tokenizer)
+    
+    # Disable augmentation for test dataset
+    test_augment_config = AugmentationConfig(enabled=False)
+    test_dataset = GLiClassDataset(test_data, tokenizer, test_augment_config, 
+                                        label_to_description,
+                                        args.max_length, args.problem_type, 
+                                        args.architecture_type, args.prompt_first,
+                                        labels_tokenizer = labels_tokenizer)
 
     # Load previous dataset for EWC if provided
     prev_dataset = None
@@ -199,11 +184,11 @@ def main(args):
             prev_data = prev_data[:args.ewc_fisher_samples]
             print(f'Using {len(prev_data)} samples for Fisher estimation')
         
-        prev_dataset = create_gliclass_dataset(
-            prev_data, tokenizer, args.max_length,
-            args.problem_type, args.architecture_type,
-            args.prompt_first, labels_tokenizer=labels_tokenizer
-        )
+        prev_dataset = GLiClassDataset(prev_data, tokenizer, test_augment_config, 
+                                        label_to_description,
+                                        args.max_length, args.problem_type, 
+                                        args.architecture_type, args.prompt_first,
+                                        labels_tokenizer = labels_tokenizer)
 
     data_collator = DataCollatorWithPadding(device=device)
 
@@ -284,7 +269,8 @@ if __name__ == '__main__':
                         help='Path to training data JSON file')
     parser.add_argument('--prev_data_path', type=str, default=None,
                         help='Path to previous task data for EWC (required if use_ewc=True)')
-    
+    parser.add_argument('--labels_desc_path', type=str, default = None)
+
     # Model architecture arguments
     parser.add_argument('--problem_type', type=str, default='multi_label_classification',
                         choices=['single_label_classification', 'multi_label_classification'])
@@ -315,6 +301,17 @@ if __name__ == '__main__':
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)
     
+    # Augmentation parameters
+    parser.add_argument('--enable_augmentation', type=bool, default=True)
+    parser.add_argument('--random_label_removal_prob', type=float, default=0.05)
+    parser.add_argument('--random_label_addition_prob', type=float, default=0.05)
+    parser.add_argument('--random_text_addition_prob', type=float, default=0.05)
+    parser.add_argument('--random_add_description_prob', type=float, default=0.05)
+    parser.add_argument('--random_add_synonyms_prob', type=float, default=0.05)
+    parser.add_argument('--random_add_examples_prob', type=float, default=0.1)
+    parser.add_argument('--max_num_examples', type=int, default=5)
+
+
     # Loss arguments
     parser.add_argument('--focal_loss_alpha', type=float, default=-1)
     parser.add_argument('--focal_loss_gamma', type=float, default=-1)
