@@ -9,6 +9,9 @@ from transformers.trainer import (
     is_sagemaker_mp_enabled,
     get_parameter_names,
 )
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+
 import transformers
 from transformers import ZeroShotClassificationPipeline as TransformersClassificationPipeline
 from .utils import default_f1_reward, is_module_available
@@ -23,6 +26,280 @@ else:
 
 ALL_LAYERNORM_LAYERS = [nn.LayerNorm, nn.RMSNorm]
 
+class EWC:
+    """Elastic Weight Consolidation for preventing catastrophic forgetting in GLiClass models."""
+    
+    def __init__(
+        self,
+        model: nn.Module,
+        dataset: Dataset,
+        data_collator: Optional[Any] = None,
+        device: str = 'cpu',
+        ewc_lambda: float = 100.0,
+        batch_size: int = 8,
+        num_samples: Optional[int] = None,
+        fisher_estimation_method: str = 'empirical',
+        normalize_fisher: bool = True
+    ):
+        """Initialize EWC.
+        
+        Args:
+            model: The GLiClass model to apply EWC to
+            dataset: Dataset from previous task to compute Fisher information
+            data_collator: Data collator for batching (required for GLiClass)
+            device: Device to use for computation
+            ewc_lambda: Importance weight for EWC penalty (higher = more regularization)
+            batch_size: Batch size for Fisher computation
+            num_samples: Number of samples to use for Fisher estimation (None = use all)
+            fisher_estimation_method: Method for Fisher estimation ('empirical' or 'diagonal')
+            normalize_fisher: Whether to normalize Fisher information values
+        """
+        self.model = model
+        self.device = device
+        self.ewc_lambda = ewc_lambda
+        self.batch_size = batch_size
+        self.num_samples = num_samples
+        self.fisher_estimation_method = fisher_estimation_method
+        self.normalize_fisher = normalize_fisher
+        self.data_collator = data_collator
+        
+        # Store old parameters (deep copy to avoid reference issues)
+        self.old_params: Dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.old_params[name] = param.data.clone().detach()
+        
+        # Compute Fisher information matrix
+        self.fisher_info: Dict[str, torch.Tensor] = self._compute_fisher(dataset)
+        
+        # Optionally normalize Fisher information
+        if self.normalize_fisher:
+            self._normalize_fisher()
+    
+    def _compute_fisher(
+        self,
+        dataset: Dataset
+    ) -> Dict[str, torch.Tensor]:
+        """Compute diagonal Fisher information matrix.
+        
+        The Fisher information measures how sensitive the loss is to changes
+        in each parameter. Parameters with high Fisher information are important
+        for the previous task.
+        
+        Args:
+            dataset: Dataset to compute Fisher information from
+            
+        Returns:
+            Dictionary mapping parameter names to Fisher information tensors
+        """
+        # Initialize Fisher information to zeros
+        fisher: Dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                fisher[name] = torch.zeros_like(param, device=self.device)
+        
+        # Set model to evaluation mode for consistent behavior
+        was_training = self.model.training
+        self.model.eval()
+        
+        # Create dataloader
+        if self.num_samples is not None and self.num_samples < len(dataset):
+            # Subsample dataset for efficiency
+            indices = torch.randperm(len(dataset))[:self.num_samples].tolist()
+            subset = torch.utils.data.Subset(dataset, indices)
+            loader = DataLoader(
+                subset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                collate_fn=self.data_collator
+            )
+        else:
+            loader = DataLoader(
+                dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                collate_fn=self.data_collator
+            )
+        
+        num_batches = len(loader)
+        
+        print(f"Computing Fisher information from {len(loader.dataset)} samples...")
+        
+        # Compute Fisher information
+        for batch in tqdm(loader, desc="Computing Fisher"):
+            self.model.zero_grad()
+            
+            # Prepare inputs - handle GLiClass specific fields
+            if isinstance(batch, dict):
+                # Remove non-tensor fields that GLiClass might have
+                inputs = {k: v for k, v in batch.items() 
+                         if k not in ['labels_text', 'input_texts']}
+                
+                # Move tensors to device
+                for k, v in inputs.items():
+                    if isinstance(v, torch.Tensor):
+                        inputs[k] = v.to(self.device)
+            else:
+                inputs = batch
+            
+            try:
+                # Forward pass
+                outputs = self.model(**inputs)
+                
+                if self.fisher_estimation_method == 'empirical':
+                    # Use the actual loss for empirical Fisher
+                    if hasattr(outputs, 'loss') and outputs.loss is not None:
+                        loss = outputs.loss
+                    else:
+                        # Compute loss manually if not provided
+                        logits = outputs.logits
+                        labels = inputs.get('labels')
+                        if labels is not None:
+                            # Handle multi-label classification
+                            if self.model.config.problem_type == 'multi_label_classification':
+                                loss = F.binary_cross_entropy_with_logits(
+                                    logits.view(-1),
+                                    labels.view(-1).float()
+                                )
+                            else:
+                                loss = F.cross_entropy(
+                                    logits.view(-1, logits.size(-1)),
+                                    labels.view(-1)
+                                )
+                        else:
+                            continue
+                else:
+                    # Diagonal Fisher: sample from model's predictive distribution
+                    logits = outputs.logits
+                    
+                    if self.model.config.problem_type == 'multi_label_classification':
+                        probs = torch.sigmoid(logits)
+                        # Sample binary labels
+                        sampled_labels = torch.bernoulli(probs)
+                        loss = F.binary_cross_entropy_with_logits(
+                            logits.view(-1),
+                            sampled_labels.view(-1)
+                        )
+                    else:
+                        probs = F.softmax(logits, dim=-1)
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        sampled_labels = torch.multinomial(
+                            probs.view(-1, probs.size(-1)), 1
+                        ).squeeze(-1)
+                        loss = F.nll_loss(
+                            log_probs.view(-1, log_probs.size(-1)),
+                            sampled_labels
+                        )
+                
+                # Backward pass to compute gradients
+                loss.backward()
+                
+                # Accumulate squared gradients (Fisher information)
+                for name, param in self.model.named_parameters():
+                    if param.requires_grad and param.grad is not None:
+                        fisher[name] += param.grad.data ** 2 / num_batches
+                        
+            except Exception as e:
+                print(f"Warning: Error computing Fisher for batch: {e}")
+                continue
+        
+        # Restore model training mode
+        if was_training:
+            self.model.train()
+        
+        return fisher
+    
+    def _normalize_fisher(self):
+        """Normalize Fisher information values to prevent numerical issues."""
+        # Compute max Fisher value across all parameters
+        max_fisher = 0.0
+        for name, fisher_val in self.fisher_info.items():
+            max_fisher = max(max_fisher, fisher_val.max().item())
+        
+        if max_fisher > 0:
+            # Normalize by max value
+            for name in self.fisher_info:
+                self.fisher_info[name] = self.fisher_info[name] / max_fisher
+    
+    def ewc_loss(self, batch_size: Optional[int] = None) -> torch.Tensor:
+        """Compute EWC penalty loss.
+        
+        The EWC loss penalizes changes to parameters that were important
+        for the previous task (as measured by Fisher information).
+        
+        Args:
+            batch_size: Batch size for normalization (optional)
+            
+        Returns:
+            EWC penalty loss tensor
+        """
+        loss = torch.tensor(0.0, device=self.device)
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.fisher_info:
+                # EWC penalty: F_i * (theta_i - theta_i^*)^2
+                param_diff = param - self.old_params[name].to(param.device)
+                fisher = self.fisher_info[name].to(param.device)
+                loss += (fisher * param_diff ** 2).sum()
+        
+        # Optionally normalize by batch size
+        if batch_size is not None:
+            loss = loss / batch_size
+        
+        return self.ewc_lambda * loss
+    
+    def get_importance_scores(self) -> Dict[str, float]:
+        """Get importance scores for each parameter group.
+        
+        Returns:
+            Dictionary mapping parameter names to average importance scores
+        """
+        scores = {}
+        for name, fisher in self.fisher_info.items():
+            scores[name] = fisher.mean().item()
+        return scores
+    
+    def update_lambda(self, new_lambda: float):
+        """Update the EWC lambda value.
+        
+        Args:
+            new_lambda: New lambda value for EWC penalty
+        """
+        self.ewc_lambda = new_lambda
+    
+    def consolidate(
+        self,
+        dataset: Dataset,
+        alpha: float = 0.5
+    ):
+        """Consolidate knowledge by updating Fisher information with new task.
+        
+        This allows for online EWC where multiple tasks are consolidated.
+        
+        Args:
+            dataset: Dataset from new task
+            alpha: Mixing coefficient (0 = keep old Fisher, 1 = use new Fisher only)
+        """
+        # Compute new Fisher information
+        new_fisher = self._compute_fisher(dataset)
+        
+        # Mix old and new Fisher information
+        for name in self.fisher_info:
+            if name in new_fisher:
+                self.fisher_info[name] = (
+                    (1 - alpha) * self.fisher_info[name] + 
+                    alpha * new_fisher[name]
+                )
+        
+        # Update old parameters
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.old_params[name] = param.data.clone().detach()
+        
+        # Re-normalize if needed
+        if self.normalize_fisher:
+            self._normalize_fisher()
+
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
@@ -30,7 +307,120 @@ class TrainingArguments(transformers.TrainingArguments):
     others_lr: Optional[float] = None
     others_weight_decay: Optional[float] = 0.0
 
+    use_ewc: bool = field(
+        default=False,
+        metadata={"help": "Whether to use Elastic Weight Consolidation (EWC) for continual learning."}
+    )
+    ewc_lambda: float = field(
+        default=100.0,
+        metadata={"help": "Lambda parameter for EWC penalty. Higher values = more regularization."}
+    )
+    ewc_fisher_samples: Optional[int] = field(
+        default=None,
+        metadata={"help": "Number of samples to use for Fisher information estimation. None = use all."}
+    )
+    ewc_normalize_fisher: bool = field(
+        default=True,
+        metadata={"help": "Whether to normalize Fisher information values."}
+    )
+    ewc_gamma: float = field(
+        default=0.95,
+        metadata={"help": "Decay factor for Online EWC."}
+    )
+
+
 class Trainer(transformers.Trainer):
+    """Extended Trainer with EWC support for continual learning."""
+    
+    def __init__(
+        self,
+        ewc: Optional[EWC] = None,
+        prev_dataset=None,
+        *args,
+        **kwargs
+    ):
+        """Initialize Trainer with optional EWC support.
+        
+        Args:
+            ewc: Pre-initialized EWC object (optional)
+            prev_dataset: Previous dataset for EWC initialization (optional)
+            *args: Arguments passed to parent Trainer
+            **kwargs: Keyword arguments passed to parent Trainer
+        """
+        super().__init__(*args, **kwargs)
+        self.ewc = ewc
+        self.prev_dataset = prev_dataset
+        self._ewc_initialized = ewc is not None
+    
+    def _maybe_initialize_ewc(self):
+        """Initialize EWC if needed and not already initialized."""
+        if self._ewc_initialized or not self.args.use_ewc:
+            return
+        
+        if self.prev_dataset is None:
+            print("Warning: EWC is enabled but no previous dataset provided. Skipping EWC initialization.")
+            return
+        
+        print(f"Initializing EWC with lambda={self.args.ewc_lambda}...")
+        
+        # Get the data collator
+        data_collator = self.data_collator
+        
+        # Determine device
+        device = self.model.device if hasattr(self.model, 'device') else (
+            next(self.model.parameters()).device if list(self.model.parameters()) else 'cpu'
+        )
+        
+        # Create EWC instance
+        ewc_kwargs = {
+            'model': self.model,
+            'dataset': self.prev_dataset,
+            'data_collator': data_collator,
+            'device': str(device),
+            'ewc_lambda': self.args.ewc_lambda,
+            'num_samples': self.args.ewc_fisher_samples,
+            'normalize_fisher': self.args.ewc_normalize_fisher,
+        }
+        
+        self.ewc = EWC(**ewc_kwargs)
+        self._ewc_initialized = True
+        print("EWC initialization complete.")
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Compute loss with optional EWC penalty.
+        
+        Args:
+            model: The model
+            inputs: Input batch
+            return_outputs: Whether to return model outputs
+            **kwargs: Additional arguments
+            
+        Returns:
+            Loss tensor, or tuple of (loss, outputs) if return_outputs=True
+        """
+        # Get base loss from parent
+        if return_outputs:
+            loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        else:
+            loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
+            outputs = None
+        
+        # Add EWC penalty if enabled
+        if self.ewc is not None and self.args.use_ewc:
+            batch_size = inputs.get('input_ids', inputs.get('labels')).shape[0] if isinstance(inputs, dict) else None
+            ewc_loss = self.ewc.ewc_loss(batch_size=batch_size)
+            loss = loss + ewc_loss
+        
+        if return_outputs:
+            return loss, outputs
+        return loss
+    
+    def train(self, *args, **kwargs):
+        """Train with EWC initialization."""
+        # Initialize EWC before training starts
+        self._maybe_initialize_ewc()
+        return super().train(*args, **kwargs)
+    
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
