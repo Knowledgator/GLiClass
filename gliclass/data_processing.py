@@ -249,6 +249,8 @@ class GLiClassDataset(Dataset):
                 prompt_texts.append(" \nLabels:\n ")
                 prompt_texts.append(', '.join(example.get("true_labels", [])))
         prompt_texts.append(self.sep_token)
+        prompt = item.get('prompt', '')
+        prompt_texts.append(prompt)
         return prompt_texts
     
     def tokenize(self, texts):
