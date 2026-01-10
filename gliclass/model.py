@@ -140,15 +140,78 @@ class GLiClassBaseModel(nn.Module):#):
         num_class_tokens = torch.sum(class_token_mask, dim=-1, keepdim=True)
 
         max_embed_dim = num_class_tokens.max()
-                
+        
+        # Get class token pooling method from config (default to "first" for backward compatibility)
+        class_token_pooling = getattr(self.config, 'class_token_pooling', 'first')
+        
+        if class_token_pooling == 'average':
+            # Average all tokens belonging to each class label
+            classes_embedding, classes_embedding_mask = self._extract_class_features_averaged(
+                token_embeds, input_ids, attention_mask, class_token_mask, 
+                num_class_tokens, max_embed_dim, batch_size, embed_dim
+            )
+        else:
+            # Original behavior: use only the class token (or token after it)
+            classes_embedding, classes_embedding_mask = self._extract_class_features_first(
+                token_embeds, input_ids, attention_mask, class_token_mask,
+                num_class_tokens, max_embed_dim, batch_size, embed_dim
+            )
+        
+        # Text features extraction
+        if self.config.extract_text_features:
+            text_token_mask = input_ids == self.config.text_token_index
+            
+            # Get text token start index per batch item (assuming one text token per batch)
+            # Shape: (batch_size,)
+            text_token_indices = text_token_mask.int().argmax(dim=-1)
+            
+            # Calculate text lengths per batch item
+            text_lengths = input_ids.shape[-1] - text_token_indices  # Shape: (batch_size,)
+            max_text_length = text_lengths.max().item()
+            
+            text_tokens_embeddings = torch.zeros(
+                batch_size, max_text_length, embed_dim, 
+                dtype=token_embeds.dtype, device=token_embeds.device
+            )
+            text_tokens_mask = torch.zeros(
+                batch_size, max_text_length, 
+                dtype=attention_mask.dtype, device=token_embeds.device
+            )
+            
+            # Create range tensor for target indices: (batch_size, max_text_length)
+            aranged_target_idx = torch.arange(
+                max_text_length, device=token_embeds.device
+            ).unsqueeze(0).expand(batch_size, -1)
+            
+            # Mask for valid positions: (batch_size, max_text_length)
+            valid_mask = aranged_target_idx < text_lengths.unsqueeze(1)
+            
+            # Get batch and target indices where valid
+            batch_idx, target_text_idx = torch.where(valid_mask)
+            
+            # Calculate corresponding source indices in token_embeds
+            source_text_idx = text_token_indices[batch_idx] + target_text_idx
+            
+            # Assign embeddings and mask
+            text_tokens_embeddings[batch_idx, target_text_idx] = token_embeds[batch_idx, source_text_idx]
+            text_tokens_mask[batch_idx, target_text_idx] = attention_mask[batch_idx, source_text_idx]
+        else:
+            text_tokens_embeddings = token_embeds
+            text_tokens_mask = attention_mask
+        return classes_embedding, classes_embedding_mask, text_tokens_embeddings, text_tokens_mask
+
+    def _extract_class_features_first(self, token_embeds, input_ids, attention_mask, 
+                                       class_token_mask, num_class_tokens, max_embed_dim, 
+                                       batch_size, embed_dim):
+        """Original method: extract only the class token embedding (or token after it)."""
         aranged_class_idx = torch.arange(max_embed_dim, 
                                             dtype=attention_mask.dtype, 
                                             device=token_embeds.device).expand(batch_size, -1)
         
-        batch_indices, target_class_idx = torch.where(aranged_class_idx<num_class_tokens)
+        batch_indices, target_class_idx = torch.where(aranged_class_idx < num_class_tokens)
         _, class_indices = torch.where(class_token_mask)
         if not self.config.embed_class_token:
-            class_indices+=1
+            class_indices += 1
 
         classes_embedding = torch.zeros(
             batch_size, max_embed_dim, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
@@ -160,35 +223,90 @@ class GLiClassBaseModel(nn.Module):#):
         classes_embedding[batch_indices, target_class_idx] = token_embeds[batch_indices, class_indices]
         classes_embedding_mask[batch_indices, target_class_idx] = 1
         
-        #tokens features extraction
+        return classes_embedding, classes_embedding_mask
+
+    def _extract_class_features_averaged(self, token_embeds, input_ids, attention_mask,
+                                          class_token_mask, num_class_tokens, max_embed_dim,
+                                          batch_size, embed_dim):
+        """
+        Average all tokens belonging to each class label.
+        
+        For each class, we average tokens from:
+        - Start: class token position (or position + 1 if embed_class_token is False)
+        - End: next class token position (or text token position, or end of valid tokens)
+        """
+        classes_embedding = torch.zeros(
+            batch_size, max_embed_dim, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
+        )
+        classes_embedding_mask = torch.zeros(
+            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=token_embeds.device
+        )
+        
+        # Get text token positions as boundary markers
         if self.config.extract_text_features:
             text_token_mask = input_ids == self.config.text_token_index
-
-            _, text_token_indices = torch.where(text_token_mask)
-
-            text_lengths = input_ids.shape[-1]-text_token_indices
-
-            max_text_length = text_lengths.max()
-
-            text_tokens_embeddings = torch.zeros(
-                batch_size, max_text_length, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
-            )
-            text_tokens_mask = torch.zeros(
-                batch_size, max_text_length, dtype=attention_mask.dtype, device=token_embeds.device
-                    )
-
-            aranged_token_idx = torch.arange(input_ids.shape[-1], device=token_embeds.device).unsqueeze(0)
-
-            batch_idx, text_token_idx = torch.where(aranged_token_idx>=text_token_indices.unsqueeze(1))
-            _, target_text_idx = torch.where(aranged_token_idx<text_lengths.unsqueeze(1))
-
-            text_tokens_embeddings[batch_idx, target_text_idx] = token_embeds[batch_idx, text_token_idx]
-            text_tokens_mask[batch_idx, target_text_idx] = attention_mask[batch_idx, text_token_idx]
-
         else:
-            text_tokens_embeddings = token_embeds
-            text_tokens_mask = attention_mask
-        return classes_embedding, classes_embedding_mask, text_tokens_embeddings, text_tokens_mask
+            text_token_mask = torch.zeros_like(class_token_mask)
+        
+        for batch_idx in range(batch_size):
+            # Get class token positions for this batch item
+            class_positions = torch.where(class_token_mask[batch_idx])[0]
+            n_classes = len(class_positions)
+            
+            if n_classes == 0:
+                continue
+            
+            # Get text token position (boundary for last class)
+            text_positions = torch.where(text_token_mask[batch_idx])[0]
+            if len(text_positions) > 0:
+                text_start = text_positions[0].item()
+            else:
+                # If no text token, use sequence length
+                text_start = attention_mask[batch_idx].sum().item()
+            
+            for class_idx in range(n_classes):
+                class_pos = class_positions[class_idx].item()
+                
+                # Determine start position
+                if self.config.embed_class_token:
+                    start_pos = class_pos
+                else:
+                    start_pos = class_pos + 1
+                
+                # Determine end position (exclusive)
+                if class_idx + 1 < n_classes:
+                    # Next class token position
+                    end_pos = class_positions[class_idx + 1].item()
+                else:
+                    # Text token position or end of valid sequence
+                    end_pos = text_start
+                
+                # Ensure valid range
+                if start_pos >= end_pos:
+                    # Fallback: just use the single token
+                    if self.config.embed_class_token:
+                        classes_embedding[batch_idx, class_idx] = token_embeds[batch_idx, class_pos]
+                    else:
+                        if class_pos + 1 < token_embeds.shape[1]:
+                            classes_embedding[batch_idx, class_idx] = token_embeds[batch_idx, class_pos + 1]
+                else:
+                    # Extract tokens for this class and average them
+                    class_tokens = token_embeds[batch_idx, start_pos:end_pos]  # (span_length, embed_dim)
+                    class_attn = attention_mask[batch_idx, start_pos:end_pos]  # (span_length,)
+                    
+                    # Masked average (only average over attended tokens)
+                    attn_sum = class_attn.sum()
+                    if attn_sum > 0:
+                        # Weighted average by attention mask
+                        class_tokens_masked = class_tokens * class_attn.unsqueeze(-1).float()
+                        classes_embedding[batch_idx, class_idx] = class_tokens_masked.sum(dim=0) / attn_sum.float()
+                    else:
+                        # Fallback to simple mean if no attention
+                        classes_embedding[batch_idx, class_idx] = class_tokens.mean(dim=0)
+                
+                classes_embedding_mask[batch_idx, class_idx] = 1
+        
+        return classes_embedding, classes_embedding_mask
 
     def get_loss(self, logits, labels, classes_embedding=None, classes_embedding_mask=None):
         loss = None

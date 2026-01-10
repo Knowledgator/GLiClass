@@ -97,6 +97,7 @@ def main(args):
             class_token_index=len(tokenizer),
             text_token_index=len(tokenizer)+1,
             pooling_strategy=args.pooler_type,
+            class_token_pooling=args.class_token_pooling,
             scorer_type=args.scorer_type,
             use_lstm=args.use_lstm,
             focal_loss_alpha=args.focal_loss_alpha,
@@ -277,6 +278,7 @@ if __name__ == '__main__':
     parser.add_argument('--pooler_type', type=str, default='avg')
     parser.add_argument('--scorer_type', type=str, default='simple')
     parser.add_argument('--architecture_type', type=str, default='uni-encoder')
+    parser.add_argument('--class_token_pooling', type=str, default='first')
     parser.add_argument('--normalize_features', type=bool, default=False)
     parser.add_argument('--extract_text_features', type=bool, default=False)
     parser.add_argument('--prompt_first', type=bool, default=True)
