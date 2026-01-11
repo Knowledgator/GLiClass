@@ -6,6 +6,7 @@ import json
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 from transformers import AutoTokenizer, AutoConfig
+from torch.utils.data import WeightedRandomSampler
 
 import random
 import torch
@@ -14,7 +15,24 @@ from gliclass import GLiClassModelConfig, GLiClassModel
 from gliclass.training import TrainingArguments, Trainer
 from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset, AugmentationConfig
 
-
+class CustomTrainer(Trainer):
+    """Trainer with weighted random sampling support."""
+    
+    def __init__(self, *args, use_weighted_sampling=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_weighted_sampling = use_weighted_sampling
+    
+    def _get_train_sampler(self, train_dataset) -> torch.utils.data.Sampler:
+        if not self.use_weighted_sampling:
+            return super()._get_train_sampler()
+        
+        weights = train_dataset.get_diversity()
+        return WeightedRandomSampler(
+            weights=weights,
+            num_samples=len(train_dataset),
+            replacement=True
+        )
+    
 def compute_metrics(p, problem_type='multi_label_classification'):
     """Compute evaluation metrics.
     
@@ -117,7 +135,7 @@ def main(args):
         model = GLiClassModel(glicalss_config, from_pretrained=True)
 
         if args.architecture_type in {'uni-encoder', 'bi-encoder-fused', 'encoder-decoder'}:
-            new_words = ["<<LABEL>>", "<<SEP>>"]
+            new_words = ["<<LABEL>>", "<<SEP>>", "<<EXAMPLE>>"]
             tokenizer.add_tokens(new_words, special_tokens=True)
             model.resize_token_embeddings(len(tokenizer))
 

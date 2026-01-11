@@ -217,6 +217,9 @@ class GLiClassDataset(Dataset):
         self.augmenter = DataAugmenter(augment_config, examples, self.dataset_labels, label2description)
         print('Total labels: ', len(self.dataset_labels))
     
+    def get_diversity(self):
+        return [item.get("_diversity", {}).get("overall_diversity", 0.5) for item in self.data]
+    
     def collect_dataset_labels(self):
         dataset_labels = set()
         for example in self._data:
