@@ -27,6 +27,7 @@ class GLiClassModelConfig(PretrainedConfig):
         initializer_range=0.03,
         scorer_type='simple',
         pooling_strategy='first',
+        class_token_pooling="first",
         focal_loss_alpha=0.5,
         focal_loss_gamma=2,
         focal_loss_reduction=None,
@@ -94,6 +95,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.initializer_range=initializer_range
         self.scorer_type = scorer_type
         self.pooling_strategy=pooling_strategy
+        self.class_token_pooling=class_token_pooling
         self.use_lstm = use_lstm
         self.focal_loss_alpha=focal_loss_alpha
         self.focal_loss_gamma=focal_loss_gamma
