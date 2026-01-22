@@ -50,11 +50,13 @@ class FeaturesProjector(nn.Module):
 
         self.linear_1 = nn.Linear(config.encoder_config.hidden_size, config.hidden_size, bias=True)
         self.act = ACT2FN[config.projector_hidden_act]
-        self.linear_2 = nn.Linear(config.encoder_config.hidden_size, config.encoder_config.hidden_size, bias=True)
+        self.dropout = nn.Dropout(config.dropout)
+        self.linear_2 = nn.Linear(config.hidden_size, config.encoder_config.hidden_size, bias=True)
 
     def forward(self, features):
         hidden_states = self.linear_1(features)
         hidden_states = self.act(hidden_states)
+        hidden_states = self.dropout(hidden_states)
         hidden_states = self.linear_2(hidden_states)
         return hidden_states
 

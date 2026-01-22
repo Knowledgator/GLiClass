@@ -129,7 +129,8 @@ def main(args):
             squeeze_layers=args.squeeze_layers,
             layer_wise=args.layer_wise,
             encoder_layer_id=args.encoder_layer_id,
-            shuffle_labels=args.shuffle_labels
+            shuffle_labels=args.shuffle_labels,
+            dropout=args.dropout
         )
 
         model = GLiClassModel(glicalss_config, from_pretrained=True)
@@ -243,7 +244,7 @@ def main(args):
         return compute_metrics(p, args.problem_type)
 
     # Create trainer with EWC support
-    trainer = Trainer(
+    trainer = CustomTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -304,6 +305,7 @@ if __name__ == '__main__':
     parser.add_argument('--squeeze_layers', type=bool, default=False)
     parser.add_argument('--layer_wise', type=bool, default=False)
     parser.add_argument('--encoder_layer_id', type=int, default=-1)
+    parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--shuffle_labels', type=bool, default=True)
     
     # Training arguments

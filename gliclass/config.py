@@ -41,6 +41,7 @@ class GLiClassModelConfig(PretrainedConfig):
         layer_wise = False,
         encoder_layer_id = -1,
         embed_class_token = True, 
+        dropout = 0.1,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -110,5 +111,6 @@ class GLiClassModelConfig(PretrainedConfig):
         self.layer_wise = layer_wise
         self.encoder_layer_id = encoder_layer_id
         self.embed_class_token = embed_class_token
+        self.dropout = dropout
         super().__init__(**kwargs)
 

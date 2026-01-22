@@ -112,14 +112,7 @@ class GLiClassBaseModel(nn.Module):#):
             self.layer_wise_attention = LayerwiseAttention(config.encoder_config.num_hidden_layers,
                                                            config.encoder_config.hidden_size)
             
-        drop_out = getattr(config.encoder_config, "cls_dropout", None)
-        if drop_out is None:
-            if hasattr(self.config.encoder_config, 'hidden_dropout_prob'):
-                drop_out = self.config.encoder_config.hidden_dropout_prob 
-            elif hasattr(self.config.encoder_config, 'dropout_rate'):
-                drop_out = self.config.encoder_config.dropout_rate
-            else:
-                drop_out = 0.15
+        drop_out = getattr(config, "dropout", 0.0)
         # self.dropout = StableDropout(drop_out)
         self.dropout = nn.Dropout(drop_out)
 
