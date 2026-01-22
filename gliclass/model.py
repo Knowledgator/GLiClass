@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
-import torch.utils.checkpoint
 from torch import nn
 
 from transformers import PreTrainedModel, AutoConfig, AutoModel
@@ -39,14 +38,12 @@ else:
     DECODER_MODEL_MAPPING = {}
 
 if IS_TURBOT5:
-    from turbot5.model.modeling import T5EncoderModel
-else:
-    from transformers import T5EncoderModel
+    from turbot5.model.modeling import T5EncoderModel as FlashT5EncoderModel
+from transformers import T5EncoderModel
 
 if IS_FLASHDEBERTA:
-    from flashdeberta import FlashDebertaV2Model as DebertaV2Model
-else:
-    from transformers import DebertaV2Model
+    from flashdeberta import FlashDebertaV2Model
+from transformers import DebertaV2Model
 
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
@@ -365,10 +362,18 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             decoder = True
         elif config_name in {'T5Config', 'MT5Config'}:
             decoder = False
-            ModelClass = T5EncoderModel
+            if config.use_flash and IS_TURBOT5:
+                ModelClass = FlashT5EncoderModel
+            else:
+                ModelClass = T5EncoderModel
         elif config_name in {'DebertaV2Config'}:
             decoder = False
-            ModelClass = DebertaV2Model
+            if config.use_flash and IS_FLASHDEBERTA:
+                print('Using FlashDeberta backend.')
+                ModelClass = FlashDebertaV2Model
+            else:
+                ModelClass = DebertaV2Model
+            
         else:
             decoder = False
             ModelClass = AutoModel
