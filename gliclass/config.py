@@ -41,7 +41,6 @@ class GLiClassModelConfig(PretrainedConfig):
         layer_wise = False,
         encoder_layer_id = -1,
         embed_class_token = True,
-        use_flash=False,
         dropout = 0.1,
         **kwargs,
     ):
@@ -99,7 +98,6 @@ class GLiClassModelConfig(PretrainedConfig):
         self.pooling_strategy=pooling_strategy
         self.class_token_pooling=class_token_pooling
         self.use_lstm = use_lstm
-        self.use_flash = use_flash
         self.focal_loss_alpha=focal_loss_alpha
         self.focal_loss_gamma=focal_loss_gamma
         self.focal_loss_reduction = focal_loss_reduction

@@ -362,13 +362,13 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             decoder = True
         elif config_name in {'T5Config', 'MT5Config'}:
             decoder = False
-            if config.use_flash and IS_TURBOT5:
+            if os.environ.get("USE_TURBOT5", "") and IS_TURBOT5:
                 ModelClass = FlashT5EncoderModel
             else:
                 ModelClass = T5EncoderModel
         elif config_name in {'DebertaV2Config'}:
             decoder = False
-            if config.use_flash and IS_FLASHDEBERTA:
+            if os.environ.get("USE_FLASHDEBERTA", "") and IS_FLASHDEBERTA:
                 print('Using FlashDeberta backend.')
                 ModelClass = FlashDebertaV2Model
             else:
