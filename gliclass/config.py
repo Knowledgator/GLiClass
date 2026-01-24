@@ -2,6 +2,17 @@ from transformers import AutoConfig
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 from transformers.models.auto import CONFIG_MAPPING
+
+from .utils import is_module_available
+
+IS_TURBOT5 = is_module_available('turbot5')
+
+if IS_TURBOT5:
+    from turbot5.model.config import T5Config
+else:
+    from transformers import T5Config
+
+
 logger = logging.get_logger(__name__)
 
 
@@ -48,7 +59,10 @@ class GLiClassModelConfig(PretrainedConfig):
             encoder_config["model_type"] = (encoder_config["model_type"] 
                                                 if "model_type" in encoder_config 
                                                 else "deberta-v2")
-            encoder_config = CONFIG_MAPPING[encoder_config["model_type"]](**encoder_config)
+            if encoder_config['model_type'] == 't5':
+                encoder_config = T5Config(**encoder_config)
+            else:
+                encoder_config = CONFIG_MAPPING[encoder_config["model_type"]](**encoder_config)
         elif encoder_config is None:
             encoder_config = CONFIG_MAPPING["deberta-v2"]()
 

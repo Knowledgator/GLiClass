@@ -353,6 +353,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         config_name = config.encoder_config.__class__.__name__
 
+        model_kwargs = {}
         if config_name in DECODER_MODEL_MAPPING:
             if not IS_LLM2VEC:
                 raise MissedPackageException(f"The llm2vec package must be installed to use this decoder model: {config_name}")
@@ -362,8 +363,11 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             decoder = True
         elif config_name in {'T5Config', 'MT5Config'}:
             decoder = False
-            if os.environ.get("USE_TURBOT5", "") and IS_TURBOT5:
+            turbot5_type = os.environ.get("TURBOT5_ATTN_TYPE", "basic")
+            if turbot5_type and IS_TURBOT5:
                 ModelClass = FlashT5EncoderModel
+                model_kwargs = {'attention_type': turbot5_type}
+                config.encoder_config.attention_type=turbot5_type
             else:
                 ModelClass = T5EncoderModel
         elif config_name in {'DebertaV2Config'}:
@@ -380,7 +384,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         if from_pretrained:
             self.encoder_model = ModelClass.from_pretrained(
-                config.encoder_model_name
+                config.encoder_model_name, **model_kwargs
             )
         else:
             if decoder:
