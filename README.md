@@ -281,20 +281,53 @@ config = GLiClassModelConfig(
 )
 ```
 
-#### Flash Attention Backends
+Gotcha — here’s a **much leaner, README-style version**, no fluff, just what matters 👇
 
-Enable Flash Attention for faster inference (requires additional packages):
+---
 
-```python
-# Install flash backends
-pip install flashdeberta  # For DeBERTa models
-pip install turbot5       # For T5 models
+### Flash Attention Backends
 
-# Enable in config
-config = GLiClassModelConfig(
-    use_flash=True
-)
+GLiClass supports optional flash attention backends for faster inference.
+
+#### Install
+
+```bash
+pip install flashdeberta   # DeBERTa v2
+pip install turbot5        # T5 / mT5
 ```
+
+---
+
+#### FlashDeBERTa (DeBERTa v2)
+
+Enable via environment variable:
+
+```bash
+export USE_FLASHDEBERTA=1
+```
+
+If `flashdeberta` is installed, DeBERTa v2 models will use `FlashDebertaV2Model`.
+Otherwise, GLiClass falls back to `DebertaV2Model`.
+
+---
+
+#### TurboT5 (T5 / mT5)
+
+Enable via environment variable:
+
+```bash
+export TURBOT5_ATTN_TYPE=triton-basic
+```
+
+If `turbot5` is installed, T5 / mT5 models will use `FlashT5EncoderModel`.
+Otherwise, GLiClass falls back to `T5EncoderModel`.
+
+Notes:
+* Flash backends are **optional**
+* Enabled automatically when available
+* No code changes required
+
+Want it even tighter (single block), or is this the sweet spot?
 
 
 ## 📚 Citations
