@@ -5,8 +5,10 @@ import argparse
 import json
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import transformers
 from transformers import AutoTokenizer, AutoConfig
 from torch.utils.data import WeightedRandomSampler
+from packaging import version
 
 import random
 import torch
@@ -114,6 +116,7 @@ def main(args):
             label_model_config=label_model_config,
             class_token_index=len(tokenizer),
             text_token_index=len(tokenizer)+1,
+            example_token_index=len(tokenizer)+2,
             pooling_strategy=args.pooler_type,
             class_token_pooling=args.class_token_pooling,
             scorer_type=args.scorer_type,
@@ -130,10 +133,11 @@ def main(args):
             layer_wise=args.layer_wise,
             encoder_layer_id=args.encoder_layer_id,
             shuffle_labels=args.shuffle_labels,
-            dropout=args.dropout
+            dropout=args.dropout,
+            use_segment_embeddings=args.use_segment_embeddings,
         )
 
-        model = GLiClassModel(glicalss_config, from_pretrained=True)
+        model = GLiClassModel(glicalss_config, from_pretrained=True).to(dtype=torch.float32)
 
         if args.architecture_type in {'uni-encoder', 'bi-encoder-fused', 'encoder-decoder'}:
             new_words = ["<<LABEL>>", "<<SEP>>", "<<EXAMPLE>>"]
@@ -153,6 +157,7 @@ def main(args):
     # Load current training data
     data = load_dataset(args.data_path)
     print(f'Dataset size: {len(data)}')
+    
     random.shuffle(data)    
     print('Dataset is shuffled...')
 
@@ -223,6 +228,7 @@ def main(args):
         warmup_ratio=args.warmup_ratio,
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_train_epochs=args.num_epochs,
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
@@ -244,16 +250,23 @@ def main(args):
         return compute_metrics(p, args.problem_type)
 
     # Create trainer with EWC support
-    trainer = CustomTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics_fn,
-        prev_dataset=prev_dataset,  # Pass previous dataset for EWC
-    )
+    # Handle version differences between transformers v4 and v5
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": test_dataset,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics_fn,
+        "prev_dataset": prev_dataset,  # Pass previous dataset for EWC
+    }
+
+    if version.parse(transformers.__version__) < version.parse("5.0.0"):
+        trainer_kwargs["tokenizer"] = tokenizer
+    else:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = CustomTrainer(**trainer_kwargs)
     
     # Print EWC status
     if args.use_ewc:
@@ -307,10 +320,12 @@ if __name__ == '__main__':
     parser.add_argument('--encoder_layer_id', type=int, default=-1)
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--shuffle_labels', type=bool, default=True)
-    
+    parser.add_argument('--use_segment_embeddings', type=bool, default=False)
+
     # Training arguments
     parser.add_argument('--num_epochs', type=int, default=3)
     parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--gradient_accumulation_steps', type=int, default=1)
     parser.add_argument('--encoder_lr', type=float, default=1e-5)
     parser.add_argument('--others_lr', type=float, default=3e-5)
     parser.add_argument('--encoder_weight_decay', type=float, default=0.01)

@@ -5,7 +5,9 @@ import argparse
 import json
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import transformers
 from transformers import AutoTokenizer, AutoConfig, AutoModelForSequenceClassification
+from packaging import version
 
 import random
 import torch
@@ -183,20 +185,27 @@ def main(args):
         num_rl_iters=args.num_rl_iters
         )
 
-    trainer = RLTrainer(
-        model=model,
-        value_model=value_model, 
-        reference_model=reference_pipe,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-        compute_metrics=compute_metrics_func,
-        reward_components={
+    # Handle version differences between transformers v4 and v5
+    trainer_kwargs = {
+        "model": model,
+        "value_model": value_model,
+        "reference_model": reference_pipe,
+        "args": training_args,
+        "train_dataset": train_dataset,
+        "eval_dataset": test_dataset,
+        "data_collator": data_collator,
+        "compute_metrics": compute_metrics_func,
+        "reward_components": {
             'micro_f1': default_f1_reward,
         },
-    )
+    }
+
+    if version.parse(transformers.__version__) < version.parse("5.0.0"):
+        trainer_kwargs["tokenizer"] = tokenizer
+    else:
+        trainer_kwargs["processing_class"] = tokenizer
+
+    trainer = RLTrainer(**trainer_kwargs)
     trainer.train()
 
 if __name__ == '__main__':

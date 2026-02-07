@@ -28,6 +28,7 @@ class GLiClassModelConfig(PretrainedConfig):
         label_model_name=None,
         class_token_index = -1,
         text_token_index = -1,
+        example_token_index = -1,
         ignore_index=-100,
         hidden_size=None,
         projector_hidden_act="gelu",
@@ -53,6 +54,7 @@ class GLiClassModelConfig(PretrainedConfig):
         encoder_layer_id = -1,
         embed_class_token = True,
         dropout = 0.1,
+        use_segment_embeddings = False,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -103,6 +105,11 @@ class GLiClassModelConfig(PretrainedConfig):
         else:
             self.text_token_index = text_token_index
 
+        if example_token_index == -1:
+            self.example_token_index = self.vocab_size+2
+        else:
+            self.example_token_index = example_token_index
+
         self.ignore_index = ignore_index
         self.projector_hidden_act = projector_hidden_act
         self.problem_type = problem_type
@@ -125,6 +132,8 @@ class GLiClassModelConfig(PretrainedConfig):
         self.layer_wise = layer_wise
         self.encoder_layer_id = encoder_layer_id
         self.embed_class_token = embed_class_token
+        self.pad_token_id = self.encoder_config.pad_token_id
         self.dropout = dropout
+        self.use_segment_embeddings = use_segment_embeddings
         super().__init__(**kwargs)
 

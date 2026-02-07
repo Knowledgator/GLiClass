@@ -340,7 +340,7 @@ class Trainer(transformers.Trainer):
         **kwargs
     ):
         """Initialize Trainer with optional EWC support.
-        
+
         Args:
             ewc: Pre-initialized EWC object (optional)
             prev_dataset: Previous dataset for EWC initialization (optional)
@@ -348,6 +348,11 @@ class Trainer(transformers.Trainer):
             **kwargs: Keyword arguments passed to parent Trainer
         """
         super().__init__(*args, **kwargs)
+
+        # Ensure use_apex is set for compatibility with different transformers versions
+        if not hasattr(self, 'use_apex'):
+            self.use_apex = False
+
         self.ewc = ewc
         self.prev_dataset = prev_dataset
         self._ewc_initialized = ewc is not None

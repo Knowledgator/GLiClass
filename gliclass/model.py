@@ -6,6 +6,8 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import transformers
+from packaging import version
 
 from transformers import PreTrainedModel, AutoConfig, AutoModel
 from transformers.activations import ACT2FN
@@ -69,6 +71,9 @@ class GLiClassPreTrainedModel(PreTrainedModel):
 
         if hasattr(module, "class_embedding"):
             module.class_embedding.data.normal_(mean=0.0, std=std)
+
+        if hasattr(module, "segment_embeddings"):
+            module.segment_embeddings.weight.data.normal_(mean=0.0, std=std)
 
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             module.weight.data.normal_(mean=0.0, std=std)
@@ -408,6 +413,42 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                 adapter_config = LoraConfig.from_pretrained(config.encoder_model_name)
                 self.encoder_model = get_peft_model(self.encoder_model, adapter_config)
 
+        if config.use_segment_embeddings:
+            self.segment_embeddings = nn.Embedding(3, config.encoder_config.hidden_size)
+            nn.init.normal_(self.segment_embeddings.weight, mean=0.0, std=config.initializer_range)
+
+    def _create_segment_ids(self, input_ids):
+        batch_size, seq_length = input_ids.shape
+        segment_ids = torch.zeros_like(input_ids)  # Default: segment 0 (labels)
+
+        # Find example token positions
+        example_token_mask = input_ids == self.config.example_token_index
+        example_token_indices = example_token_mask.int().argmax(dim=-1)
+        has_example = example_token_mask.any(dim=-1)
+
+        if self.config.extract_text_features:
+            text_token_mask = input_ids == self.config.text_token_index
+            text_token_indices = text_token_mask.int().argmax(dim=-1)
+
+            for batch_idx in range(batch_size):
+                text_start = text_token_indices[batch_idx].item()
+
+                # If examples exist, assign segment 1 to example section
+                if has_example[batch_idx]:
+                    example_start = example_token_indices[batch_idx].item()
+                    segment_ids[batch_idx, example_start:text_start] = 1
+
+                # Assign segment 2 to text section
+                segment_ids[batch_idx, text_start:] = 2
+        else:
+            # If not extracting text features, just separate labels and examples
+            for batch_idx in range(batch_size):
+                if has_example[batch_idx]:
+                    example_start = example_token_indices[batch_idx].item()
+                    segment_ids[batch_idx, example_start:] = 1
+
+        return segment_ids
+
     def process_encoder_output(self, input_ids, attention_mask, encoder_layer, labels = None):
         classes_embedding, classes_embedding_mask, text_token_embeddings, text_mask = self._extract_class_features(encoder_layer, 
                                                                                                             input_ids, attention_mask)
@@ -457,15 +498,32 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             output_hidden_states = True
             return_dict = True
 
-        outputs = self.encoder_model(
-            input_ids,
-            attention_mask=attention_mask,
-            # inputs_embeds=inputs_embeds,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            **kwargs
-        )
+        if self.config.use_segment_embeddings:
+            embedding_layer = self.encoder_model.get_input_embeddings()
+            token_embeds = embedding_layer(input_ids)
+
+            segment_ids = self._create_segment_ids(input_ids)
+            segment_embeds = self.segment_embeddings(segment_ids)
+
+            inputs_embeds = token_embeds + segment_embeds
+
+            outputs = self.encoder_model(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs
+            )
+        else:
+            outputs = self.encoder_model(
+                input_ids,
+                attention_mask=attention_mask,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states,
+                return_dict=return_dict,
+                **kwargs
+            )
 
         if self.config.layer_wise and labels is not None:
             hidden_states = outputs.hidden_states
@@ -778,15 +836,28 @@ class GLiClassModel(GLiClassPreTrainedModel):
         else:
             raise NotImplementedError('Setting input embeddings is not implemented for bi-encoder architecture')
         
-    def tie_weights(self):
-        if self.config.architecture_type in {'uni-encoder'}:
-            return self.model.encoder_model.tie_weights()
-        elif self.config.architecture_type == 'encoder-decoder':
-            return self.model.encoder_decoder_model.tie_weights()
-        elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
-            return self.model.encoder_model.tie_weights()
+    def tie_weights(self, recompute_mapping=True, missing_keys=None):
+        # Handle version differences between transformers v4 and v5
+        if version.parse(transformers.__version__) >= version.parse("5.0.0"):
+            # Transformers v5+ supports recompute_mapping and missing_keys parameters
+            if self.config.architecture_type in {'uni-encoder'}:
+                return self.model.encoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
+            elif self.config.architecture_type == 'encoder-decoder':
+                return self.model.encoder_decoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
+            elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
+                return self.model.encoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
+            else:
+                raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
         else:
-            raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
+            # Transformers v4 does not support recompute_mapping or missing_keys parameters
+            if self.config.architecture_type in {'uni-encoder'}:
+                return self.model.encoder_model.tie_weights()
+            elif self.config.architecture_type == 'encoder-decoder':
+                return self.model.encoder_decoder_model.tie_weights()
+            elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
+                return self.model.encoder_model.tie_weights()
+            else:
+                raise NotImplementedError('Tie weights is not implemented for bi-encoder architecture')
 
     def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
         if self.config.architecture_type in {'uni-encoder'}:
