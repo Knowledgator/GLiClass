@@ -423,29 +423,22 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         # Find example token positions
         example_token_mask = input_ids == self.config.example_token_index
-        example_token_indices = example_token_mask.int().argmax(dim=-1)
+        example_token_indices = example_token_mask.int().argmin(dim=-1)
         has_example = example_token_mask.any(dim=-1)
 
-        if self.config.extract_text_features:
-            text_token_mask = input_ids == self.config.text_token_index
-            text_token_indices = text_token_mask.int().argmax(dim=-1)
+        text_token_mask = input_ids == self.config.text_token_index
+        text_token_indices = text_token_mask.int().argmax(dim=-1)
 
-            for batch_idx in range(batch_size):
-                text_start = text_token_indices[batch_idx].item()
+        for batch_idx in range(batch_size):
+            text_start = text_token_indices[batch_idx].item()
 
-                # If examples exist, assign segment 1 to example section
-                if has_example[batch_idx]:
-                    example_start = example_token_indices[batch_idx].item()
-                    segment_ids[batch_idx, example_start:text_start] = 1
-
-                # Assign segment 2 to text section
-                segment_ids[batch_idx, text_start:] = 2
-        else:
-            # If not extracting text features, just separate labels and examples
-            for batch_idx in range(batch_size):
-                if has_example[batch_idx]:
-                    example_start = example_token_indices[batch_idx].item()
-                    segment_ids[batch_idx, example_start:] = 1
+            # If examples exist, assign segment 1 to example section
+            if has_example[batch_idx]:
+                example_start = example_token_indices[batch_idx].item()
+                segment_ids[batch_idx, text_start: example_start] = 1
+                segment_ids[batch_idx, example_start:] = 2
+            else:
+                segment_ids[batch_idx, text_start: ] = 1
 
         return segment_ids
 

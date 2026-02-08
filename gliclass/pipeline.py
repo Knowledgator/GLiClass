@@ -483,34 +483,33 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
     def prepare_input(self, text, labels, examples=None, prompt=None):
         """
         Prepare input matching training format from data_processing.py:
-        Order: Labels → SEP → Examples → SEP → Prompt
+        Order: Labels → SEP → Prompt → Text → Examples
         """
         input_parts = []
 
-        # 1. Add labels first (matching training order)
+        # 1. Add labels
         for label in labels:
             label_tag = f"{self.label_token}{label}"
             input_parts.append(label_tag)
         input_parts.append(self.sep_token)
 
-        # 2. Add few-shot examples (format_examples_prompt already adds trailing SEP)
-        if examples:
-            examples_str = self._format_examples_for_input(examples)
-            if examples_str:
-                input_parts.append(examples_str)
-
-        # 3. Add task description prompt at the end (matching training order)
+        # 2. Add task description prompt
         if prompt:
             input_parts.append(prompt)
 
+        # 3. Format examples to go after text
+        examples_str = ""
+        if examples:
+            examples_str = self._format_examples_for_input(examples)
+
         if self.model.config.prompt_first:
-            return ''.join(input_parts) + text
+            return ''.join(input_parts) + text + examples_str
         else:
-            return text + ''.join(input_parts)
+            return text + ''.join(input_parts) + examples_str
 
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         inputs = []
-        
+
         if same_labels:
             for i, text in enumerate(texts):
                 text_examples = None
@@ -519,7 +518,7 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
                         text_examples = examples[i] if i < len(examples) else None
                     else:
                         text_examples = examples
-                
+
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels, text_examples, text_prompt))
         else:
@@ -530,13 +529,13 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
                         text_examples = examples[i] if i < len(examples) else None
                     else:
                         text_examples = examples
-                
+
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels_, text_examples, text_prompt))
-        
+
         tokenized_inputs = self.tokenizer(
-            inputs, truncation=True, 
-            max_length=self.max_length, 
+            inputs, truncation=True,
+            max_length=self.max_length,
             padding="longest", return_tensors="pt"
         ).to(self.device)
 
@@ -544,33 +543,32 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
 
 
 class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
-    def __init__(self, model, tokenizer, max_classes=25, max_length=1024, 
+    def __init__(self, model, tokenizer, max_classes=25, max_length=1024,
                  classification_type='multi-label', device='cuda:0', progress_bar=True,
                  label_separator: str = "."):
         super().__init__(
-            model, tokenizer, max_classes, max_length, 
+            model, tokenizer, max_classes, max_length,
             classification_type, device, progress_bar, label_separator
         )
 
-    def prepare_labels_prompt(self, labels, examples=None):
+    def prepare_labels_prompt(self, labels, prompt=None):
+        """Match training format: Labels → SEP → Prompt"""
         input_parts = []
-        
-        if examples:
-            examples_str = self._format_examples_for_input(examples)
-            if examples_str:
-                input_parts.append(examples_str)
-        
+
         for label in labels:
             label_tag = f"{self.label_token}{label}"
             input_parts.append(label_tag)
         input_parts.append(self.sep_token)
+
+        if prompt:
+            input_parts.append(prompt)
 
         return ''.join(input_parts)
 
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         prompts = []
         processed_texts = []
-        
+
         if same_labels:
             for i, text in enumerate(texts):
                 text_examples = None
@@ -579,13 +577,10 @@ class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPip
                         text_examples = examples[i] if i < len(examples) else None
                     else:
                         text_examples = examples
-                prompts.append(self.prepare_labels_prompt(labels, text_examples))
-                
                 text_prompt = self._format_prompt(prompt, i)
-                if text_prompt:
-                    processed_texts.append(f"{text_prompt} {text}")
-                else:
-                    processed_texts.append(text)
+                prompts.append(self.prepare_labels_prompt(labels, text_prompt))
+                examples_str = self._format_examples_for_input(text_examples) if text_examples else ""
+                processed_texts.append(text + examples_str)
         else:
             for i, labels_ in enumerate(labels):
                 text_examples = None
@@ -594,13 +589,10 @@ class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPip
                         text_examples = examples[i] if i < len(examples) else None
                     else:
                         text_examples = examples
-                prompts.append(self.prepare_labels_prompt(labels_, text_examples))
-                
                 text_prompt = self._format_prompt(prompt, i)
-                if text_prompt:
-                    processed_texts.append(f"{text_prompt} {texts[i]}")
-                else:
-                    processed_texts.append(texts[i])
+                prompts.append(self.prepare_labels_prompt(labels_, text_prompt))
+                examples_str = self._format_examples_for_input(text_examples) if text_examples else ""
+                processed_texts.append(texts[i] + examples_str)
         
         tokenized_inputs = self.tokenizer(
             processed_texts, truncation=True, 
@@ -631,24 +623,23 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
 
     def prepare_input(self, text, labels, examples=None, prompt=None):
         input_parts = []
-        
+
         if prompt:
             input_parts.append(prompt)
             input_parts.append(" ")
-        
-        if examples:
-            examples_str = self._format_examples_for_input(examples)
-            if examples_str:
-                input_parts.append(examples_str)
-        
+
         for label in labels:
             input_parts.append(self.label_token)
         input_parts.append(self.sep_token)
-        
+
+        examples_str = ""
+        if examples:
+            examples_str = self._format_examples_for_input(examples)
+
         if self.model.config.prompt_first:
-            return ''.join(input_parts) + text
+            return ''.join(input_parts) + text + examples_str
         else:
-            return text + ''.join(input_parts)
+            return text + ''.join(input_parts) + examples_str
     
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         if self.model.config.architecture_type == 'bi-encoder-fused':
@@ -989,30 +980,29 @@ class ZeroShotClassificationWithChunkingPipeline(BaseZeroShotClassificationPipel
     def prepare_input(self, text, labels, examples=None, prompt=None):
         """
         Prepare input matching training format from data_processing.py:
-        Order: Labels → SEP → Examples → SEP → Prompt
+        Order: Labels → SEP → Prompt → Text → Examples
         """
         input_parts = []
 
-        # 1. Add labels first (matching training order)
+        # 1. Add labels
         for label in labels:
             label_tag = f"{self.label_token}{label}"
             input_parts.append(label_tag)
         input_parts.append(self.sep_token)
 
-        # 2. Add few-shot examples (format_examples_prompt already adds trailing SEP)
-        if examples:
-            examples_str = self._format_examples_for_input(examples)
-            if examples_str:
-                input_parts.append(examples_str)
-
-        # 3. Add task description prompt at the end (matching training order)
+        # 2. Add task description prompt
         if prompt:
             input_parts.append(prompt)
 
+        # 3. Format examples to go after text
+        examples_str = ""
+        if examples:
+            examples_str = self._format_examples_for_input(examples)
+
         if self.model.config.prompt_first:
-            return ''.join(input_parts) + text
+            return ''.join(input_parts) + text + examples_str
         else:
-            return text + ''.join(input_parts)
+            return text + ''.join(input_parts) + examples_str
 
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         inputs = []

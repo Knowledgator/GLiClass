@@ -244,17 +244,23 @@ class GLiClassDataset(Dataset):
             label_tag = f"{self.label_token}{str(label)}"
             prompt_texts.append(label_tag)
         prompt_texts.append(self.sep_token)
-        examples = item.get("examples", [])
-        if examples:
-            for example in examples:
-                prompt_texts.append(self.example_token)
-                prompt_texts.append(example.get("text", ""))
-                prompt_texts.append(" \nLabels:\n ")
-                prompt_texts.append(', '.join(example.get("true_labels", [])))
-        prompt_texts.append(self.sep_token)
         prompt = item.get('prompt', '')
         prompt_texts.append(prompt)
         return prompt_texts
+
+    def format_examples(self, item):
+        examples = item.get("examples", [])
+        if not examples:
+            return ""
+        examples = random.sample(examples, k=random.randint(1, len(examples)))
+        parts = []
+        for example in examples:
+            parts.append(self.example_token)
+            parts.append(example.get("text", ""))
+            parts.append(" \nLabels:\n ")
+            parts.append(', '.join(example.get("labels", example.get("true_labels", []))))
+        parts.append(self.sep_token)
+        return ''.join(parts)
     
     def tokenize(self, texts):
         tokenized_inputs = self.tokenizer(texts, truncation=True, max_length=self.max_length, padding="longest")
@@ -268,10 +274,11 @@ class GLiClassDataset(Dataset):
         if self.shuffle_labels:
             random.shuffle(example['all_labels'])
         input_text = self.prepare_prompt(example)
+        examples_text = self.format_examples(example)
         if self.prompt_first:
-            input_text = ''.join(input_text)+str(example['text'])
+            input_text = ''.join(input_text) + str(example['text']) + examples_text
         else:
-            input_text = str(example['text'])+''.join(input_text)
+            input_text = str(example['text']) + ''.join(input_text) + examples_text
         label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
 
         tokenized_inputs = self.tokenize(input_text)
@@ -285,10 +292,12 @@ class GLiClassDataset(Dataset):
             random.shuffle(example['all_labels'])
         class_texts = self.prepare_prompt(example)
         class_texts = ''.join(class_texts)
+        examples_text = self.format_examples(example)
 
         label2idx = {label: idx for idx, label in enumerate(example['all_labels'])}
 
-        tokenized_inputs = self.tokenize(example['text'])
+        input_text = str(example['text']) + examples_text
+        tokenized_inputs = self.tokenize(input_text)
         tokenized_classes = self.tokenize(class_texts)
         tokenized_inputs["class_input_ids"] = tokenized_classes["input_ids"]
         tokenized_inputs["class_attention_mask"] = tokenized_classes["attention_mask"]   
