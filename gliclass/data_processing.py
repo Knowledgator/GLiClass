@@ -238,10 +238,13 @@ class GLiClassDataset(Dataset):
             raise NotImplementedError(f"{problem_type} is not implemented.")
         return torch.tensor(labels)
 
-    def prepare_prompt(self, item):
+    def prepare_prompt(self, item, label_token_first=True):
         prompt_texts = []
         for label in item['all_labels']:
-            label_tag = f"{self.label_token}{str(label)}"
+            if label_token_first:
+                label_tag = f"{self.label_token}{str(label)}"
+            else:
+                label_tag = f"{str(label)}{self.label_token}"
             prompt_texts.append(label_tag)
         prompt_texts.append(self.sep_token)
         prompt = item.get('prompt', '')
@@ -290,7 +293,7 @@ class GLiClassDataset(Dataset):
     def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
         if self.shuffle_labels:
             random.shuffle(example['all_labels'])
-        class_texts = self.prepare_prompt(example)
+        class_texts = self.prepare_prompt(example, label_token_first=True)
         class_texts = ''.join(class_texts)
         examples_text = self.format_examples(example)
 
@@ -347,7 +350,7 @@ class GLiClassDataset(Dataset):
 
         if self.architecture_type == 'uni-encoder':
             model_inputs = self.tokenize_and_prepare_labels_for_uniencoder(example)
-        elif self.architecture_type == 'encoder-decoder':
+        elif self.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
             model_inputs = self.tokenize_and_prepare_labels_for_encoder_decoder(example)
         elif self.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
             model_inputs = self.tokenize_and_prepare_labels_for_biencoder(example)

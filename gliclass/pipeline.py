@@ -556,6 +556,7 @@ class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPip
         input_parts = []
 
         for label in labels:
+            # label_tag = f"{label}{self.label_token}"
             label_tag = f"{self.label_token}{label}"
             input_parts.append(label_tag)
         input_parts.append(self.sep_token)
@@ -850,7 +851,7 @@ class ZeroShotClassificationPipeline:
                 model, tokenizer, max_classes, max_length, 
                 classification_type, device, progress_bar, label_separator
             )
-        elif model.config.architecture_type in {'encoder-decoder'}:
+        elif model.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
             self.pipe = EncoderDecoderZeroShotClassificationPipeline(
                 model, tokenizer, max_classes, max_length, 
                 classification_type, device, progress_bar, label_separator
