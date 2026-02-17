@@ -423,29 +423,22 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         # Find example token positions
         example_token_mask = input_ids == self.config.example_token_index
-        example_token_indices = example_token_mask.int().argmax(dim=-1)
+        example_token_indices = example_token_mask.int().argmin(dim=-1)
         has_example = example_token_mask.any(dim=-1)
 
-        if self.config.extract_text_features:
-            text_token_mask = input_ids == self.config.text_token_index
-            text_token_indices = text_token_mask.int().argmax(dim=-1)
+        text_token_mask = input_ids == self.config.text_token_index
+        text_token_indices = text_token_mask.int().argmax(dim=-1)
 
-            for batch_idx in range(batch_size):
-                text_start = text_token_indices[batch_idx].item()
+        for batch_idx in range(batch_size):
+            text_start = text_token_indices[batch_idx].item()
 
-                # If examples exist, assign segment 1 to example section
-                if has_example[batch_idx]:
-                    example_start = example_token_indices[batch_idx].item()
-                    segment_ids[batch_idx, example_start:text_start] = 1
-
-                # Assign segment 2 to text section
-                segment_ids[batch_idx, text_start:] = 2
-        else:
-            # If not extracting text features, just separate labels and examples
-            for batch_idx in range(batch_size):
-                if has_example[batch_idx]:
-                    example_start = example_token_indices[batch_idx].item()
-                    segment_ids[batch_idx, example_start:] = 1
+            # If examples exist, assign segment 1 to example section
+            if has_example[batch_idx]:
+                example_start = example_token_indices[batch_idx].item()
+                segment_ids[batch_idx, text_start: example_start] = 1
+                segment_ids[batch_idx, example_start:] = 2
+            else:
+                segment_ids[batch_idx, text_start: ] = 1
 
         return segment_ids
 
@@ -564,7 +557,7 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
 
         if not config.encoder_config.is_encoder_decoder:
             raise ValueError("You need to choose encoder-decoder model as a backbone.")
-        
+
         if from_pretrained:
             self.encoder_decoder_model = AutoModel.from_pretrained(
                 config.encoder_model_name
@@ -573,7 +566,28 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
             self.encoder_decoder_model = AutoModel.from_config(
                 config.encoder_config
             )
-    
+
+    @staticmethod
+    def _make_bidirectional_4d_mask(attention_mask_2d, dtype):
+        """Convert a 2D padding mask into a 4D bidirectional attention mask.
+
+        When a 4D mask is passed to the decoder, the model uses it as-is
+        without applying its default causal pattern, enabling bidirectional
+        self-attention in the decoder.
+
+        Args:
+            attention_mask_2d: (batch_size, seq_length) with 1 for real tokens, 0 for padding.
+            dtype: The dtype of the model (needed for the min-value fill).
+
+        Returns:
+            4D mask of shape (batch_size, 1, seq_length, seq_length).
+            Values are 0.0 for attended positions and a large negative value for masked positions.
+        """
+        batch_size, seq_length = attention_mask_2d.shape
+        # (batch_size, 1, 1, seq_length) – masks out padding columns
+        padding_mask = (1.0 - attention_mask_2d.to(dtype))[:, None, None, :] * torch.finfo(dtype).min
+        return padding_mask.expand(batch_size, 1, seq_length, seq_length)
+
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -597,11 +611,18 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # Build a 4D bidirectional mask for the decoder so it attends to
+        # all non-padding positions instead of using causal masking.
+        decoder_4d_mask = None
+        if class_attention_mask is not None:
+            model_dtype = next(self.encoder_decoder_model.parameters()).dtype
+            decoder_4d_mask = self._make_bidirectional_4d_mask(class_attention_mask, model_dtype)
+
         outputs = self.encoder_decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             decoder_input_ids=class_input_ids,
-            decoder_attention_mask=class_attention_mask,
+            decoder_attention_mask=decoder_4d_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -639,12 +660,107 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
 
         return GLiClassOutput(
             loss=loss, logits=logits, 
-            hidden_states = outputs.hidden_states, 
-            attentions = outputs.attentions,
+            hidden_states = outputs.decoder_hidden_states,
+            attentions = outputs.decoder_attentions,
             text_embeddings = pooled_output if output_text_embeddings else None,
             class_embeddings = classes_embedding if output_class_embeddings else None,
         )
  
+class GLiClassEncoderDecoderCLS(GLiClassBaseModel):
+    """Encoder-decoder architecture where labels go to the encoder and text goes to the decoder.
+
+    Class features are extracted from encoder output using _extract_class_features().
+    Text features are extracted from the last non-padding token of the decoder output.
+    """
+    def __init__(self, config: GLiClassModelConfig, from_pretrained = False):
+        super().__init__(config)
+        if config.encoder_config is None:
+            if config.encoder_model_name is None:
+                raise ValueError("You need to specify encoder model name to use it as a backbone.")
+            config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
+
+        if not config.encoder_config.is_encoder_decoder:
+            raise ValueError("You need to choose encoder-decoder model as a backbone.")
+
+        if from_pretrained:
+            self.encoder_decoder_model = AutoModel.from_pretrained(
+                config.encoder_model_name
+            )
+        else:
+            self.encoder_decoder_model = AutoModel.from_config(
+                config.encoder_config
+            )
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        class_input_ids: Optional[torch.Tensor] = None,
+        class_attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        output_text_embeddings: Optional[bool] = None,
+        output_class_embeddings:  Optional[bool] = None,
+        return_dict: Optional[bool] = True,
+        **kwargs
+    ) -> Union[Tuple, SequenceClassifierOutput]:
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # Labels → encoder, Text → decoder
+        outputs = self.encoder_decoder_model(
+            input_ids=class_input_ids,
+            attention_mask=class_attention_mask,
+            decoder_input_ids=input_ids,
+            decoder_attention_mask=attention_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+            **kwargs
+        )
+
+        # Class features from encoder output
+        encoder_token_embeddings = outputs.encoder_last_hidden_state
+        classes_embedding, classes_embedding_mask, _, _ = self._extract_class_features(
+            encoder_token_embeddings, class_input_ids, class_attention_mask
+        )
+
+        # Text features from decoder's last non-padding token
+        decoder_output = outputs.last_hidden_state
+        batch_size = decoder_output.shape[0]
+        last_non_pad_idx = attention_mask.sum(dim=1) - 1
+        pooled_output = decoder_output[torch.arange(batch_size, device=decoder_output.device), last_non_pad_idx]
+
+        pooled_output = self.text_projector(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        if self.config.normalize_features:
+            pooled_output = nn.functional.normalize(pooled_output, p=2, dim=-1, eps=self.epsilon)
+
+        classes_embedding = self.classes_projector(classes_embedding)
+        if self.config.normalize_features:
+            classes_embedding = nn.functional.normalize(classes_embedding, p=2, dim=-1, eps=self.epsilon)
+
+        logits = self.scorer(pooled_output, classes_embedding)
+
+        if self.config.normalize_features:
+            logits = logits*self.logit_scale.to(classes_embedding.device)
+
+        loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
+
+        if not return_dict:
+            output = (logits,) + outputs[1:]
+            return ((loss,) + output) if loss is not None else output
+
+        return GLiClassOutput(
+            loss=loss, logits=logits,
+            hidden_states = outputs.decoder_hidden_states,
+            attentions = outputs.decoder_attentions,
+            text_embeddings = pooled_output if output_text_embeddings else None,
+            class_embeddings = classes_embedding if output_class_embeddings else None,
+        )
+
+
 class GLiClassBiEncoder(GLiClassBaseModel):
     def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
         super().__init__(config)
@@ -815,12 +931,14 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.model = GLiClassBiEncoderFused(config, from_pretrained)
         elif config.architecture_type == 'encoder-decoder':
             self.model = GLiClassEncoderDecoder(config, from_pretrained)
+        elif config.architecture_type == 'encoder-decoder-cls':
+            self.model = GLiClassEncoderDecoderCLS(config, from_pretrained)
         self.post_init()
 
     def get_input_embeddings(self):
         if self.config.architecture_type in {'uni-encoder'}:
             return self.model.encoder_model.get_input_embeddings()
-        elif self.config.architecture_type == 'encoder-decoder':
+        elif self.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
             return self.model.encoder_decoder_model.get_input_embeddings()
         else:
             raise NotImplementedError('Getting input embeddings is not implemented for bi-encoder architecture')
@@ -829,7 +947,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
         if self.config.architecture_type in {'uni-encoder'}:
             self.model.encoder_model.set_input_embeddings(value)
             return None
-        elif self.config.architecture_type == 'encoder-decoder':
+        elif self.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
             self.model.encoder_decoder_model.set_input_embeddings(value)
         elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
             self.model.encoder_model.set_input_embeddings(value)
@@ -842,7 +960,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             # Transformers v5+ supports recompute_mapping and missing_keys parameters
             if self.config.architecture_type in {'uni-encoder'}:
                 return self.model.encoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
-            elif self.config.architecture_type == 'encoder-decoder':
+            elif self.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
                 return self.model.encoder_decoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
             elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
                 return self.model.encoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
@@ -852,7 +970,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             # Transformers v4 does not support recompute_mapping or missing_keys parameters
             if self.config.architecture_type in {'uni-encoder'}:
                 return self.model.encoder_model.tie_weights()
-            elif self.config.architecture_type == 'encoder-decoder':
+            elif self.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
                 return self.model.encoder_decoder_model.tie_weights()
             elif self.config.architecture_type in {'bi-encoder', 'bi-encoder-fused'}:
                 return self.model.encoder_model.tie_weights()
@@ -862,7 +980,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
     def resize_token_embeddings(self, new_num_tokens: Optional[int] = None, pad_to_multiple_of=None) -> nn.Embedding:
         if self.config.architecture_type in {'uni-encoder'}:
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
-        elif self.config.architecture_type == 'encoder-decoder':
+        elif self.config.architecture_type in {'encoder-decoder', 'encoder-decoder-cls'}:
             model_embeds = self.model.encoder_decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         elif self.config.architecture_type in {'bi-encoder-fused'}:
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
