@@ -38,6 +38,10 @@ class GLiClassModelConfig(PretrainedConfig):
         use_lstm=False,
         initializer_range=0.03,
         scorer_type='simple',
+        scorer_num_heads=16,
+        scorer_mlp_hidden_size=1024,
+        scorer_attn_dropout=0.1,
+        scorer_use_sequence_packing=True,
         pooling_strategy='first',
         class_token_pooling="first",
         focal_loss_alpha=0.5,
@@ -116,6 +120,10 @@ class GLiClassModelConfig(PretrainedConfig):
         self.max_num_classes = max_num_classes
         self.initializer_range=initializer_range
         self.scorer_type = scorer_type
+        self.scorer_num_heads = scorer_num_heads
+        self.scorer_mlp_hidden_size = scorer_mlp_hidden_size
+        self.scorer_attn_dropout = scorer_attn_dropout
+        self.scorer_use_sequence_packing = scorer_use_sequence_packing
         self.pooling_strategy=pooling_strategy
         self.class_token_pooling=class_token_pooling
         self.use_lstm = use_lstm
