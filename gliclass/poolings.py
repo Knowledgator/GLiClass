@@ -89,6 +89,12 @@ class GlobalAbsAvgPooling1D(nn.Module):
         else:
             return x.abs().mean(dim=1)
 
+class PassPooling1D(nn.Module):
+    """Passes the input through without pooling."""
+
+    def forward(self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None):
+        return x
+
 POOLING2OBJECT = {
     'max': GlobalMaxPooling1D,
     'first': FirstTokenPooling1D,
@@ -97,5 +103,6 @@ POOLING2OBJECT = {
     'sum': GlobalSumPooling1D,
     'rms': GlobalRMSPooling1D,
     'abs_max': GlobalAbsMaxPooling1D,
-    'abs_avg': GlobalAbsAvgPooling1D
+    'abs_avg': GlobalAbsAvgPooling1D,
+    'pass': PassPooling1D
 }
