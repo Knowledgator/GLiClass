@@ -99,7 +99,7 @@ class HopfieldScorer(nn.Module):
         return scores
 
 class CrossAttnScorer(nn.Module):
-    def __init__(self, hidden_size, num_heads=16, attn_dropout=0.1, mlp_hidden_size=1024, use_sequence_packing=True, **kwargs):
+    def __init__(self, hidden_size, num_heads=16, attn_dropout=0.1, scorer_mlp_hidden_size=1024, use_sequence_packing=True, **kwargs):
         super().__init__()
         assert hidden_size % num_heads == 0, \
             f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
@@ -119,11 +119,11 @@ class CrossAttnScorer(nn.Module):
         self.norm = nn.LayerNorm(hidden_size)
 
         self.score_mlp = nn.Sequential(
-            nn.Linear(hidden_size * 2, mlp_hidden_size),
+            nn.Linear(hidden_size * 2, scorer_mlp_hidden_size),
             nn.GELU(),
-            nn.Linear(mlp_hidden_size, mlp_hidden_size // 2),
+            nn.Linear(scorer_mlp_hidden_size, scorer_mlp_hidden_size // 2),
             nn.GELU(),
-            nn.Linear(mlp_hidden_size // 2, 1),
+            nn.Linear(scorer_mlp_hidden_size // 2, 1),
         )
 
     def _forward_packed(self, text_rep, label_rep, text_mask, batch_size, num_labels, hidden_size):

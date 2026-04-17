@@ -108,7 +108,7 @@ class GLiClassBaseModel(nn.Module):#):
             self.scorer = SCORER2OBJECT[config.scorer_type](
                 config.hidden_size,
                 num_heads=config.scorer_num_heads,
-                mlp_hidden_size=config.scorer_mlp_hidden_size,
+                scorer_mlp_hidden_size=config.scorer_mlp_hidden_size,
                 attn_dropout=config.scorer_attn_dropout,
                 use_sequence_packing=config.scorer_use_sequence_packing,
             )
