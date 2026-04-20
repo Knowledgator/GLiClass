@@ -41,7 +41,7 @@ else:
 
 if IS_TURBOT5:
     from turbot5.model.modeling import T5EncoderModel as FlashT5EncoderModel
-from transformers import T5EncoderModel
+from transformers import T5EncoderModel, UMT5EncoderModel
 
 if IS_FLASHDEBERTA:
     from flashdeberta import FlashDebertaV2Model
@@ -105,7 +105,13 @@ class GLiClassBaseModel(nn.Module):#):
         if config.pooling_strategy not in POOLING2OBJECT:
             raise NotImplementedError(f"{config.scorer_type} is not implemented. Choose one of this: 'dot', 'weighted-dot'")
         else:
-            self.scorer = SCORER2OBJECT[config.scorer_type](config.hidden_size)
+            self.scorer = SCORER2OBJECT[config.scorer_type](
+                config.hidden_size,
+                num_heads=config.scorer_num_heads,
+                scorer_mlp_hidden_size=config.scorer_mlp_hidden_size,
+                attn_dropout=config.scorer_attn_dropout,
+                use_sequence_packing=config.scorer_use_sequence_packing,
+            )
 
         if config.use_lstm:
             self.lstm = LstmSeq2SeqEncoder(config.hidden_size, config.hidden_size//2, bidirectional=True)
@@ -366,13 +372,14 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                 print('Loading decoder model using LLM2Vec...')
                 ModelClass = DECODER_MODEL_MAPPING[config_name]
             decoder = True
-        elif config_name in {'T5Config', 'MT5Config'}:
+        elif config_name in {'T5Config', 'MT5Config', 'UMT5Config'}:
             decoder = False
-            turbot5_type = os.environ.get("TURBOT5_ATTN_TYPE", "basic")
+            turbot5_type = os.environ.get("TURBOT5_ATTN_TYPE", "")
             if turbot5_type and IS_TURBOT5:
                 ModelClass = FlashT5EncoderModel
                 model_kwargs = {'attention_type': turbot5_type}
-                config.encoder_config.attention_type=turbot5_type
+            elif config_name == 'UMT5Config':
+                ModelClass = UMT5EncoderModel
             else:
                 ModelClass = T5EncoderModel
         elif config_name in {'DebertaV2Config'}:
@@ -395,7 +402,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             if decoder:
                 self.encoder_model = ModelClass(config.encoder_config)
             else:
-                if config_name in {'T5Config', 'MT5Config', 'DebertaV2Config'}:
+                if config_name in {'T5Config', 'MT5Config', 'UMT5Config', 'DebertaV2Config'}:
                     self.encoder_model = ModelClass._from_config(
                         config.encoder_config
                     )
@@ -458,11 +465,11 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         if self.config.normalize_features:
             classes_embedding = classes_embedding / (classes_embedding.norm(p=2, dim=-1, keepdim=True)+self.epsilon)
 
-        logits = self.scorer(pooled_output, classes_embedding)
+        logits = self.scorer(pooled_output, classes_embedding, text_mask=text_mask)
 
         if self.config.normalize_features:
             logits = logits*self.logit_scale.to(classes_embedding.device)
-        
+
         loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
         return (logits, loss, pooled_output, classes_embedding)
     
