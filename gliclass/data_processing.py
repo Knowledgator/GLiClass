@@ -390,19 +390,35 @@ def pad_2d_tensor(key_data):
     return padded_tensors
 
 class DataCollatorWithPadding:
-    def __init__(self, device = 'cuda:0'):
+    def __init__(self, device='cuda:0', config=None):
         self.device = device
+        self._max_labels_alloc = getattr(config, 'max_labels_alloc', 'dynamic') if config is not None else 'dynamic'
+
+    def _resolve_max_num_classes(self, batch):
+        if self._max_labels_alloc == 'dynamic':
+            first = batch[0]
+            if 'labels_text' in first:
+                return max(len(item['labels_text']) for item in batch)
+            if 'labels_mask' in first:
+                return max(item['labels_mask'].shape[0] for item in batch)
+            first_labels = first.get('labels')
+            if isinstance(first_labels, torch.Tensor) and first_labels.dim() >= 1:
+                return max(item['labels'].shape[0] for item in batch)
+            return None
+        if isinstance(self._max_labels_alloc, int):
+            return self._max_labels_alloc
+        return None  # 'fixed': model uses config.max_num_classes
 
     def __call__(self, batch):
         keys = batch[0].keys()
         padded_batch = {key: [] for key in keys}
-        
+
         for key in keys:
             key_data = [item[key] for item in batch]
             if isinstance(key_data[0], torch.Tensor):
                 if  key_data[0].dim() == 1:
                     padded_batch[key] = pad_sequence(key_data, batch_first=True)
-                elif key_data[0].dim() == 2: 
+                elif key_data[0].dim() == 2:
                     padded_batch[key] = pad_2d_tensor(key_data)
             elif isinstance(key_data[0], list):
                 data_el = "string"
@@ -412,7 +428,7 @@ class DataCollatorWithPadding:
                     padded_batch[key] = key_data
                 else:
                     max_length = max(len(seq) for seq in key_data)
-                    padded_batch[key] = torch.tensor([seq + [0] * (max_length - len(seq)) 
+                    padded_batch[key] = torch.tensor([seq + [0] * (max_length - len(seq))
                                                         for seq in key_data])
             elif type(key_data[0]) in {int, float}:
                 padded_batch[key] = torch.tensor(key_data)
@@ -420,5 +436,6 @@ class DataCollatorWithPadding:
                 padded_batch[key] = key_data
             else:
                 raise TypeError(f"Unsupported data type: {type(key_data[0])}")
-        
+
+        padded_batch['max_num_classes'] = self._resolve_max_num_classes(batch)
         return padded_batch
