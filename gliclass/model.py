@@ -110,7 +110,6 @@ class GLiClassBaseModel(nn.Module):#):
                 num_heads=config.scorer_num_heads,
                 scorer_mlp_hidden_size=config.scorer_mlp_hidden_size,
                 attn_dropout=config.scorer_attn_dropout,
-                use_sequence_packing=config.scorer_use_sequence_packing,
             )
 
         if config.use_lstm:
@@ -134,13 +133,14 @@ class GLiClassBaseModel(nn.Module):#):
         
         self.device = torch.device(device)
 
-    def _extract_class_features(self, token_embeds, input_ids, attention_mask):
+    def _extract_class_features(self, token_embeds, input_ids, attention_mask, max_num_classes=None):
         batch_size, sequence_length, embed_dim = token_embeds.shape
 
         class_token_mask = input_ids == self.config.class_token_index
         num_class_tokens = torch.sum(class_token_mask, dim=-1, keepdim=True)
 
-        max_embed_dim = num_class_tokens.max()
+        # max_num_classes from caller (CPU int) avoids GPU→CPU sync via .item()
+        max_embed_dim = max_num_classes if max_num_classes is not None else self.config.max_num_classes
         
         # Get class token pooling method from config (default to "first" for backward compatibility)
         class_token_pooling = getattr(self.config, 'class_token_pooling', 'first')
@@ -161,152 +161,82 @@ class GLiClassBaseModel(nn.Module):#):
         # Text features extraction
         if self.config.extract_text_features:
             text_token_mask = input_ids == self.config.text_token_index
-            
-            # Get text token start index per batch item (assuming one text token per batch)
-            # Shape: (batch_size,)
-            text_token_indices = text_token_mask.int().argmax(dim=-1)
-            
-            # Calculate text lengths per batch item
-            text_lengths = input_ids.shape[-1] - text_token_indices  # Shape: (batch_size,)
-            max_text_length = text_lengths.max().item()
-            
-            text_tokens_embeddings = torch.zeros(
-                batch_size, max_text_length, embed_dim, 
-                dtype=token_embeds.dtype, device=token_embeds.device
-            )
-            text_tokens_mask = torch.zeros(
-                batch_size, max_text_length, 
-                dtype=attention_mask.dtype, device=token_embeds.device
-            )
-            
-            # Create range tensor for target indices: (batch_size, max_text_length)
+            text_token_indices = text_token_mask.int().argmax(dim=-1)  # (batch,)
+            max_text_length = input_ids.shape[-1]  # static, no GPU→CPU sync
+
+            # (batch, max_text_length): source position in token_embeds for each target slot
             aranged_target_idx = torch.arange(
                 max_text_length, device=token_embeds.device
             ).unsqueeze(0).expand(batch_size, -1)
-            
-            # Mask for valid positions: (batch_size, max_text_length)
-            valid_mask = aranged_target_idx < text_lengths.unsqueeze(1)
-            
-            # Get batch and target indices where valid
-            batch_idx, target_text_idx = torch.where(valid_mask)
-            
-            # Calculate corresponding source indices in token_embeds
-            source_text_idx = text_token_indices[batch_idx] + target_text_idx
-            
-            # Assign embeddings and mask
-            text_tokens_embeddings[batch_idx, target_text_idx] = token_embeds[batch_idx, source_text_idx]
-            text_tokens_mask[batch_idx, target_text_idx] = attention_mask[batch_idx, source_text_idx]
+            valid_mask = aranged_target_idx < (input_ids.shape[-1] - text_token_indices).unsqueeze(1)
+
+            source_indices = (text_token_indices.unsqueeze(1) + aranged_target_idx).clamp(
+                max=input_ids.shape[-1] - 1
+            )
+            batch_arange = torch.arange(batch_size, device=token_embeds.device).unsqueeze(1)
+
+            # Gather then zero-out invalid positions — no nonzero/scatter needed
+            text_tokens_embeddings = token_embeds[batch_arange, source_indices] * valid_mask.unsqueeze(-1).to(token_embeds.dtype)
+            text_tokens_mask = attention_mask[batch_arange, source_indices] * valid_mask
         else:
             text_tokens_embeddings = token_embeds
             text_tokens_mask = attention_mask
         return classes_embedding, classes_embedding_mask, text_tokens_embeddings, text_tokens_mask
 
-    def _extract_class_features_first(self, token_embeds, input_ids, attention_mask, 
-                                       class_token_mask, num_class_tokens, max_embed_dim, 
+    def _extract_class_features_first(self, token_embeds, input_ids, attention_mask,
+                                       class_token_mask, num_class_tokens, max_embed_dim,
                                        batch_size, embed_dim):
-        """Original method: extract only the class token embedding (or token after it)."""
-        aranged_class_idx = torch.arange(max_embed_dim, 
-                                            dtype=attention_mask.dtype, 
-                                            device=token_embeds.device).expand(batch_size, -1)
-        
-        batch_indices, target_class_idx = torch.where(aranged_class_idx < num_class_tokens)
-        _, class_indices = torch.where(class_token_mask)
+        """Extract only the class token embedding (or token after it). Fully vectorized."""
+        class_cum = class_token_mask.long().cumsum(dim=-1)  # (batch, seq)
+        k_range = torch.arange(max_embed_dim, device=token_embeds.device).view(1, -1, 1)
+
+        # select_mask[b, k, s] = True at the position of the k-th class token
+        select_mask = class_token_mask.unsqueeze(1) & ((class_cum.unsqueeze(1) - 1) == k_range)
+
         if not self.config.embed_class_token:
-            class_indices += 1
+            # Shift right by 1: select the token immediately after each class token
+            shifted = torch.zeros_like(select_mask)
+            shifted[:, :, 1:] = select_mask[:, :, :-1]
+            select_mask = shifted
 
-        classes_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
-        )
-        classes_embedding_mask = torch.zeros(
-            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=token_embeds.device
-        )
+        classes_embedding = torch.einsum('bks,bsd->bkd', select_mask.to(token_embeds.dtype), token_embeds)
 
-        classes_embedding[batch_indices, target_class_idx] = token_embeds[batch_indices, class_indices]
-        classes_embedding_mask[batch_indices, target_class_idx] = 1
-        
+        arange_k = torch.arange(max_embed_dim, device=token_embeds.device).unsqueeze(0)
+        classes_embedding_mask = (arange_k < num_class_tokens).to(attention_mask.dtype)
+
         return classes_embedding, classes_embedding_mask
 
     def _extract_class_features_averaged(self, token_embeds, input_ids, attention_mask,
                                           class_token_mask, num_class_tokens, max_embed_dim,
                                           batch_size, embed_dim):
-        """
-        Average all tokens belonging to each class label.
-        
-        For each class, we average tokens from:
-        - Start: class token position (or position + 1 if embed_class_token is False)
-        - End: next class token position (or text token position, or end of valid tokens)
-        """
-        classes_embedding = torch.zeros(
-            batch_size, max_embed_dim, embed_dim, dtype=token_embeds.dtype, device=token_embeds.device
-        )
-        classes_embedding_mask = torch.zeros(
-            batch_size, max_embed_dim, dtype=attention_mask.dtype, device=token_embeds.device
-        )
-        
-        # Get text token positions as boundary markers
+        """Average all tokens belonging to each class label. Fully vectorized."""
+        # class_cum[b, s] = cumulative count of class tokens up to position s
+        class_cum = class_token_mask.long().cumsum(dim=-1)  # (batch, seq)
+
         if self.config.extract_text_features:
-            text_token_mask = input_ids == self.config.text_token_index
+            text_token_mask = (input_ids == self.config.text_token_index)
         else:
             text_token_mask = torch.zeros_like(class_token_mask)
-        
-        for batch_idx in range(batch_size):
-            # Get class token positions for this batch item
-            class_positions = torch.where(class_token_mask[batch_idx])[0]
-            n_classes = len(class_positions)
-            
-            if n_classes == 0:
-                continue
-            
-            # Get text token position (boundary for last class)
-            text_positions = torch.where(text_token_mask[batch_idx])[0]
-            if len(text_positions) > 0:
-                text_start = text_positions[0].item()
-            else:
-                # If no text token, use sequence length
-                text_start = attention_mask[batch_idx].sum().item()
-            
-            for class_idx in range(n_classes):
-                class_pos = class_positions[class_idx].item()
-                
-                # Determine start position
-                if self.config.embed_class_token:
-                    start_pos = class_pos
-                else:
-                    start_pos = class_pos + 1
-                
-                # Determine end position (exclusive)
-                if class_idx + 1 < n_classes:
-                    # Next class token position
-                    end_pos = class_positions[class_idx + 1].item()
-                else:
-                    # Text token position or end of valid sequence
-                    end_pos = text_start
-                
-                # Ensure valid range
-                if start_pos >= end_pos:
-                    # Fallback: just use the single token
-                    if self.config.embed_class_token:
-                        classes_embedding[batch_idx, class_idx] = token_embeds[batch_idx, class_pos]
-                    else:
-                        if class_pos + 1 < token_embeds.shape[1]:
-                            classes_embedding[batch_idx, class_idx] = token_embeds[batch_idx, class_pos + 1]
-                else:
-                    # Extract tokens for this class and average them
-                    class_tokens = token_embeds[batch_idx, start_pos:end_pos]  # (span_length, embed_dim)
-                    class_attn = attention_mask[batch_idx, start_pos:end_pos]  # (span_length,)
-                    
-                    # Masked average (only average over attended tokens)
-                    attn_sum = class_attn.sum()
-                    if attn_sum > 0:
-                        # Weighted average by attention mask
-                        class_tokens_masked = class_tokens * class_attn.unsqueeze(-1).float()
-                        classes_embedding[batch_idx, class_idx] = class_tokens_masked.sum(dim=0) / attn_sum.float()
-                    else:
-                        # Fallback to simple mean if no attention
-                        classes_embedding[batch_idx, class_idx] = class_tokens.mean(dim=0)
-                
-                classes_embedding_mask[batch_idx, class_idx] = 1
-        
+        # text_cum[b, s] >= 1 at and after the text token → use as exclusion boundary
+        text_cum = text_token_mask.long().cumsum(dim=-1)  # (batch, seq)
+
+        # span_mask[b, k, s] = True if token s belongs to the span of class k
+        k_range = torch.arange(max_embed_dim, device=token_embeds.device).view(1, -1, 1)
+        span_mask = (
+            (class_cum.unsqueeze(1) == (k_range + 1))  # in the span of class k
+            & (text_cum.unsqueeze(1) == 0)             # before the text boundary
+            & attention_mask.unsqueeze(1).bool()        # real token (not padding)
+        )
+        if not self.config.embed_class_token:
+            span_mask = span_mask & ~class_token_mask.unsqueeze(1)
+
+        span_float = span_mask.to(token_embeds.dtype)  # (batch, max_embed_dim, seq)
+        class_counts = span_float.sum(dim=-1, keepdim=True).clamp(min=1)
+        classes_embedding = torch.einsum('bks,bsd->bkd', span_float, token_embeds) / class_counts
+
+        arange_k = torch.arange(max_embed_dim, device=token_embeds.device).unsqueeze(0)
+        classes_embedding_mask = (arange_k < num_class_tokens).to(attention_mask.dtype)
+
         return classes_embedding, classes_embedding_mask
 
     def get_loss(self, logits, labels, classes_embedding=None, classes_embedding_mask=None):
@@ -411,6 +341,11 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                         config.encoder_config
                     )
 
+        if config.vocab_size is not None and hasattr(self.encoder_model, 'resize_token_embeddings'):
+            current_vocab = self.encoder_model.config.vocab_size
+            if current_vocab != config.vocab_size:
+                self.encoder_model.resize_token_embeddings(config.vocab_size)
+
         adapter_config_file = Path(config.encoder_model_name) / "adapter_config.json"
 
         if adapter_config_file.exists():
@@ -449,9 +384,9 @@ class GLiClassUniEncoder(GLiClassBaseModel):
 
         return segment_ids
 
-    def process_encoder_output(self, input_ids, attention_mask, encoder_layer, labels = None):
-        classes_embedding, classes_embedding_mask, text_token_embeddings, text_mask = self._extract_class_features(encoder_layer, 
-                                                                                                            input_ids, attention_mask)
+    def process_encoder_output(self, input_ids, attention_mask, encoder_layer, labels=None, max_num_classes=None):
+        classes_embedding, classes_embedding_mask, text_token_embeddings, text_mask = self._extract_class_features(encoder_layer,
+                                                                                                            input_ids, attention_mask, max_num_classes)
         if self.config.use_lstm:
             text_token_embeddings = self.lstm(text_token_embeddings, text_mask)
         
@@ -484,6 +419,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
         output_text_embeddings: Optional[bool] = None,
         output_class_embeddings:  Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        max_num_classes: Optional[int] = None,
         **kwargs
     ) -> Union[Tuple, GLiClassOutput]:
         r"""
@@ -529,7 +465,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             hidden_states = outputs.hidden_states
             loss = 0
             for encoder_layer in hidden_states:
-                logits, layer_loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels)
+                logits, layer_loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels, max_num_classes)
                 loss+=layer_loss
         else:
             if self.config.encoder_layer_id==-1:
@@ -539,7 +475,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                     encoder_layer = outputs[0]
             else:
                 encoder_layer = outputs.hidden_states[self.config.encoder_layer_id]
-            logits, loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels)
+            logits, loss, pooled_output, classes_embedding = self.process_encoder_output(input_ids, attention_mask, encoder_layer, labels, max_num_classes)
 
         if not return_dict:
             output = (logits,) + outputs[1:]

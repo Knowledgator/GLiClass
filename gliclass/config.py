@@ -41,7 +41,6 @@ class GLiClassModelConfig(PretrainedConfig):
         scorer_num_heads=16,
         scorer_mlp_hidden_size=1024,
         scorer_attn_dropout=0.1,
-        scorer_use_sequence_packing=True,
         pooling_strategy='first',
         class_token_pooling="first",
         focal_loss_alpha=0.5,
@@ -50,6 +49,7 @@ class GLiClassModelConfig(PretrainedConfig):
         logit_scale_init_value=2.6592,
         normalize_features=False,
         extract_text_features=False,
+        max_labels_alloc: str = 'dynamic',
         contrastive_loss_coef=0,
         architecture_type = 'uni-encoder',
         prompt_first = False,
@@ -67,8 +67,14 @@ class GLiClassModelConfig(PretrainedConfig):
                                                 else "deberta-v2")
             if encoder_config['model_type'] == 't5':
                 encoder_config = T5Config(**encoder_config)
-            else:
+            elif encoder_config["model_type"] in CONFIG_MAPPING:
                 encoder_config = CONFIG_MAPPING[encoder_config["model_type"]](**encoder_config)
+            else:
+                _name = encoder_model or kwargs.get("encoder_model_name")
+                if _name:
+                    encoder_config = AutoConfig.from_pretrained(_name, trust_remote_code=True)
+                else:
+                    encoder_config = PretrainedConfig(**encoder_config)
         elif encoder_config is None:
             encoder_config = CONFIG_MAPPING["deberta-v2"]()
 
@@ -123,7 +129,6 @@ class GLiClassModelConfig(PretrainedConfig):
         self.scorer_num_heads = scorer_num_heads
         self.scorer_mlp_hidden_size = scorer_mlp_hidden_size
         self.scorer_attn_dropout = scorer_attn_dropout
-        self.scorer_use_sequence_packing = scorer_use_sequence_packing
         self.pooling_strategy=pooling_strategy
         self.class_token_pooling=class_token_pooling
         self.use_lstm = use_lstm
@@ -134,6 +139,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.logit_scale_init_value = logit_scale_init_value
         self.normalize_features=normalize_features
         self.extract_text_features = extract_text_features
+        self.max_labels_alloc = max_labels_alloc
         self.architecture_type = architecture_type
         self.prompt_first = prompt_first
         self.squeeze_layers = squeeze_layers

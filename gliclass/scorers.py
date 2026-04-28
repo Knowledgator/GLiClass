@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from .ops import attn_varlen, attn_padded, unpad_input, pad_input
+from .ops import attn_padded
 
 class ScorerWeightedDot(nn.Module):
     def __init__(self, hidden_size, dropout=0.1, **kwargs):
@@ -121,14 +121,13 @@ class HopfieldScorer(nn.Module):
         return scores
 
 class CrossAttnScorer(nn.Module):
-    def __init__(self, hidden_size, num_heads=16, attn_dropout=0.1, scorer_mlp_hidden_size=1024, use_sequence_packing=True, **kwargs):
+    def __init__(self, hidden_size, num_heads=16, attn_dropout=0.1, scorer_mlp_hidden_size=1024, **kwargs):
         super().__init__()
         assert hidden_size % num_heads == 0, \
             f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
-        self.num_heads            = num_heads
-        self.head_dim             = hidden_size // num_heads
-        self.attn_dropout         = attn_dropout
-        self.use_sequence_packing = use_sequence_packing
+        self.num_heads  = num_heads
+        self.head_dim   = hidden_size // num_heads
+        self.attn_dropout = attn_dropout
 
         self.q_norm  = nn.LayerNorm(hidden_size)
         self.kv_norm = nn.LayerNorm(hidden_size)
@@ -148,46 +147,6 @@ class CrossAttnScorer(nn.Module):
             nn.Linear(scorer_mlp_hidden_size // 2, 1),
         )
 
-    def _forward_packed(self, text_rep, label_rep, text_mask, batch_size, num_labels, hidden_size):
-        """Unpadded path: flash_attn_varlen → PyTorch loop fallback."""
-        label_mask = label_rep.abs().sum(dim=-1) > 0  # [B, N]
-
-        text_unpad,  _, cu_seqlens_k, _            = unpad_input(text_rep,  text_mask)
-        label_unpad, label_indices, cu_seqlens_q, _ = unpad_input(label_rep, label_mask)
-
-        q = self.q(self.q_norm(label_unpad)).view(-1, self.num_heads, self.head_dim)
-        k = self.k(self.kv_norm(text_unpad)).view(-1, self.num_heads, self.head_dim)
-        v = self.v(text_unpad).view(-1, self.num_heads, self.head_dim)
-
-        dropout_p = self.attn_dropout if self.training else 0.0
-        context = attn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, dropout_p=dropout_p)
-        context = self.norm(self.out(context.reshape(-1, hidden_size)))  # [Ql, H]
-
-        scores_unpad = self.score_mlp(
-            torch.cat([context, label_unpad], dim=-1)
-        ).squeeze(-1)  # [Ql]
-
-        return pad_input(
-            scores_unpad.unsqueeze(-1), label_indices, batch_size, num_labels
-        ).squeeze(-1)  # [B, N]
-
-    def _forward_padded(self, text_rep, label_rep, text_mask, batch_size, num_labels, hidden_size):
-        """Padded path: F.scaled_dot_product_attention (flash backend on CUDA)."""
-        q = self.q(self.q_norm(label_rep)).view(batch_size, num_labels, self.num_heads, self.head_dim)
-        k = self.k(self.kv_norm(text_rep)).view(batch_size, -1, self.num_heads, self.head_dim)
-        v = self.v(text_rep).view(batch_size, -1, self.num_heads, self.head_dim)
-
-        dropout_p = self.attn_dropout if self.training else 0.0
-        context = attn_padded(q, k, v, key_padding_mask=text_mask, dropout_p=dropout_p)
-        # [B, N, nheads, head_dim] → [B, N, H]
-        context = self.norm(self.out(context.reshape(batch_size, num_labels, hidden_size)))
-
-        scores = self.score_mlp(
-            torch.cat([context, label_rep], dim=-1)
-        ).squeeze(-1)  # [B, N]
-
-        return scores
-
     def forward(self, text_rep, label_rep, text_mask=None, **kwargs):
         batch_size, _, hidden_size = text_rep.shape
         num_labels = label_rep.shape[1]
@@ -196,10 +155,17 @@ class CrossAttnScorer(nn.Module):
             text_mask = torch.ones(batch_size, text_rep.shape[1],
                                    dtype=torch.bool, device=text_rep.device)
 
-        if self.use_sequence_packing:
-            return self._forward_packed(text_rep, label_rep, text_mask, batch_size, num_labels, hidden_size)
-        else:
-            return self._forward_padded(text_rep, label_rep, text_mask, batch_size, num_labels, hidden_size)
+        q = self.q(self.q_norm(label_rep)).view(batch_size, num_labels, self.num_heads, self.head_dim)
+        k = self.k(self.kv_norm(text_rep)).view(batch_size, -1, self.num_heads, self.head_dim)
+        v = self.v(text_rep).view(batch_size, -1, self.num_heads, self.head_dim)
+
+        dropout_p = self.attn_dropout if self.training else 0.0
+        context = attn_padded(q, k, v, key_padding_mask=text_mask, dropout_p=dropout_p)
+        context = self.norm(self.out(context.reshape(batch_size, num_labels, hidden_size)))
+
+        return self.score_mlp(
+            torch.cat([context, label_rep], dim=-1)
+        ).squeeze(-1)
 
 
 SCORER2OBJECT = {
