@@ -190,7 +190,8 @@ class BaseZeroShotClassificationPipeline(ABC):
         self.max_length = max_length
         self.progress_bar = progress_bar
         self.label_separator = label_separator
-        
+        self._max_labels_alloc = getattr(model.config, 'max_labels_alloc', 'dynamic')
+
         self.example_token = "<<EXAMPLE>>"
         self.label_token = "<<LABEL>>"
         self.sep_token = "<<SEP>>"
@@ -277,6 +278,13 @@ class BaseZeroShotClassificationPipeline(ABC):
         
         return ""
 
+    def _resolve_max_num_classes(self, batch_labels, same_labels: bool):
+        if self._max_labels_alloc == 'dynamic':
+            return len(batch_labels) if same_labels else max(len(l) for l in batch_labels)
+        if isinstance(self._max_labels_alloc, int):
+            return self._max_labels_alloc
+        return None  # 'fixed': model uses config.max_num_classes
+
     @abstractmethod
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         pass
@@ -321,11 +329,13 @@ class BaseZeroShotClassificationPipeline(ABC):
             batch_prompt = self._get_batch_prompt(prompt, idx, len(batch_texts))
             
             tokenized_inputs = self.prepare_inputs(
-                batch_texts, labels, same_labels, 
+                batch_texts, labels, same_labels,
                 examples=batch_examples, prompt=batch_prompt
             )
+            max_num_classes = self._resolve_max_num_classes(labels, same_labels)
             model_output = self.model(
-                **tokenized_inputs, 
+                **tokenized_inputs,
+                max_num_classes=max_num_classes,
                 output_text_embeddings=True,
                 output_class_embeddings=True
             )
@@ -410,10 +420,11 @@ class BaseZeroShotClassificationPipeline(ABC):
             batch_prompt = self._get_batch_prompt(prompt, idx, len(batch_texts))
             
             tokenized_inputs = self.prepare_inputs(
-                batch_texts, batch_labels, same_labels, 
+                batch_texts, batch_labels, same_labels,
                 examples=batch_examples, prompt=batch_prompt
             )
-            model_output = self.model(**tokenized_inputs)
+            max_num_classes = self._resolve_max_num_classes(batch_labels, same_labels)
+            model_output = self.model(**tokenized_inputs, max_num_classes=max_num_classes)
             logits = model_output.logits
             
             if self.classification_type == 'single-label':
@@ -1068,10 +1079,11 @@ class ZeroShotClassificationWithChunkingPipeline(BaseZeroShotClassificationPipel
                 all_labels.extend(curr_labels)
                 
                 tokenized_inputs = self.prepare_inputs(
-                    [text_chunk], curr_labels, same_labels=True, 
+                    [text_chunk], curr_labels, same_labels=True,
                     examples=examples, prompt=prompt
                 )
-                model_output = self.model(**tokenized_inputs)
+                max_num_classes = self._resolve_max_num_classes(curr_labels, same_labels=True)
+                model_output = self.model(**tokenized_inputs, max_num_classes=max_num_classes)
                 logits = model_output.logits
                 
                 chunk_logits.extend(logits[0][:len(curr_labels)].tolist())
@@ -1178,10 +1190,11 @@ class ZeroShotClassificationWithChunkingPipeline(BaseZeroShotClassificationPipel
 
                     batch_prompt = self._get_batch_prompt(prompt, idx, len(batch_texts))
                     tokenized_inputs = self.prepare_inputs(
-                        batch_texts, curr_labels, same_labels=True, 
+                        batch_texts, curr_labels, same_labels=True,
                         examples=examples, prompt=batch_prompt
                     )
-                    model_output = self.model(**tokenized_inputs)
+                    max_num_classes = self._resolve_max_num_classes(curr_labels, same_labels=True)
+                    model_output = self.model(**tokenized_inputs, max_num_classes=max_num_classes)
                     logits = model_output.logits
 
                     for i in range(len(batch_texts)):
