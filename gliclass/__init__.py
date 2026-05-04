@@ -2,4 +2,4 @@ from .model import GLiClassModel, GLiClassBiEncoder, GLiClassUniEncoder, GLiClas
 from .config import GLiClassModelConfig
 from .pipeline import ZeroShotClassificationPipeline, BiEncoderZeroShotClassificationPipeline, ZeroShotClassificationWithChunkingPipeline
 
-__version__ = "0.1.17"
+__version__ = "0.1.18"
