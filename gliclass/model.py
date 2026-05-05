@@ -14,6 +14,13 @@ from transformers.activations import ACT2FN
 from transformers.modeling_outputs import SequenceClassifierOutput
 from transformers.utils import (logging)
 from transformers.models.auto import AutoModel
+
+# Import initialization module (transformers 5.0+) or fallback to torch.nn.init
+try:
+    from transformers import initialization as init
+except ImportError:
+    # transformers < 5.0 doesn't have this module, use torch.nn.init instead
+    from torch.nn import init
 from .config import GLiClassModelConfig
 from .layers import FeaturesProjector, LstmSeq2SeqEncoder, BiEncoderProjector, LayerwiseAttention
 from .poolings import POOLING2OBJECT
@@ -61,7 +68,23 @@ class GLiClassPreTrainedModel(PreTrainedModel):
     supports_gradient_checkpointing = True
     _supports_sdpa = False
     _keys_to_ignore_on_load_unexpected = ["position_embeddings"]
-    
+
+    def _initialize_weights(self, module, is_remote_code: bool = False):
+        """
+        Initialize weights if not already initialized.
+
+        This method is called by transformers 5.0+ during post_init().
+        It uses the _is_hf_initialized flag to prevent reinitializing weights
+        that were already loaded from a checkpoint.
+
+        For transformers 4.x, this method is not called, maintaining backward compatibility.
+        """
+        if getattr(module, "_is_hf_initialized", False):
+            return
+
+        self._init_weights(module)
+        module._is_hf_initialized = True
+
     def _init_weights(self, module):
         std = (
             self.config.initializer_range
@@ -70,25 +93,25 @@ class GLiClassPreTrainedModel(PreTrainedModel):
         )
 
         if hasattr(module, "class_embedding"):
-            module.class_embedding.data.normal_(mean=0.0, std=std)
+            init.normal_(module.class_embedding, mean=0.0, std=std)
 
         if hasattr(module, "segment_embeddings"):
-            module.segment_embeddings.weight.data.normal_(mean=0.0, std=std)
+            init.normal_(module.segment_embeddings.weight, mean=0.0, std=std)
 
         if isinstance(module, (nn.Linear, nn.Conv2d)):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
-                module.bias.data.zero_()
+                init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            module.weight.data.normal_(mean=0.0, std=std)
+            init.normal_(module.weight, mean=0.0, std=std)
             if module.padding_idx is not None:
-                module.weight.data[module.padding_idx].zero_()
+                init.zeros_(module.weight[module.padding_idx])
         elif isinstance(module, nn.LSTM):
             for name, param in module.named_parameters():
                 if 'weight_ih' in name or 'weight_hh' in name:
-                    nn.init.normal_(param.data, mean=0.0, std=std)
+                    init.normal_(param, mean=0.0, std=std)
                 elif 'bias' in name:
-                    param.data.zero_()
+                    init.zeros_(param)
 
 class GLiClassBaseModel(nn.Module):#):
     def __init__(self, config: GLiClassModelConfig, device='cpu', **kwargs):
