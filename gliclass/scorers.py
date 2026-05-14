@@ -1,6 +1,8 @@
 import torch
 from torch import nn
+
 from .ops import attn_padded
+
 
 class ScorerWeightedDot(nn.Module):
     def __init__(self, hidden_size, dropout=0.1, **kwargs):
@@ -13,7 +15,7 @@ class ScorerWeightedDot(nn.Module):
             nn.Linear(hidden_size * 3, hidden_size * 4),
             nn.Dropout(dropout),
             nn.ReLU(),
-            nn.Linear(hidden_size * 4, 1)  # start, end, score
+            nn.Linear(hidden_size * 4, 1),  # start, end, score
         )
 
     def forward(self, text_rep, label_rep, **kwargs):
@@ -36,6 +38,7 @@ class ScorerWeightedDot(nn.Module):
 
         return scores
 
+
 class ScorerDot(nn.Module):
     def __init__(self, *args, **kwargs):
         super().__init__()
@@ -43,15 +46,16 @@ class ScorerDot(nn.Module):
 
     def forward(self, text_rep, label_rep, **kwargs):
         # dot product with einsum
-        scores = torch.einsum('BD,BCD->BC', text_rep, label_rep)
+        scores = torch.einsum("BD,BCD->BC", text_rep, label_rep)
         return scores
+
 
 class MLPScorer(nn.Module):
     def __init__(self, hidden_size, mlp_hidden_size=256, **kwargs):
         super().__init__()
 
         # Calculate the input size for the MLP
-        total_input_size = hidden_size*2
+        total_input_size = hidden_size * 2
 
         # Define the MLP
         self.mlp = nn.Sequential(
@@ -59,7 +63,7 @@ class MLPScorer(nn.Module):
             nn.ReLU(),
             nn.Linear(mlp_hidden_size, mlp_hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(mlp_hidden_size // 2, 1)
+            nn.Linear(mlp_hidden_size // 2, 1),
         )
 
     def forward(self, text_rep, label_rep, **kwargs):
@@ -72,6 +76,7 @@ class MLPScorer(nn.Module):
         scores = self.mlp(combined_rep).squeeze(-1)
 
         return scores
+
 
 class HopfieldScorer(nn.Module):
     def __init__(self, hidden_size, mlp_hidden_size=256, beta=4, num_iteration=1, **kwargs):
@@ -87,7 +92,7 @@ class HopfieldScorer(nn.Module):
             nn.ReLU(),
             nn.Linear(mlp_hidden_size, mlp_hidden_size // 2),
             nn.ReLU(),
-            nn.Linear(mlp_hidden_size // 2, 1)
+            nn.Linear(mlp_hidden_size // 2, 1),
         )
 
         self.beta = beta
@@ -96,21 +101,20 @@ class HopfieldScorer(nn.Module):
     def forward(self, text_rep, label_rep, **kwargs):
         """
         text_rep: [batch_size, hidden_size]
-        label_rep: [batch_size, num_labels, hidden_size]
+        label_rep: [batch_size, num_labels, hidden_size].
         """
-        for i in range(self.num_iteration):
+        for _i in range(self.num_iteration):
             # Expand text_rep to match label_rep's batch shape
             text_rep_expanded = text_rep.unsqueeze(1)  # [batch_size, 1, dim]
 
             # Compute Q, K, V
-            query = self.q_proj(label_rep)           # [batch_size, num_labels, dim]
-            key   = self.k_proj(text_rep_expanded)   # [batch_size, 1, dim]
-            value = self.v_proj(text_rep_expanded)   # [batch_size, 1, dim]
-
+            query = self.q_proj(label_rep)  # [batch_size, num_labels, dim]
+            key = self.k_proj(text_rep_expanded)  # [batch_size, 1, dim]
+            value = self.v_proj(text_rep_expanded)  # [batch_size, 1, dim]
 
             attn = torch.bmm(query, key.transpose(1, 2))  # [b, num_labels, 1]
-            attn = attn * self.beta                       # optional beta scaling
-            attn = torch.nn.functional.softmax(attn, dim=1)                 # softmax over labels
+            attn = attn * self.beta  # optional beta scaling
+            attn = torch.nn.functional.softmax(attn, dim=1)  # softmax over labels
 
             context = attn * value  # [b, num_labels, dim]
 
@@ -120,21 +124,21 @@ class HopfieldScorer(nn.Module):
 
         return scores
 
+
 class CrossAttnScorer(nn.Module):
     def __init__(self, hidden_size, num_heads=16, attn_dropout=0.1, scorer_mlp_hidden_size=1024, **kwargs):
         super().__init__()
-        assert hidden_size % num_heads == 0, \
-            f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
-        self.num_heads  = num_heads
-        self.head_dim   = hidden_size // num_heads
+        assert hidden_size % num_heads == 0, f"hidden_size {hidden_size} must be divisible by num_heads {num_heads}"
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
         self.attn_dropout = attn_dropout
 
-        self.q_norm  = nn.LayerNorm(hidden_size)
+        self.q_norm = nn.LayerNorm(hidden_size)
         self.kv_norm = nn.LayerNorm(hidden_size)
 
-        self.q   = nn.Linear(hidden_size, hidden_size)
-        self.k   = nn.Linear(hidden_size, hidden_size)
-        self.v   = nn.Linear(hidden_size, hidden_size)
+        self.q = nn.Linear(hidden_size, hidden_size)
+        self.k = nn.Linear(hidden_size, hidden_size)
+        self.v = nn.Linear(hidden_size, hidden_size)
         self.out = nn.Linear(hidden_size, hidden_size)
 
         self.norm = nn.LayerNorm(hidden_size)
@@ -152,8 +156,7 @@ class CrossAttnScorer(nn.Module):
         num_labels = label_rep.shape[1]
 
         if text_mask is None:
-            text_mask = torch.ones(batch_size, text_rep.shape[1],
-                                   dtype=torch.bool, device=text_rep.device)
+            text_mask = torch.ones(batch_size, text_rep.shape[1], dtype=torch.bool, device=text_rep.device)
 
         q = self.q(self.q_norm(label_rep)).view(batch_size, num_labels, self.num_heads, self.head_dim)
         k = self.k(self.kv_norm(text_rep)).view(batch_size, -1, self.num_heads, self.head_dim)
@@ -163,9 +166,7 @@ class CrossAttnScorer(nn.Module):
         context = attn_padded(q, k, v, key_padding_mask=text_mask, dropout_p=dropout_p)
         context = self.norm(self.out(context.reshape(batch_size, num_labels, hidden_size)))
 
-        return self.score_mlp(
-            torch.cat([context, label_rep], dim=-1)
-        ).squeeze(-1)
+        return self.score_mlp(torch.cat([context, label_rep], dim=-1)).squeeze(-1)
 
 
 SCORER2OBJECT = {
@@ -173,5 +174,5 @@ SCORER2OBJECT = {
     "simple": ScorerDot,
     "mlp": MLPScorer,
     "hopfield": HopfieldScorer,
-    "cross-attn": CrossAttnScorer
+    "cross-attn": CrossAttnScorer,
 }

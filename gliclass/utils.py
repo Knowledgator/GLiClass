@@ -1,12 +1,13 @@
 import torch
 
+
 def is_module_available(module_name):
     """
     Checks whether the specified Python module is available.
-    
+
     Args:
         module_name (str): The name of the module to check.
-        
+
     Returns:
         bool: True if the module is available, False otherwise.
     """
@@ -16,8 +17,10 @@ def is_module_available(module_name):
     except ImportError:
         return False
 
+
 class MissedPackageException(Exception):
     """Raised when the requested decoder model is not supported."""
+
     pass
 
 
@@ -37,7 +40,7 @@ def retrieval_augmented_text(text: str, examples: list) -> str:
         return text
 
     retrieved_examples = []
-    all_labels = set(label for example in examples for label in example.get("true_labels", []))
+    all_labels = {label for example in examples for label in example.get("true_labels", [])}
     relevant_examples = [ex for ex in examples if set(ex.get("true_labels", [])) & all_labels]
 
     for example in relevant_examples:
@@ -57,16 +60,14 @@ def retrieval_augmented_text(text: str, examples: list) -> str:
 
     return augmented_text
 
+
 def default_f1_reward(
-    probs: torch.Tensor,
-    actions: torch.Tensor,
-    original_targets: torch.Tensor,
-    valid_mask: torch.Tensor
+    probs: torch.Tensor, actions: torch.Tensor, original_targets: torch.Tensor, valid_mask: torch.Tensor
 ) -> torch.Tensor:
     """
     A variant that extracts list-of-indices sets and then calculates
     the F1 score in a classical manner. Returns shape (N, 1).
-    
+
     Args:
         probs:              (N, T) Tensor of probabilities (not used here but left for interface consistency).
         actions:            (N, T) Tensor of predicted labels in {0, 1}.
@@ -111,7 +112,7 @@ def default_f1_reward(
             f1 = 0.0
 
         f1_scores.append(f1)
-    
+
     # Convert list to tensor shape (N, 1)
     f1_scores = torch.tensor(f1_scores, dtype=torch.float).unsqueeze(-1)
     return f1_scores.detach().to(probs.device)

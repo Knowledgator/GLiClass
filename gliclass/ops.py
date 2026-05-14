@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
 
-
 # ─── Attention (padded) ───────────────────────────────────────────────────────
+
 
 def attn_padded(
     q: torch.Tensor,
@@ -32,7 +32,9 @@ def attn_padded(
         attn_mask = key_padding_mask[:, None, None, :].bool()
 
     out = F.scaled_dot_product_attention(
-        q, k, v,
+        q,
+        k,
+        v,
         attn_mask=attn_mask,
         dropout_p=dropout_p if torch.is_grad_enabled() else 0.0,
     )
