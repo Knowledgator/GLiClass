@@ -1,18 +1,171 @@
-[tool.poetry]
-name = "gliclass"
-version = "0.1.18"
-description = "Generalist and Lightweight Model for Text Classification"
-authors = ["knowledgator.com"]
-readme = "README.md"
-
-[tool.poetry.dependencies]
-python = ">=3.9,<4.0"
-torch = "^2.0.0"
-transformers = ">=5.0.0"
-scikit-learn = "^1.0.0"
-numpy = "^2.0.0"
-
-
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["setuptools>=61.0.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["gliclass", "gliclass.*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "gliclass.__version__"}
+
+[project]
+name = "gliclass"
+description = "Generalist and Lightweight Model for Text Classification"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+keywords = [
+    "text-classification",
+    "zero-shot-classification",
+    "natural-language-processing",
+    "nlp",
+    "transformers",
+    "machine-learning"
+]
+authors = [
+    {name = "knowledgator.com"}
+]
+
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=5.0.0",
+    "scikit-learn>=1.0.0",
+    "numpy>=2.0.0",
+]
+
+dynamic = ["version"]
+
+[project.optional-dependencies]
+serve = [
+    "ray[serve]>=2.0.0",
+    "requests>=2.31.0",
+    "pyyaml>=6.0.0",
+]
+
+[dependency-groups]
+# version pins are in uv.lock
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff"
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+indent-width = 4
+output-format = "grouped"
+target-version = "py310"
+
+exclude = [
+    ".git",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "*.egg-info",
+]
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint]
+select = [
+    "F",      # Pyflakes
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "I",      # isort
+    "D",      # pydocstyle
+    "UP",     # pyupgrade
+    "B",      # bugbear
+    "SIM",    # simplify
+    "ARG",    # unused arguments
+    "T20",    # print statements
+    "C4",     # comprehensions
+    "EM",     # errmsg
+    "PL",     # Pylint
+    "RUF"     # Ruff-specific rules
+]
+
+ignore = [
+    "D100",   # Missing docstring in public module
+    "D101",   # Missing docstring in public class
+    "D102",   # Missing docstring in public method
+    "D103",   # Missing docstring in public function
+    "D104",   # Missing docstring in public package
+    "D105",   # Missing docstring in magic method
+    "D107",   # Missing docstring in `__init__`
+    "D200",   # One-line docstring should fit on one line
+    "D205",   # Blank line required between summary and description
+    "D212",   # Multi-line docstring summary should start at the first line
+    "D400",   # First line should end with a period
+    "D401",   # First line should be in imperative mood
+    "D417",   # Missing argument descriptions
+    "RUF012", # Mutable class attributes should be annotated
+    "PLR0913",# Too many arguments
+    "PLR0912",# Too many branches
+    "PLR0915",# Too many statements
+    "PLR2004",# Magic value used in comparison
+    "PLW2901",# Loop variable overwritten
+    "B006",   # Mutable defaults
+    "S101",   # Use of `assert` detected
+    "SIM105", # Use contextlib.suppress instead of try-except-pass
+    "SIM108", # Use ternary operator
+    "UP035",  # Deprecated typing imports
+    "UP006",  # Deprecated typing imports
+    "EM101",  # Exception message formatting
+    "EM102",  # Exception message formatting
+    "ARG002", # Unused method arguments
+    "B905",   # zip() without explicit strict= parameter
+    "E402",   # Module level import not at top (for conditional imports)
+    "PLC0206",# Extracting value from dictionary without .items()
+    "PLC0415",# Import should be at top-level (for dynamic imports)
+    "T201",   # Print statements (used for debugging)
+]
+
+unfixable = [
+    "F401",   # Unused imports
+    "T201",   # Print statements
+    "T203",   # pprint statements
+    "F841",   # Unused variables
+]
+
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = [
+    "F401",  # Unused imports in __init__.py are often intentional
+    "F403",  # Star imports in __init__.py
+]
+"tests/**/*.py" = [
+    "D",      # No docstring requirements in tests
+    "ARG",    # Unused arguments are common in test fixtures
+    "PLR2004",# Magic values are fine in tests
+    "S101",   # Assert is expected in tests
+]
+
+[tool.ruff.lint.isort]
+length-sort = true
+length-sort-straight = true
+combine-as-imports = true
+known-first-party = ["gliclass"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pylint]
+max-args = 20
+max-branches = 15
+max-returns = 8
+max-statements = 60
+
+[project.urls]
+Homepage = "https://github.com/knowledgator/gliclass"
