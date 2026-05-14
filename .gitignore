@@ -13,6 +13,7 @@ gradio_cached_examples/
 test.ipynb
 demo1.py
 .gradio/
+uv.lock
 
 # Distribution / packaging
 .Python
@@ -57,6 +58,7 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+.ruff_cache/
 cover/
 
 # Translations
