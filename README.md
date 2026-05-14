@@ -196,6 +196,64 @@ for predict in results:
     print(f"{predict['label']} => {predict['score']:.3f}")
 ```
 
+### 🚀 Production Serving
+
+Deploy GLiClass with Ray Serve for production workloads with dynamic batching and memory-aware processing.
+
+#### Installation
+
+```bash
+pip install gliclass[serve]
+```
+
+#### Quick Start
+
+```bash
+# Default model
+python -m gliclass.serve
+
+# Specify model and port
+python -m gliclass.serve --model knowledgator/gliclass-edge-v3.0 --port 8000
+
+# With config file
+python -m gliclass.serve --config serve_configs/serve_config.yaml
+```
+
+#### Python Client
+
+```python
+from gliclass.serve import GLiClassClient
+
+client = GLiClassClient(url="http://localhost:8000/gliclass")
+
+result = client.classify(
+    text="This is a great product!",
+    labels=["positive", "negative", "neutral"],
+    threshold=0.3,
+)
+print(result)  # [{"label": "positive", "score": 0.95}, ...]
+```
+
+#### HTTP API
+
+The HTTP endpoint processes one text per request.
+
+```bash
+curl -X POST http://localhost:8000/gliclass \
+  -H "Content-Type: application/json" \
+  -d '{
+    "texts": "This is a great product!",
+    "labels": ["positive", "negative", "neutral"],
+    "threshold": 0.3
+  }'
+
+# Response: [{"label": "positive", "score": 0.95}, ...]
+```
+
+**Note:** For batch processing multiple texts, use the `ZeroShotClassificationPipeline` directly instead of the serving API.
+
+See `serve_configs/serve_config.yaml` for full configuration options.
+
 ### 🎯 Key Use Cases
 
 - **Sentiment Analysis:** Rapidly classify texts as positive, negative, or neutral.
@@ -280,8 +338,6 @@ config = GLiClassModelConfig(
     scorer_type='mlp'
 )
 ```
-
-Gotcha — here’s a **much leaner, README-style version**, no fluff, just what matters 👇
 
 ---
 
