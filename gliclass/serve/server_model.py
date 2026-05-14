@@ -145,7 +145,7 @@ class GLiClassServerModel:
         examples_str: str | None,
         prompt: str | None,
     ) -> str:
-        """Match training format from pipeline.prepare_input"""
+        """Match format from pipeline.prepare_input."""
         input_parts = []
 
         # Add labels

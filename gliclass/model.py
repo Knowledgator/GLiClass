@@ -969,32 +969,58 @@ class GLiClassModel(GLiClassPreTrainedModel):
             raise NotImplementedError("Setting input embeddings is not implemented for bi-encoder architecture")
 
     def tie_weights(self, recompute_mapping=True, missing_keys=None):
-        # Handle version differences between transformers v4 and v5
-        if version.parse(transformers.__version__) >= version.parse("5.0.0"):
-            # Transformers v5+ supports recompute_mapping and missing_keys parameters
-            if self.config.architecture_type in {"uni-encoder"}:
-                return self.model.encoder_model.tie_weights(
-                    recompute_mapping=recompute_mapping, missing_keys=missing_keys
-                )
-            elif self.config.architecture_type in {"encoder-decoder", "encoder-decoder-cls"}:
-                return self.model.encoder_decoder_model.tie_weights(
-                    recompute_mapping=recompute_mapping, missing_keys=missing_keys
-                )
-            elif self.config.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
-                return self.model.encoder_model.tie_weights(
-                    recompute_mapping=recompute_mapping, missing_keys=missing_keys
-                )
-            else:
-                raise NotImplementedError("Tie weights is not implemented for bi-encoder architecture")
-        # Transformers v4 does not support recompute_mapping or missing_keys parameters
-        elif self.config.architecture_type in {"uni-encoder"}:
-            return self.model.encoder_model.tie_weights()
+        """
+        Tie model weights for architectures that share parameters.
+
+        This method handles:
+        - Version compatibility between transformers v4 and v5
+        - Different GLiClass architecture types
+        - Special handling for T5/MT5 models in transformers v5+ where encoder.embed_tokens
+          may be incorrectly initialized instead of being tied to shared.weight
+
+        Args:
+            recompute_mapping: Whether to recompute weight mapping (transformers v5+)
+            missing_keys: Keys that are missing from checkpoint (transformers v5+)
+        """
+        # Get encoder model based on architecture type
+        encoder_model = None
+        if self.config.architecture_type in {"uni-encoder"}:
+            encoder_model = self.model.encoder_model
         elif self.config.architecture_type in {"encoder-decoder", "encoder-decoder-cls"}:
-            return self.model.encoder_decoder_model.tie_weights()
+            encoder_model = self.model.encoder_decoder_model
         elif self.config.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
-            return self.model.encoder_model.tie_weights()
+            encoder_model = self.model.encoder_model
         else:
-            raise NotImplementedError("Tie weights is not implemented for bi-encoder architecture")
+            raise NotImplementedError("Tie weights is not implemented for this architecture type")
+
+        # Call base tie_weights with version-appropriate parameters
+        if version.parse(transformers.__version__) >= version.parse("5.0.0"):
+            result = encoder_model.tie_weights(recompute_mapping=recompute_mapping, missing_keys=missing_keys)
+        else:
+            result = encoder_model.tie_weights()
+
+        # Fix for T5/MT5/UMT5 models in transformers v5+
+        # In v5, if encoder.embed_tokens.weight is missing from checkpoint, it gets randomly
+        # initialized instead of being tied to shared.weight. We explicitly ensure proper tying.
+        if (
+            encoder_model is not None
+            and hasattr(encoder_model, "shared")
+            and hasattr(encoder_model, "encoder")
+            and hasattr(encoder_model.encoder, "embed_tokens")
+        ):
+            shared_weight = encoder_model.shared.weight
+            embed_weight = encoder_model.encoder.embed_tokens.weight
+
+            # Only tie if they're not already the same tensor
+            if shared_weight is not embed_weight:
+                encoder_model.encoder.embed_tokens.weight = shared_weight
+                if version.parse(transformers.__version__) >= version.parse("5.0.0"):
+                    logger.info(
+                        "Applied transformers v5 compatibility fix: tied encoder.embed_tokens.weight "
+                        "to shared.weight for T5-based model"
+                    )
+
+        return result
 
     def resize_token_embeddings(self, new_num_tokens: int | None = None, pad_to_multiple_of=None) -> nn.Embedding:
         if self.config.architecture_type in {"uni-encoder"}:
