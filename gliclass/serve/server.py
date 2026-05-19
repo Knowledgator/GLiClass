@@ -6,10 +6,13 @@ from typing import Any
 
 import torch
 from ray import serve
+from transformers import AutoTokenizer
+
+from gliclass.model import GLiClassModel
+from gliclass.pipeline import ZeroShotClassificationPipeline
 
 from .config import GLiClassServeConfig
 from .memory import GLiClassMemoryEstimator
-from .server_model import GLiClassServerModel
 
 logger = logging.getLogger("ray.serve")
 
@@ -56,13 +59,23 @@ class GLiClassServer:
 
         logger.info("Loading model: %s", config.model)
 
-        self.model = GLiClassServerModel(
-            model_name=config.model,
-            device=self.device,
-            dtype=self.torch_dtype,
-            max_length=config.max_model_len,
-            max_classes=config.max_labels if config.max_labels > 0 else 100,
-            max_labels_alloc=config.max_labels_alloc,
+        self.model = GLiClassModel.from_pretrained(config.model)
+        self.model.config.max_labels_alloc = config.max_labels_alloc
+        self.model.to(device=self.device, dtype=self.torch_dtype)
+        self.model.eval()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(config.model)
+        pipeline_kwargs = {
+            "model": self.model,
+            "tokenizer": self.tokenizer,
+            "max_classes": config.max_labels if config.max_labels > 0 else 100,
+            "max_length": config.max_model_len,
+            "device": self.device,
+            "progress_bar": False,
+        }
+        self.pipeline = ZeroShotClassificationPipeline(
+            classification_type="multi-label",
+            **pipeline_kwargs,
         )
 
         if torch.cuda.is_available():
@@ -79,8 +92,8 @@ class GLiClassServer:
     def _precompile(self) -> None:
         logger.info("Precompiling model for batch sizes: %s", self.config.precompiled_batch_sizes)
 
-        if hasattr(self.model.model, "compile"):
-            self.model.model.compile()
+        if hasattr(self.model, "compile"):
+            self.model.compile()
 
         dummy_labels = ["person", "organization", "location"]
 
@@ -136,7 +149,7 @@ class GLiClassServer:
     def observed_seq_len(
         self,
         texts: list[str],
-        labels: list[str] | None = None,
+        labels: list[str] | list[list[str]] | None = None,
     ) -> int:
         """Total input word count: longest text + all label words.
 
@@ -153,7 +166,10 @@ class GLiClassServer:
         max_text_words = max((len(t.split()) for t in texts if t.strip()), default=0)
         prompt_words = 0
         if labels:
-            prompt_words += sum(len(label.split()) for label in labels)
+            if isinstance(labels[0], list):
+                prompt_words += max(sum(len(label.split()) for label in label_set) for label_set in labels)
+            else:
+                prompt_words += sum(len(label.split()) for label in labels)
         total = max_text_words + prompt_words
         return min(max(total, self.config.calibration_min_seq_len), self.config.max_model_len)
 
@@ -167,34 +183,39 @@ class GLiClassServer:
     def _run_batch_internal(
         self,
         texts: list[str],
-        labels: list[str],
-        threshold: float = 0.5,
-        multi_label: bool = True,
-        examples: list[dict[str, Any]] | None = None,
+        labels: list[str] | list[list[str]],
+        threshold: float | list[float] = 0.5,
+        multi_label: bool | list[bool] = True,
+        examples: list[dict[str, Any]] | list[list[dict[str, Any]] | None] | None = None,
         prompt: str | list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Run batch inference using low-level methods.
-
-        This is the core inference method that uses prepare_batch, tokenize_batch,
-        collate_batch, run_batch, and decode_batch directly.
+    ) -> list[list[dict[str, Any]]]:
+        """Run batch inference using the shared zero-shot pipeline.
 
         Args:
             texts: List of input texts
-            labels: Label list (same for all texts)
-            threshold: Classification threshold
-            multi_label: Multi-label classification
-            examples: Few-shot examples
-            prompt: Task description
+            labels: Shared label list or one label list per text
+            threshold: Shared threshold or one threshold per text
+            multi_label: Shared mode or one mode flag per text
+            examples: Shared examples or one example set per text
+            prompt: Shared prompt or one prompt per text
 
         Returns:
             List of prediction dicts
         """
-        prepared = self.model.prepare_batch(texts, labels, examples, prompt)
-        tokenized = self.model.tokenize_batch(prepared)
-        batch = self.model.collate_batch(tokenized)
-        outputs = self.model.run_batch(batch)
-        results = self.model.decode_batch(outputs, threshold, multi_label)
-        return results
+        if isinstance(multi_label, list):
+            classification_type = ["multi-label" if item else "single-label" for item in multi_label]
+        else:
+            classification_type = "multi-label" if multi_label else "single-label"
+
+        return self.pipeline(
+            texts,
+            labels,
+            threshold=threshold,
+            batch_size=max(len(texts), 1),
+            classification_type=classification_type,
+            examples=examples,
+            prompt=prompt,
+        )
 
     def predict(
         self,
@@ -204,7 +225,7 @@ class GLiClassServer:
         multi_label: bool = True,
         examples: list[dict[str, Any]] | None = None,
         prompt: str | list[str] | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> list[list[dict[str, Any]]]:
         if isinstance(texts, str):
             texts = [texts]
 
@@ -267,33 +288,27 @@ def _build_deployment(config: GLiClassServeConfig):
             using batch_size_fn on the observed seq length — so the next
             accumulation picks the largest precompiled size that fits.
 
-            Assumes batch requests are homogeneous — labels/thresholds/flags
-            are taken from the first request.
+            Supports heterogeneous request parameters by passing per-text
+            thresholds, classification types, labels, examples, and prompts
+            through to the shared pipeline.
             """
             # Dynamically adjust batch size based on observed sequence length
             next_max_batch = self.server.batch_size_fn(
                 seq_len=self.server.observed_seq_len(
                     texts,
-                    labels=labels_list[0] if labels_list else None,
+                    labels=labels_list,
                 )
             )
             self._infer_batch.set_max_batch_size(next_max_batch)
 
-            # Use first request's parameters (assume homogeneous)
-            labels = labels_list[0]
-            threshold = thresholds[0]
-            multi_label = multi_label_list[0]
-            examples = examples_list[0]
-            prompt = prompts_list[0]
-
             # Process entire batch at once
             results = self.server._run_batch_internal(
                 texts,
-                labels,
-                threshold=threshold,
-                multi_label=multi_label,
-                examples=examples,
-                prompt=prompt,
+                labels_list,
+                threshold=thresholds,
+                multi_label=multi_label_list,
+                examples=examples_list,
+                prompt=prompts_list,
             )
 
             return results

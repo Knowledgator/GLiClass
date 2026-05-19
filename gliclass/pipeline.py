@@ -213,6 +213,42 @@ class BaseZeroShotClassificationPipeline(ABC):
         # Ensure model is in evaluation mode for inference
         self.model.eval()
 
+    def _normalize_classification_type(self, classification_type: str | None) -> str:
+        if classification_type is None:
+            return self.classification_type
+
+        normalized = classification_type.strip().lower()
+        if normalized in {"single", "single-label", "single_label"}:
+            return "single-label"
+        if normalized in {"multi", "multi-label", "multi_label"}:
+            return "multi-label"
+        raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
+
+    def _normalize_texts(self, texts: str | List[str]) -> List[str]:
+        if isinstance(texts, str):
+            return [texts]
+        return texts
+
+    def _normalize_thresholds(self, threshold: float | List[float], num_texts: int) -> List[float]:
+        if isinstance(threshold, list):
+            if len(threshold) != num_texts:
+                raise ValueError("Length of threshold list must match number of texts.")
+            return threshold
+        return [threshold] * num_texts
+
+    def _normalize_classification_types(
+        self,
+        classification_type: str | List[str] | None,
+        num_texts: int,
+    ) -> List[str]:
+        if isinstance(classification_type, list):
+            if len(classification_type) != num_texts:
+                raise ValueError("Length of classification_type list must match number of texts.")
+            return [self._normalize_classification_type(item) for item in classification_type]
+
+        normalized = self._normalize_classification_type(classification_type)
+        return [normalized] * num_texts
+
     def _process_labels(
         self, labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]]
     ) -> List[str] | List[List[str]]:
@@ -246,7 +282,26 @@ class BaseZeroShotClassificationPipeline(ABC):
         """Format few-shot examples using <<EXAMPLE>> and <<SEP>> tokens."""
         if not examples:
             return ""
+        examples = [example for example in examples if example is not None]
+        if not examples:
+            return ""
         return format_examples_prompt(examples, example_token=self.example_token, sep_token=self.sep_token)
+
+    def _examples_are_per_text(self, examples) -> bool:
+        """Detect whether examples are provided per text rather than shared."""
+        if not isinstance(examples, list) or len(examples) == 0:
+            return False
+        if all(isinstance(example, dict) for example in examples):
+            return False
+        return all(example is None or isinstance(example, list) for example in examples)
+
+    def _get_text_examples(self, examples, index: int):
+        """Get examples for a single text from shared or per-text input."""
+        if not examples:
+            return None
+        if self._examples_are_per_text(examples):
+            return examples[index] if index < len(examples) else None
+        return examples
 
     def _format_prompt(self, prompt: str | List[str] | None = None, index: int = 0) -> str:
         """Format the task description prompt."""
@@ -278,7 +333,7 @@ class BaseZeroShotClassificationPipeline(ABC):
         """Get examples for current batch."""
         if not examples:
             return None
-        if isinstance(examples[0], list):
+        if self._examples_are_per_text(examples):
             return examples[start_idx : start_idx + batch_size]
         return examples
 
@@ -343,8 +398,9 @@ class BaseZeroShotClassificationPipeline(ABC):
         self,
         texts: str | List[str],
         labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]],
-        threshold: float = 0.5,
+        threshold: float | List[float] = 0.5,
         batch_size: int = 8,
+        classification_type: str | List[str] | None = None,
         rac_examples: List | None = None,
         examples: List[Dict[str, Any]] | None = None,
         prompt: str | List[str] | None = None,
@@ -356,8 +412,11 @@ class BaseZeroShotClassificationPipeline(ABC):
         Args:
             texts: Single text or list of texts to classify
             labels: Labels in various formats (flat list or hierarchical dict)
-            threshold: Classification threshold for multi-label (default: 0.5)
+            threshold: Classification threshold for multi-label, either one
+                value for all texts or one value per text
             batch_size: Batch size for processing
+            classification_type: Override classification mode globally or per text.
+                If None, uses the pipeline's configured classification_type
             rac_examples: Retrieval augmented examples (legacy)
             examples: Few-shot examples with 'text' and 'labels'/'true_labels' keys
             prompt: Task description - string (same for all) or list (per-text)
@@ -368,12 +427,15 @@ class BaseZeroShotClassificationPipeline(ABC):
         """
         original_labels = labels
 
-        if isinstance(texts, str):
-            if rac_examples:
-                texts = retrieval_augmented_text(texts, rac_examples)
-            texts = [texts]
-        elif rac_examples:
-            texts = [retrieval_augmented_text(text, ex) for text, ex in zip(texts, rac_examples)]
+        texts = self._normalize_texts(texts)
+        thresholds = self._normalize_thresholds(threshold, len(texts))
+        classification_types = self._normalize_classification_types(classification_type, len(texts))
+
+        if rac_examples:
+            if len(texts) == 1 and not isinstance(rac_examples[0], list):
+                texts = [retrieval_augmented_text(texts[0], rac_examples)]
+            else:
+                texts = [retrieval_augmented_text(text, ex) for text, ex in zip(texts, rac_examples)]
 
         processed_labels = self._process_labels(labels)
 
@@ -405,14 +467,20 @@ class BaseZeroShotClassificationPipeline(ABC):
             max_num_classes = self._resolve_max_num_classes(batch_labels, same_labels)
             model_output = self.model(**tokenized_inputs, max_num_classes=max_num_classes)
             logits = model_output.logits
+            probs = torch.sigmoid(logits)
 
-            if self.classification_type == "single-label":
-                for i in range(len(batch_texts)):
-                    score = torch.softmax(logits[i], dim=-1)
-                    if same_labels:
-                        curr_labels = batch_labels
-                    else:
-                        curr_labels = batch_labels[i]
+            for i in range(len(batch_texts)):
+                global_idx = idx + i
+                item_classification_type = classification_types[global_idx]
+                item_threshold = thresholds[global_idx]
+
+                if same_labels:
+                    curr_labels = batch_labels
+                else:
+                    curr_labels = batch_labels[i]
+
+                if item_classification_type == "single-label":
+                    score = torch.softmax(logits[i][: len(curr_labels)], dim=-1)
 
                     if return_hierarchical:
                         all_scores = {curr_labels[j]: score[j].item() for j in range(len(curr_labels))}
@@ -420,16 +488,8 @@ class BaseZeroShotClassificationPipeline(ABC):
 
                     pred_label = curr_labels[torch.argmax(score).item()]
                     results.append([{"label": pred_label, "score": score.max().item()}])
-
-            elif self.classification_type == "multi-label":
-                sigmoid = torch.nn.Sigmoid()
-                probs = sigmoid(logits)
-                for i in range(len(batch_texts)):
+                elif item_classification_type == "multi-label":
                     text_results = []
-                    if same_labels:
-                        curr_labels = batch_labels
-                    else:
-                        curr_labels = batch_labels[i]
 
                     if return_hierarchical:
                         all_scores = {curr_labels[j]: probs[i][j].item() for j in range(len(curr_labels))}
@@ -437,11 +497,11 @@ class BaseZeroShotClassificationPipeline(ABC):
 
                     for j, prob in enumerate(probs[i][: len(curr_labels)]):
                         score = prob.item()
-                        if score >= threshold:
+                        if score >= item_threshold:
                             text_results.append({"label": curr_labels[j], "score": score})
                     results.append(text_results)
-            else:
-                raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
+                else:
+                    raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
 
         if return_hierarchical:
             hierarchical_results = []
@@ -507,24 +567,12 @@ class UniEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipelin
 
         if same_labels:
             for i, text in enumerate(texts):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
-
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels, text_examples, text_prompt))
         else:
             for i, (text, labels_) in enumerate(zip(texts, labels)):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
-
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels_, text_examples, text_prompt))
 
@@ -572,24 +620,14 @@ class EncoderDecoderZeroShotClassificationPipeline(BaseZeroShotClassificationPip
 
         if same_labels:
             for i, text in enumerate(texts):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 prompts.append(self.prepare_labels_prompt(labels, text_prompt))
                 examples_str = self._format_examples_for_input(text_examples) if text_examples else ""
                 processed_texts.append(text + examples_str)
         else:
             for i, labels_ in enumerate(labels):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 prompts.append(self.prepare_labels_prompt(labels_, text_prompt))
                 examples_str = self._format_examples_for_input(text_examples) if text_examples else ""
@@ -651,22 +689,12 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             inputs = []
             if same_labels:
                 for i, text in enumerate(texts):
-                    text_examples = None
-                    if examples:
-                        if isinstance(examples[0], list):
-                            text_examples = examples[i] if i < len(examples) else None
-                        else:
-                            text_examples = examples
+                    text_examples = self._get_text_examples(examples, i)
                     text_prompt = self._format_prompt(prompt, i)
                     inputs.append(self.prepare_input(text, labels, text_examples, text_prompt))
             else:
                 for i, (text, labels_) in enumerate(zip(texts, labels)):
-                    text_examples = None
-                    if examples:
-                        if isinstance(examples[0], list):
-                            text_examples = examples[i] if i < len(examples) else None
-                        else:
-                            text_examples = examples
+                    text_examples = self._get_text_examples(examples, i)
                     text_prompt = self._format_prompt(prompt, i)
                     inputs.append(self.prepare_input(text, labels_, text_examples, text_prompt))
         else:
@@ -859,8 +887,9 @@ class ZeroShotClassificationPipeline:
         self,
         texts: str | List[str],
         labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]],
-        threshold: float = 0.5,
+        threshold: float | List[float] = 0.5,
         batch_size: int = 8,
+        classification_type: str | List[str] | None = None,
         rac_examples: List | None = None,
         examples: List[Dict[str, Any]] | None = None,
         prompt: str | List[str] | None = None,
@@ -875,8 +904,11 @@ class ZeroShotClassificationPipeline:
                 Examples:
                 - ["positive", "negative"] - flat labels
                 - {"sentiment": ["positive", "negative"], "topic": ["product", "service"]}
-            threshold: Classification threshold for multi-label (default: 0.5)
+            threshold: Classification threshold for multi-label, either one
+                value for all texts or one value per text
             batch_size: Batch size for processing
+            classification_type: Override classification mode globally or per text.
+                If None, uses the pipeline's configured classification_type
             rac_examples: Retrieval augmented examples (legacy)
             examples: Few-shot examples, each with 'text' and 'labels' keys
             prompt: Task description - string or list of strings (per-text)
@@ -890,6 +922,7 @@ class ZeroShotClassificationPipeline:
             labels,
             threshold=threshold,
             batch_size=batch_size,
+            classification_type=classification_type,
             rac_examples=rac_examples,
             examples=examples,
             prompt=prompt,
@@ -980,22 +1013,12 @@ class ZeroShotClassificationWithChunkingPipeline(BaseZeroShotClassificationPipel
 
         if same_labels:
             for i, text in enumerate(texts):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels, text_examples, text_prompt))
         else:
             for i, (text, labels_) in enumerate(zip(texts, labels)):
-                text_examples = None
-                if examples:
-                    if isinstance(examples[0], list):
-                        text_examples = examples[i] if i < len(examples) else None
-                    else:
-                        text_examples = examples
+                text_examples = self._get_text_examples(examples, i)
                 text_prompt = self._format_prompt(prompt, i)
                 inputs.append(self.prepare_input(text, labels_, text_examples, text_prompt))
 

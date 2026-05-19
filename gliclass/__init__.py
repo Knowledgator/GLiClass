@@ -6,7 +6,7 @@ from .pipeline import (
     ZeroShotClassificationWithChunkingPipeline,
 )
 
-__version__ = "0.1.18"
+__version__ = "0.1.19"
 
 # Serve module (optional import)
 try:
