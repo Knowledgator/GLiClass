@@ -1,24 +1,26 @@
-from typing import Optional, Tuple, Dict, List, Union, Any, Callable
-from tqdm import tqdm
-import numpy as np
 import os
-from dataclasses import dataclass, field
-import torch
-from torch import nn
-from transformers.trainer import (
-    is_sagemaker_mp_enabled,
-    get_parameter_names,
-)
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from typing import Any, Dict, List, Tuple, Callable
+from dataclasses import field, dataclass
 
+import numpy as np
+import torch
 import transformers
+import torch.nn.functional as F
+from tqdm import tqdm
+from torch import nn
 from transformers import ZeroShotClassificationPipeline as TransformersClassificationPipeline
+from torch.utils.data import Dataset, DataLoader
+from transformers.trainer import (
+    get_parameter_names,
+    is_sagemaker_mp_enabled,
+)
+
 from .utils import default_f1_reward, is_module_available
 from .pipeline import ZeroShotClassificationPipeline
 
 if is_module_available("apex"):
     from apex import amp
+
     _has_apex = True
 else:
     _has_apex = False
@@ -26,23 +28,24 @@ else:
 
 ALL_LAYERNORM_LAYERS = [nn.LayerNorm, nn.RMSNorm]
 
+
 class EWC:
     """Elastic Weight Consolidation for preventing catastrophic forgetting in GLiClass models."""
-    
+
     def __init__(
         self,
         model: nn.Module,
         dataset: Dataset,
-        data_collator: Optional[Any] = None,
-        device: str = 'cpu',
+        data_collator: Any | None = None,
+        device: str = "cpu",
         ewc_lambda: float = 100.0,
         batch_size: int = 8,
-        num_samples: Optional[int] = None,
-        fisher_estimation_method: str = 'empirical',
-        normalize_fisher: bool = True
+        num_samples: int | None = None,
+        fisher_estimation_method: str = "empirical",
+        normalize_fisher: bool = True,
     ):
         """Initialize EWC.
-        
+
         Args:
             model: The GLiClass model to apply EWC to
             dataset: Dataset from previous task to compute Fisher information
@@ -62,33 +65,30 @@ class EWC:
         self.fisher_estimation_method = fisher_estimation_method
         self.normalize_fisher = normalize_fisher
         self.data_collator = data_collator
-        
+
         # Store old parameters (deep copy to avoid reference issues)
         self.old_params: Dict[str, torch.Tensor] = {}
         for name, param in model.named_parameters():
             if param.requires_grad:
                 self.old_params[name] = param.data.clone().detach()
-        
+
         # Compute Fisher information matrix
         self.fisher_info: Dict[str, torch.Tensor] = self._compute_fisher(dataset)
-        
+
         # Optionally normalize Fisher information
         if self.normalize_fisher:
             self._normalize_fisher()
-    
-    def _compute_fisher(
-        self,
-        dataset: Dataset
-    ) -> Dict[str, torch.Tensor]:
+
+    def _compute_fisher(self, dataset: Dataset) -> Dict[str, torch.Tensor]:
         """Compute diagonal Fisher information matrix.
-        
+
         The Fisher information measures how sensitive the loss is to changes
         in each parameter. Parameters with high Fisher information are important
         for the previous task.
-        
+
         Args:
             dataset: Dataset to compute Fisher information from
-            
+
         Returns:
             Dictionary mapping parameter names to Fisher information tensors
         """
@@ -97,160 +97,135 @@ class EWC:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 fisher[name] = torch.zeros_like(param, device=self.device)
-        
+
         # Set model to evaluation mode for consistent behavior
         was_training = self.model.training
         self.model.eval()
-        
+
         # Create dataloader
         if self.num_samples is not None and self.num_samples < len(dataset):
             # Subsample dataset for efficiency
-            indices = torch.randperm(len(dataset))[:self.num_samples].tolist()
+            indices = torch.randperm(len(dataset))[: self.num_samples].tolist()
             subset = torch.utils.data.Subset(dataset, indices)
-            loader = DataLoader(
-                subset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                collate_fn=self.data_collator
-            )
+            loader = DataLoader(subset, batch_size=self.batch_size, shuffle=False, collate_fn=self.data_collator)
         else:
-            loader = DataLoader(
-                dataset,
-                batch_size=self.batch_size,
-                shuffle=False,
-                collate_fn=self.data_collator
-            )
-        
+            loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False, collate_fn=self.data_collator)
+
         num_batches = len(loader)
-        
+
         print(f"Computing Fisher information from {len(loader.dataset)} samples...")
-        
+
         # Compute Fisher information
         for batch in tqdm(loader, desc="Computing Fisher"):
             self.model.zero_grad()
-            
+
             # Prepare inputs - handle GLiClass specific fields
             if isinstance(batch, dict):
                 # Remove non-tensor fields that GLiClass might have
-                inputs = {k: v for k, v in batch.items() 
-                         if k not in ['labels_text', 'input_texts']}
-                
+                inputs = {k: v for k, v in batch.items() if k not in ["labels_text", "input_texts"]}
+
                 # Move tensors to device
                 for k, v in inputs.items():
                     if isinstance(v, torch.Tensor):
                         inputs[k] = v.to(self.device)
             else:
                 inputs = batch
-            
+
             try:
                 # Forward pass
                 outputs = self.model(**inputs)
-                
-                if self.fisher_estimation_method == 'empirical':
+
+                if self.fisher_estimation_method == "empirical":
                     # Use the actual loss for empirical Fisher
-                    if hasattr(outputs, 'loss') and outputs.loss is not None:
+                    if hasattr(outputs, "loss") and outputs.loss is not None:
                         loss = outputs.loss
                     else:
                         # Compute loss manually if not provided
                         logits = outputs.logits
-                        labels = inputs.get('labels')
+                        labels = inputs.get("labels")
                         if labels is not None:
                             # Handle multi-label classification
-                            if self.model.config.problem_type == 'multi_label_classification':
-                                loss = F.binary_cross_entropy_with_logits(
-                                    logits.view(-1),
-                                    labels.view(-1).float()
-                                )
+                            if self.model.config.problem_type == "multi_label_classification":
+                                loss = F.binary_cross_entropy_with_logits(logits.view(-1), labels.view(-1).float())
                             else:
-                                loss = F.cross_entropy(
-                                    logits.view(-1, logits.size(-1)),
-                                    labels.view(-1)
-                                )
+                                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1))
                         else:
                             continue
                 else:
                     # Diagonal Fisher: sample from model's predictive distribution
                     logits = outputs.logits
-                    
-                    if self.model.config.problem_type == 'multi_label_classification':
+
+                    if self.model.config.problem_type == "multi_label_classification":
                         probs = torch.sigmoid(logits)
                         # Sample binary labels
                         sampled_labels = torch.bernoulli(probs)
-                        loss = F.binary_cross_entropy_with_logits(
-                            logits.view(-1),
-                            sampled_labels.view(-1)
-                        )
+                        loss = F.binary_cross_entropy_with_logits(logits.view(-1), sampled_labels.view(-1))
                     else:
                         probs = F.softmax(logits, dim=-1)
                         log_probs = F.log_softmax(logits, dim=-1)
-                        sampled_labels = torch.multinomial(
-                            probs.view(-1, probs.size(-1)), 1
-                        ).squeeze(-1)
-                        loss = F.nll_loss(
-                            log_probs.view(-1, log_probs.size(-1)),
-                            sampled_labels
-                        )
-                
+                        sampled_labels = torch.multinomial(probs.view(-1, probs.size(-1)), 1).squeeze(-1)
+                        loss = F.nll_loss(log_probs.view(-1, log_probs.size(-1)), sampled_labels)
+
                 # Backward pass to compute gradients
                 loss.backward()
-                
+
                 # Accumulate squared gradients (Fisher information)
                 for name, param in self.model.named_parameters():
                     if param.requires_grad and param.grad is not None:
-                        fisher[name] += param.grad.data ** 2 / num_batches
-                        
+                        fisher[name] += param.grad.data**2 / num_batches
+
             except Exception as e:
                 print(f"Warning: Error computing Fisher for batch: {e}")
                 continue
-        
+
         # Restore model training mode
         if was_training:
             self.model.train()
-        
+
         return fisher
-    
+
     def _normalize_fisher(self):
         """Normalize Fisher information values to prevent numerical issues."""
         # Compute max Fisher value across all parameters
         max_fisher = 0.0
-        for name, fisher_val in self.fisher_info.items():
+        for _, fisher_val in self.fisher_info.items():
             max_fisher = max(max_fisher, fisher_val.max().item())
-        
+
         if max_fisher > 0:
             # Normalize by max value
             for name in self.fisher_info:
                 self.fisher_info[name] = self.fisher_info[name] / max_fisher
-    
-    def ewc_loss(self, batch_size: Optional[int] = None) -> torch.Tensor:
+
+    def ewc_loss(self, batch_size: int | None = None) -> torch.Tensor:
         """Compute EWC penalty loss.
-        
+
         The EWC loss penalizes changes to parameters that were important
         for the previous task (as measured by Fisher information).
-        
+
         Args:
             batch_size: Batch size for normalization (optional)
-            
+
         Returns:
             EWC penalty loss tensor
         """
         loss = torch.tensor(0.0, device=self.device)
-        
+
         for name, param in self.model.named_parameters():
             if param.requires_grad and name in self.fisher_info:
                 # EWC penalty: F_i * (theta_i - theta_i^*)^2
                 param_diff = param - self.old_params[name].to(param.device)
                 fisher = self.fisher_info[name].to(param.device)
-                loss += (fisher * param_diff ** 2).sum()
-        
+                loss += (fisher * param_diff**2).sum()
+
         # Optionally normalize by batch size
         if batch_size is not None:
             loss = loss / batch_size
-        
+
         return self.ewc_lambda * loss
-    
+
     def get_importance_scores(self) -> Dict[str, float]:
         """Get importance scores for each parameter group.
-        
+
         Returns:
             Dictionary mapping parameter names to average importance scores
         """
@@ -258,87 +233,68 @@ class EWC:
         for name, fisher in self.fisher_info.items():
             scores[name] = fisher.mean().item()
         return scores
-    
+
     def update_lambda(self, new_lambda: float):
         """Update the EWC lambda value.
-        
+
         Args:
             new_lambda: New lambda value for EWC penalty
         """
         self.ewc_lambda = new_lambda
-    
-    def consolidate(
-        self,
-        dataset: Dataset,
-        alpha: float = 0.5
-    ):
+
+    def consolidate(self, dataset: Dataset, alpha: float = 0.5):
         """Consolidate knowledge by updating Fisher information with new task.
-        
+
         This allows for online EWC where multiple tasks are consolidated.
-        
+
         Args:
             dataset: Dataset from new task
             alpha: Mixing coefficient (0 = keep old Fisher, 1 = use new Fisher only)
         """
         # Compute new Fisher information
         new_fisher = self._compute_fisher(dataset)
-        
+
         # Mix old and new Fisher information
         for name in self.fisher_info:
             if name in new_fisher:
-                self.fisher_info[name] = (
-                    (1 - alpha) * self.fisher_info[name] + 
-                    alpha * new_fisher[name]
-                )
-        
+                self.fisher_info[name] = (1 - alpha) * self.fisher_info[name] + alpha * new_fisher[name]
+
         # Update old parameters
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 self.old_params[name] = param.data.clone().detach()
-        
+
         # Re-normalize if needed
         if self.normalize_fisher:
             self._normalize_fisher()
 
+
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
+    cache_dir: str | None = field(default=None)
     optim: str = field(default="adamw_torch")
-    others_lr: Optional[float] = None
-    others_weight_decay: Optional[float] = 0.0
+    others_lr: float | None = None
+    others_weight_decay: float | None = 0.0
 
     use_ewc: bool = field(
-        default=False,
-        metadata={"help": "Whether to use Elastic Weight Consolidation (EWC) for continual learning."}
+        default=False, metadata={"help": "Whether to use Elastic Weight Consolidation (EWC) for continual learning."}
     )
     ewc_lambda: float = field(
-        default=100.0,
-        metadata={"help": "Lambda parameter for EWC penalty. Higher values = more regularization."}
+        default=100.0, metadata={"help": "Lambda parameter for EWC penalty. Higher values = more regularization."}
     )
-    ewc_fisher_samples: Optional[int] = field(
-        default=None,
-        metadata={"help": "Number of samples to use for Fisher information estimation. None = use all."}
+    ewc_fisher_samples: int | None = field(
+        default=None, metadata={"help": "Number of samples to use for Fisher information estimation. None = use all."}
     )
     ewc_normalize_fisher: bool = field(
-        default=True,
-        metadata={"help": "Whether to normalize Fisher information values."}
+        default=True, metadata={"help": "Whether to normalize Fisher information values."}
     )
-    ewc_gamma: float = field(
-        default=0.95,
-        metadata={"help": "Decay factor for Online EWC."}
-    )
+    ewc_gamma: float = field(default=0.95, metadata={"help": "Decay factor for Online EWC."})
 
 
 class Trainer(transformers.Trainer):
     """Extended Trainer with EWC support for continual learning."""
-    
-    def __init__(
-        self,
-        ewc: Optional[EWC] = None,
-        prev_dataset=None,
-        *args,
-        **kwargs
-    ):
+
+    def __init__(self, ewc: EWC | None = None, prev_dataset=None, *args, **kwargs):
         """Initialize Trainer with optional EWC support.
 
         Args:
@@ -350,56 +306,58 @@ class Trainer(transformers.Trainer):
         super().__init__(*args, **kwargs)
 
         # Ensure use_apex is set for compatibility with different transformers versions
-        if not hasattr(self, 'use_apex'):
+        if not hasattr(self, "use_apex"):
             self.use_apex = False
 
         self.ewc = ewc
         self.prev_dataset = prev_dataset
         self._ewc_initialized = ewc is not None
-    
+
     def _maybe_initialize_ewc(self):
         """Initialize EWC if needed and not already initialized."""
         if self._ewc_initialized or not self.args.use_ewc:
             return
-        
+
         if self.prev_dataset is None:
             print("Warning: EWC is enabled but no previous dataset provided. Skipping EWC initialization.")
             return
-        
+
         print(f"Initializing EWC with lambda={self.args.ewc_lambda}...")
-        
+
         # Get the data collator
         data_collator = self.data_collator
-        
+
         # Determine device
-        device = self.model.device if hasattr(self.model, 'device') else (
-            next(self.model.parameters()).device if list(self.model.parameters()) else 'cpu'
+        device = (
+            self.model.device
+            if hasattr(self.model, "device")
+            else (next(self.model.parameters()).device if list(self.model.parameters()) else "cpu")
         )
-        
+
         # Create EWC instance
         ewc_kwargs = {
-            'model': self.model,
-            'dataset': self.prev_dataset,
-            'data_collator': data_collator,
-            'device': str(device),
-            'ewc_lambda': self.args.ewc_lambda,
-            'num_samples': self.args.ewc_fisher_samples,
-            'normalize_fisher': self.args.ewc_normalize_fisher,
+            "model": self.model,
+            "dataset": self.prev_dataset,
+            "data_collator": data_collator,
+            "device": str(device),
+            "ewc_lambda": self.args.ewc_lambda,
+            "num_samples": self.args.ewc_fisher_samples,
+            "normalize_fisher": self.args.ewc_normalize_fisher,
         }
-        
+
         self.ewc = EWC(**ewc_kwargs)
         self._ewc_initialized = True
         print("EWC initialization complete.")
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Compute loss with optional EWC penalty.
-        
+
         Args:
             model: The model
             inputs: Input batch
             return_outputs: Whether to return model outputs
             **kwargs: Additional arguments
-            
+
         Returns:
             Loss tensor, or tuple of (loss, outputs) if return_outputs=True
         """
@@ -409,23 +367,23 @@ class Trainer(transformers.Trainer):
         else:
             loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
             outputs = None
-        
+
         # Add EWC penalty if enabled
         if self.ewc is not None and self.args.use_ewc:
-            batch_size = inputs.get('input_ids', inputs.get('labels')).shape[0] if isinstance(inputs, dict) else None
+            batch_size = inputs.get("input_ids", inputs.get("labels")).shape[0] if isinstance(inputs, dict) else None
             ewc_loss = self.ewc.ewc_loss(batch_size=batch_size)
             loss = loss + ewc_loss
-        
+
         if return_outputs:
             return loss, outputs
         return loss
-    
+
     def train(self, *args, **kwargs):
         """Train with EWC initialization."""
         # Initialize EWC before training starts
         self._maybe_initialize_ewc()
         return super().train(*args, **kwargs)
-    
+
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -447,9 +405,9 @@ class Trainer(transformers.Trainer):
         model.train()
         try:
             if "labels_text" in inputs:
-                inputs.pop('labels_text')
+                inputs.pop("labels_text")
             if "input_texts" in inputs:
-                inputs.pop('input_texts')
+                inputs.pop("input_texts")
             inputs = self._prepare_inputs(inputs)
 
             with self.compute_loss_context_manager():
@@ -475,17 +433,18 @@ class Trainer(transformers.Trainer):
             model.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
             return torch.tensor(0.0, requires_grad=True).to(model.device)
-        
+
     def prediction_step(
         self,
         model: torch.nn.Module,
-        inputs: Dict[str, Union[torch.Tensor, Any]],
+        inputs: Dict[str, torch.Tensor | Any],
         prediction_loss_only: bool,
-        ignore_keys: Optional[List[str]] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        ignore_keys: List[str] | None = None,
+    ) -> Tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """
         Perform an evaluation step on model using inputs.
         Subclass and override to inject custom behavior.
+
         Args:
             model (nn.Module):
                 The model to evaluate.
@@ -498,6 +457,7 @@ class Trainer(transformers.Trainer):
             ignore_keys (List[str], *optional*):
                 A list of keys in the output of your model (if it is a dictionary) that should be ignored when
                 gathering predictions.
+
         Return:
             Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]: A tuple with the loss,
             logits and labels (each being optional).
@@ -505,36 +465,36 @@ class Trainer(transformers.Trainer):
         try:
             with torch.no_grad():
                 if "labels_text" in inputs:
-                    inputs.pop('labels_text')
+                    inputs.pop("labels_text")
                 if "input_texts" in inputs:
-                    inputs.pop('input_texts')
+                    inputs.pop("input_texts")
                 loss = None
                 with self.compute_loss_context_manager():
                     try:
                         outputs = model(**inputs)
                     except Exception as e:
-                        raise RuntimeError(f"Error during model forward pass: {str(e)}")
+                        raise RuntimeError(f"Error during model forward pass: {e!s}") from e
 
-                if not hasattr(outputs, 'loss'):
+                if not hasattr(outputs, "loss"):
                     raise AttributeError("Model output does not contain 'loss' attribute")
                 loss = outputs.loss
 
-                if not hasattr(outputs, 'logits'):
+                if not hasattr(outputs, "logits"):
                     raise AttributeError("Model output does not contain 'logits' attribute")
                 logits = outputs.logits
 
-                if 'labels' not in inputs:
+                if "labels" not in inputs:
                     raise KeyError("'labels' not found in input dictionary")
-                labels = inputs['labels']
+                labels = inputs["labels"]
 
             if prediction_loss_only:
                 return (loss, None, None)
             return (loss, logits, labels)
 
         except Exception as e:
-            print(f"An error occurred during prediction step: {str(e)}")
+            print(f"An error occurred during prediction step: {e!s}")
             return (None, None, None)
-        
+
     def create_optimizer(self):
         """
         Setup the optimizer.
@@ -555,27 +515,35 @@ class Trainer(transformers.Trainer):
                 optimizer_grouped_parameters = [
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n not in encoder_parameters and p.requires_grad)
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n in decay_parameters and n not in encoder_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.others_weight_decay,
                         "lr": self.args.others_lr,
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n not in encoder_parameters and p.requires_grad)
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and n not in encoder_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                         "lr": self.args.others_lr,
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n in decay_parameters and n in encoder_parameters and p.requires_grad)
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n in decay_parameters and n in encoder_parameters and p.requires_grad)
                         ],
                         "weight_decay": self.args.weight_decay,
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and n in encoder_parameters and p.requires_grad)
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and n in encoder_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                     },
@@ -590,7 +558,9 @@ class Trainer(transformers.Trainer):
                     },
                     {
                         "params": [
-                            p for n, p in opt_model.named_parameters() if (n not in decay_parameters and p.requires_grad)
+                            p
+                            for n, p in opt_model.named_parameters()
+                            if (n not in decay_parameters and p.requires_grad)
                         ],
                         "weight_decay": 0.0,
                     },
@@ -601,6 +571,7 @@ class Trainer(transformers.Trainer):
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         return self.optimizer
+
 
 @dataclass
 class RLTrainerConfig(TrainingArguments):
@@ -620,18 +591,9 @@ class RLTrainerConfig(TrainingArguments):
         default=-1,
         metadata={"help": "Focal loss alpha."},
     )
-    labels_smoothing: float = field(
-        default=-1,
-        metadata={"help": "Labels smoothing factor."}
-    )
-    entropy_beta: float = field(
-        default=-1,
-        metadata={"help": "Coeficient of entropy factor."}
-    )
-    kl_beta: float = field(
-        default=-1,
-        metadata={"help": "Coeficient of KL-divergence factor."}
-    )
+    labels_smoothing: float = field(default=-1, metadata={"help": "Labels smoothing factor."})
+    entropy_beta: float = field(default=-1, metadata={"help": "Coeficient of entropy factor."})
+    kl_beta: float = field(default=-1, metadata={"help": "Coeficient of KL-divergence factor."})
     get_actions: str = field(
         default="bernoulli",
         metadata={"help": "How to get actions of a model, default is `bernoulli`, another option is `threshold`"},
@@ -641,39 +603,36 @@ class RLTrainerConfig(TrainingArguments):
         metadata={"help": "Threshold value for predictions."},
     )
 
+
 class RLTrainer(Trainer):
     def __init__(
         self,
-        value_model: Optional[torch.nn.Module] = None,
-        reference_model: Optional[Union[ZeroShotClassificationPipeline|TransformersClassificationPipeline]] = None,
-        reward_components: Optional[List[Tuple[str, Callable]]] = None,
+        value_model: torch.nn.Module | None = None,
+        reference_model: ZeroShotClassificationPipeline | TransformersClassificationPipeline | None = None,
+        reward_components: List[Tuple[str, Callable]] | None = None,
         *args,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(*args, **kwargs)
         if value_model is not None:
             self.value_model = value_model.to(self.model.device)
         self.reference_model = reference_model
         if reward_components is None:
-            reward_components = [('f1', default_f1_reward)]
+            reward_components = [("f1", default_f1_reward)]
         self.reward_components = reward_components
         self._init_metrics()
 
     def _init_metrics(self):
         self.metrics = {
-            'total_loss': [],
-            'advantages': [],
+            "total_loss": [],
+            "advantages": [],
         }
         # Initialize metrics for each reward component
         for name, _ in self.reward_components.items():
-            self.metrics[f'reward_{name}'] = []
+            self.metrics[f"reward_{name}"] = []
 
     def compute_rewards(
-        self,
-        probs: torch.Tensor,
-        actions: torch.Tensor,
-        original_targets: torch.Tensor,
-        valid_mask: torch.Tensor
+        self, probs: torch.Tensor, actions: torch.Tensor, original_targets: torch.Tensor, valid_mask: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
         rewards = {}
         total_reward = 0.0
@@ -681,48 +640,49 @@ class RLTrainer(Trainer):
             component = reward_fn(probs, actions, original_targets, valid_mask)
             rewards[name] = component
             total_reward += component
-        rewards['total_reward'] = total_reward
+        rewards["total_reward"] = total_reward
         return rewards
-    
+
     def get_reference_scores(self, input_texts, labels_text):
         if input_texts is None or labels_text is None:
             return None
         all_scores = []
         with torch.no_grad():
             if isinstance(self.reference_model, ZeroShotClassificationPipeline):
-                results = self.reference_model(input_texts, labels_text, threshold=0.)
+                results = self.reference_model(input_texts, labels_text, threshold=0.0)
                 for id, result in enumerate(results):
-                    label2score = {item['label']: item['score'] for item in result}
+                    label2score = {item["label"]: item["score"] for item in result}
                     label_scores = [label2score[label] for label in labels_text[id]]
                     all_scores.append(label_scores)
             elif isinstance(self.reference_model, TransformersClassificationPipeline):
                 for text, labels in zip(input_texts, labels_text):
                     result = self.reference_model(text, labels)
-                    label2score = {label:score for label, score in zip(result['labels'], result['scores'])}
+                    label2score = dict(zip(result["labels"], result["scores"]))
                     label_scores = [label2score[label] for label in labels_text[id]]
                     all_scores.append(label_scores)
             else:
                 raise NotImplementedError("This classification pipelines is not supported as a reference model.")
         max_length = max(len(seq) for seq in all_scores)
-        all_scores = torch.FloatTensor([seq + [0] * (max_length - len(seq)) 
-                                            for seq in all_scores]).to(self.model.device)
+        all_scores = torch.FloatTensor([seq + [0] * (max_length - len(seq)) for seq in all_scores]).to(
+            self.model.device
+        )
         return all_scores
-    
+
     def compute_loss(
         self,
         inputs: torch.Tensor,
         targets: torch.Tensor,
-        log_prob_prev: Optional[torch.Tensor] = None,
-        value_outputs: Optional[torch.Tensor] = None,
-        reference_probs: Optional[torch.Tensor] = None,
-        **kwargs
+        log_prob_prev: torch.Tensor | None = None,
+        value_outputs: torch.Tensor | None = None,
+        reference_probs: torch.Tensor | None = None,
+        **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         valid_mask = targets != -100
         original_targets = targets.clone()
 
         probs = torch.sigmoid(inputs)
 
-        if self.args.get_actions == 'bernoulli':
+        if self.args.get_actions == "bernoulli":
             actions = torch.bernoulli(probs).detach()
         else:
             actions = (probs > self.args.threshold).float().detach()
@@ -730,7 +690,7 @@ class RLTrainer(Trainer):
         with torch.no_grad():
             metrics = self.compute_rewards(probs, actions, original_targets, valid_mask)
 
-        reward = metrics['total_reward']
+        reward = metrics["total_reward"]
 
         if value_outputs is not None:
             state_values = value_outputs.logits[:, 0].unsqueeze(-1)  # Using first token logits as value prediction
@@ -740,23 +700,19 @@ class RLTrainer(Trainer):
             value_loss = torch.tensor(0.0).to(inputs.device)
 
         advantages = (reward - state_values).detach()
-        self.metrics['advantages'].append(advantages.mean().item())
+        self.metrics["advantages"].append(advantages.mean().item())
 
         for name, _ in self.reward_components.items():
-            key = f'reward_{name}'
+            key = f"reward_{name}"
             self.metrics[key].append(metrics[name].mean().item())
 
         if self.args.label_smoothing_factor > 0:
             smoothed_actions = actions * (1 - self.args.label_smoothing_factor) + 0.5 * self.args.label_smoothing_factor
-            log_prob_current = (
-                smoothed_actions * torch.log(probs + 1e-8) +
-                (1 - smoothed_actions) * torch.log(1 - probs + 1e-8)
+            log_prob_current = smoothed_actions * torch.log(probs + 1e-8) + (1 - smoothed_actions) * torch.log(
+                1 - probs + 1e-8
             )
         else:
-            log_prob_current = (
-                actions * torch.log(probs + 1e-8) +
-                (1 - actions) * torch.log(1 - probs + 1e-8)
-            )
+            log_prob_current = actions * torch.log(probs + 1e-8) + (1 - actions) * torch.log(1 - probs + 1e-8)
 
         if log_prob_prev is None:
             log_prob_prev = log_prob_current.detach()
@@ -770,11 +726,11 @@ class RLTrainer(Trainer):
         loss_elements = -torch.min(per_label_loss1, per_label_loss2)
 
         loss_elements = loss_elements * valid_mask
-        self.metrics['total_loss'].append(loss_elements.mean().item())
+        self.metrics["total_loss"].append(loss_elements.mean().item())
 
         if self.args.gamma > 0:
             p_t = probs * original_targets + (1 - probs) * (1 - original_targets)
-            loss_elements = loss_elements * (p_t ** self.args.gamma)
+            loss_elements = loss_elements * (p_t**self.args.gamma)
 
         if self.args.alpha >= 0:
             alpha_t = self.args.alpha * original_targets + (1 - self.args.alpha) * (1 - original_targets)
@@ -784,19 +740,19 @@ class RLTrainer(Trainer):
 
         if reference_probs is not None:
             ref_per_token_logps = torch.log(reference_probs + 1e-8)
-            per_token_logps = log_prob_current  
-            per_label_kl = torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            per_token_logps = log_prob_current
+            per_label_kl = (
+                torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            )
             per_label_kl = per_label_kl * valid_mask
             kl_loss = self.args.kl_beta * per_label_kl.mean()
             loss = loss + kl_loss
 
         if self.args.entropy_beta:
-            entropy = - (probs * torch.log(probs + 1e-8) +
-                        (1 - probs) * torch.log(1 - probs + 1e-8))
+            entropy = -(probs * torch.log(probs + 1e-8) + (1 - probs) * torch.log(1 - probs + 1e-8))
             loss = loss + self.args.entropy_beta * entropy.mean()
 
         return loss, log_prob_current
-
 
     def _inner_training_loop(self, *args, **kwargs):
         self.create_optimizer()
@@ -810,7 +766,7 @@ class RLTrainer(Trainer):
         device = accelerator.device
 
         num_local_steps = len(dataloader)
-        num_iters = args.num_train_epochs*num_local_steps
+        num_iters = args.num_train_epochs * num_local_steps
         pbar = tqdm(total=num_iters, desc="Training iterations")
         self._init_metrics()
 
@@ -821,20 +777,20 @@ class RLTrainer(Trainer):
                 self.value_model.train()
 
             for step, inputs in enumerate(dataloader):
-                global_step = step+epoch*num_local_steps
+                global_step = step + epoch * num_local_steps
 
                 inputs = self._prepare_inputs(inputs)
-                labels = inputs.pop('labels').to(device)
+                labels = inputs.pop("labels").to(device)
                 if "labels_text" in inputs:
-                    labels_text = inputs.pop('labels_text')
+                    labels_text = inputs.pop("labels_text")
                 else:
                     labels_text = None
                 if "input_texts" in inputs:
-                    input_texts = inputs.pop('input_texts')
+                    input_texts = inputs.pop("input_texts")
                 else:
                     input_texts = None
                 prev_logps = None
-                for iter in range(args.num_rl_iters):
+                for _iter in range(args.num_rl_iters):
                     try:
                         outputs = model(**inputs)
                         logits = outputs.logits
@@ -846,11 +802,15 @@ class RLTrainer(Trainer):
                             reference_probs = self.get_reference_scores(input_texts, labels_text)
                         else:
                             reference_probs = None
-                        loss, current_logps = self.compute_loss(logits, labels, log_prob_prev=prev_logps, 
-                                                                                value_outputs=value_outputs,
-                                                                                reference_probs=reference_probs)
+                        loss, current_logps = self.compute_loss(
+                            logits,
+                            labels,
+                            log_prob_prev=prev_logps,
+                            value_outputs=value_outputs,
+                            reference_probs=reference_probs,
+                        )
                     except Exception as e:
-                        print(f"An error occurred during training step: {str(e)}")
+                        print(f"An error occurred during training step: {e!s}")
                         del inputs
                         model.zero_grad(set_to_none=True)
                         torch.cuda.empty_cache()
@@ -884,12 +844,12 @@ class RLTrainer(Trainer):
 
     def log_metrics(self):
         logged_metrics = {
-            'loss': np.mean(self.metrics['total_loss']),
-            'advantages': np.mean(self.metrics['advantages']),
+            "loss": np.mean(self.metrics["total_loss"]),
+            "advantages": np.mean(self.metrics["advantages"]),
         }
         # Add user reward components
         for name, _ in self.reward_components.items():
-            key = f'reward_{name}'
+            key = f"reward_{name}"
             logged_metrics[key] = np.mean(self.metrics[key])
         self.log(logged_metrics)
         self._init_metrics()
