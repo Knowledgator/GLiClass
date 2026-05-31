@@ -39,9 +39,9 @@ class GLiClassServeConfig:
 
     tokenizer_threads: int = 4
 
-    enable_compilation: bool = True
+    enable_compilation: bool = False
     calibrate_on_startup: bool = False
-    precompile_on_startup: bool = True
+    precompile_on_startup: bool = False
     use_memory_aware_batching: bool = False
 
     precompiled_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16, 32])
@@ -59,6 +59,17 @@ class GLiClassServeConfig:
     http_port: int = 8000
 
     ray_address: str | None = None
+
+    enable_mlora: bool = False
+    mlora_adapter_weight_modules: list[str] | None = None
+    mlora_max_rank: int = 16
+    mlora_max_gpu_adapters: int = 8
+    mlora_max_cpu_adapters: int | None = 128
+    mlora_disk_cache_dir: str | None = None
+    mlora_max_disk_adapters: int | None = None
+    mlora_base_adapter_id: str = "__base__"
+    mlora_use_triton_kernels: bool = True
+    mlora_adapter_id_pattern: str = r"^[A-Za-z0-9_.-]{1,128}$"
 
     def __post_init__(self):
         if self.max_batch_size not in self.precompiled_batch_sizes:
@@ -84,7 +95,14 @@ class GLiClassServeConfig:
         """
         config_path = Path(config_path)
         with config_path.open("r") as f:
-            config_dict = yaml.safe_load(f)
+            config_dict = yaml.safe_load(f) or {}
+        config_dict.pop("mlora_lazy_load_adapters", None)
+        config_dict.pop("mlora_allow_runtime_adapter_loading", None)
+        config_dict.pop("mlora_allow_unsafe_bin_adapters", None)
+        if "mlora_target_modules" in config_dict and "mlora_adapter_weight_modules" not in config_dict:
+            config_dict["mlora_adapter_weight_modules"] = config_dict.pop("mlora_target_modules")
+        else:
+            config_dict.pop("mlora_target_modules", None)
         return cls(**config_dict)
 
     def to_yaml(self, config_path: str | Path) -> None:

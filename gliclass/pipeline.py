@@ -249,6 +249,15 @@ class BaseZeroShotClassificationPipeline(ABC):
         normalized = self._normalize_classification_type(classification_type)
         return [normalized] * num_texts
 
+    def _normalize_adapter_ids(self, adapter_ids: str | List[str] | None, num_texts: int) -> List[str] | None:
+        if adapter_ids is None:
+            return None
+        if isinstance(adapter_ids, str):
+            return [adapter_ids] * num_texts
+        if len(adapter_ids) != num_texts:
+            raise ValueError("Length of adapter_ids list must match number of texts.")
+        return adapter_ids
+
     def _process_labels(
         self, labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]]
     ) -> List[str] | List[List[str]]:
@@ -405,6 +414,7 @@ class BaseZeroShotClassificationPipeline(ABC):
         examples: List[Dict[str, Any]] | None = None,
         prompt: str | List[str] | None = None,
         return_hierarchical: bool = False,
+        adapter_ids: str | List[str] | None = None,
     ):
         """
         Perform zero-shot classification.
@@ -421,6 +431,7 @@ class BaseZeroShotClassificationPipeline(ABC):
             examples: Few-shot examples with 'text' and 'labels'/'true_labels' keys
             prompt: Task description - string (same for all) or list (per-text)
             return_hierarchical: If True, return hierarchical structure with all scores
+            adapter_ids: Optional LoRA adapter id for all texts or one adapter id per text.
 
         Returns:
             List of classification results or hierarchical dict structure.
@@ -430,6 +441,7 @@ class BaseZeroShotClassificationPipeline(ABC):
         texts = self._normalize_texts(texts)
         thresholds = self._normalize_thresholds(threshold, len(texts))
         classification_types = self._normalize_classification_types(classification_type, len(texts))
+        adapter_ids = self._normalize_adapter_ids(adapter_ids, len(texts))
 
         if rac_examples:
             if len(texts) == 1 and not isinstance(rac_examples[0], list):
@@ -460,12 +472,17 @@ class BaseZeroShotClassificationPipeline(ABC):
 
             batch_examples = self._get_batch_examples(examples, idx, len(batch_texts))
             batch_prompt = self._get_batch_prompt(prompt, idx, len(batch_texts))
+            batch_adapter_ids = adapter_ids[idx : idx + len(batch_texts)] if adapter_ids is not None else None
 
             tokenized_inputs = self.prepare_inputs(
                 batch_texts, batch_labels, same_labels, examples=batch_examples, prompt=batch_prompt
             )
             max_num_classes = self._resolve_max_num_classes(batch_labels, same_labels)
-            model_output = self.model(**tokenized_inputs, max_num_classes=max_num_classes)
+            model_output = self.model(
+                **tokenized_inputs,
+                max_num_classes=max_num_classes,
+                adapter_ids=batch_adapter_ids,
+            )
             logits = model_output.logits
             probs = torch.sigmoid(logits)
 
@@ -894,6 +911,7 @@ class ZeroShotClassificationPipeline:
         examples: List[Dict[str, Any]] | None = None,
         prompt: str | List[str] | None = None,
         return_hierarchical: bool = False,
+        adapter_ids: str | List[str] | None = None,
     ):
         """
         Perform zero-shot classification.
@@ -913,6 +931,7 @@ class ZeroShotClassificationPipeline:
             examples: Few-shot examples, each with 'text' and 'labels' keys
             prompt: Task description - string or list of strings (per-text)
             return_hierarchical: If True, return structure matching input labels
+            adapter_ids: Optional LoRA adapter id for all texts or one adapter id per text.
 
         Returns:
             List of predictions (flat) or hierarchical dicts with all scores
@@ -927,6 +946,7 @@ class ZeroShotClassificationPipeline:
             examples=examples,
             prompt=prompt,
             return_hierarchical=return_hierarchical,
+            adapter_ids=adapter_ids,
         )
 
 

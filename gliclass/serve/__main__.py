@@ -211,11 +211,8 @@ def main():
     logger.info("Initializing Ray...")
     ray.init(ignore_reinit_error=True)
 
-    logger.info("Starting Ray Serve...")
-    serve.start(http_options={"host": args.host, "port": config.http_port})
-
     logger.info(f"Deploying GLiClass with model: {config.model}")
-    _app = serve_gliclass(config, blocking=False)  # Keep reference to prevent GC
+    _app = serve_gliclass(config, blocking=False, host=args.host)  # Keep reference to prevent GC
 
     logger.info(f"GLiClass server running at http://{args.host}:{config.http_port}{config.route_prefix}")
     logger.info("Press Ctrl+C to stop the server")

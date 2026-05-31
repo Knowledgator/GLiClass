@@ -1,11 +1,15 @@
 """Ray Serve deployment for GLiClass with dynamic batching."""
 
 import os
+import re
 import logging
 from typing import Any
 
 import torch
 from ray import serve
+from ray.serve._private import api as serve_private_api
+from ray.serve._private.build_app import build_app
+from starlette.responses import JSONResponse
 from transformers import AutoTokenizer
 
 from gliclass.model import GLiClassModel
@@ -27,6 +31,8 @@ class GLiClassServer:
             config: Server configuration with model and serving parameters
         """
         self.config = config
+        self._mlora_model = None
+        self._adapter_id_re = re.compile(config.mlora_adapter_id_pattern)
 
         env_vars = config.to_env_vars()
         for key, value in env_vars.items():
@@ -60,6 +66,8 @@ class GLiClassServer:
         logger.info("Loading model: %s", config.model)
 
         self.model = GLiClassModel.from_pretrained(config.model)
+        if config.enable_mlora:
+            self._initialize_mlora()
         self.model.config.max_labels_alloc = config.max_labels_alloc
         self.model.to(device=self.device, dtype=self.torch_dtype)
         self.model.eval()
@@ -88,6 +96,96 @@ class GLiClassServer:
             self._calibrate_memory()
 
         logger.info("GLiClass server initialized successfully")
+
+    def _initialize_mlora(self) -> None:
+        try:
+            from mlora import CustomLoraConfig, CustomPeftModel
+        except ImportError as exc:
+            raise ImportError("enable_mlora=True requires the mlora package to be importable") from exc
+
+        target_model = self._get_mlora_target_model()
+        mlora_config = CustomLoraConfig(
+            max_gpu_adapters=self.config.mlora_max_gpu_adapters,
+            max_cpu_adapters=self.config.mlora_max_cpu_adapters,
+            disk_cache_dir=self.config.mlora_disk_cache_dir,
+            max_disk_adapters=self.config.mlora_max_disk_adapters,
+            max_rank=self.config.mlora_max_rank,
+            target_modules=self.config.mlora_adapter_weight_modules,
+            base_adapter_id=self.config.mlora_base_adapter_id,
+            use_triton_kernels=self.config.mlora_use_triton_kernels,
+        )
+        self._mlora_model = CustomPeftModel(target_model, mlora_config)
+        self._set_mlora_target_model(self._mlora_model)
+
+        logger.info(
+            "mLoRA enabled with %d GPU slots, max rank %d, disk cache %s",
+            self.config.mlora_max_gpu_adapters,
+            self.config.mlora_max_rank,
+            self.config.mlora_disk_cache_dir or "disabled",
+        )
+
+    def _get_mlora_target_model(self):
+        architecture = self.model.config.architecture_type
+        if architecture in {"uni-encoder", "bi-encoder", "bi-encoder-fused"}:
+            return self.model.model.encoder_model
+        if architecture in {"encoder-decoder", "encoder-decoder-cls"}:
+            return self.model.model.encoder_decoder_model
+        raise NotImplementedError(f"mLoRA is not implemented for architecture {architecture!r}")
+
+    def _set_mlora_target_model(self, wrapped_model) -> None:
+        architecture = self.model.config.architecture_type
+        if architecture in {"uni-encoder", "bi-encoder", "bi-encoder-fused"}:
+            self.model.model.encoder_model = wrapped_model
+        elif architecture in {"encoder-decoder", "encoder-decoder-cls"}:
+            self.model.model.encoder_decoder_model = wrapped_model
+        else:
+            raise NotImplementedError(f"mLoRA is not implemented for architecture {architecture!r}")
+
+    def _validate_adapter_id(self, adapter_id: str) -> None:
+        if not isinstance(adapter_id, str) or not self._adapter_id_re.fullmatch(adapter_id):
+            raise ValueError("adapter_id must match mlora_adapter_id_pattern")
+        if adapter_id == self.config.mlora_base_adapter_id:
+            raise ValueError(f"{adapter_id!r} is reserved for base-only inference")
+
+    def adapter_cache_status(self, adapter_id: str | None = None) -> dict[str, Any]:
+        if not self.config.enable_mlora or self._mlora_model is None:
+            return {"enabled": False, "base_adapter_id": self.config.mlora_base_adapter_id}
+        store = self._mlora_model.adapter_store
+        disk_cache = getattr(store, "disk_cache", None)
+        response: dict[str, Any] = {
+            "enabled": True,
+            "base_adapter_id": self.config.mlora_base_adapter_id,
+            "loaded": sorted(store.adapters.keys()),
+            "disk_cached": sorted(disk_cache.entries.keys()) if disk_cache is not None else [],
+            "disk_cache_dir": str(disk_cache.cache_dir) if disk_cache is not None else None,
+            "max_disk_adapters": disk_cache.max_adapters if disk_cache is not None else None,
+            "gpu_slots": list(self._mlora_model.adapter_cache.slot_to_adapter),
+        }
+        if adapter_id is not None:
+            if adapter_id == self.config.mlora_base_adapter_id:
+                response["adapter_id"] = adapter_id
+                response["cached"] = True
+                response["cpu_resident"] = False
+                response["gpu_resident"] = True
+                return response
+            self._validate_adapter_id(adapter_id)
+            response["adapter_id"] = adapter_id
+            response["cached"] = disk_cache is not None and adapter_id in disk_cache
+            response["cpu_resident"] = adapter_id in store.adapters
+            response["gpu_resident"] = adapter_id in self._mlora_model.adapter_cache.adapter_to_slot
+        return response
+
+    def ensure_adapter_loaded(self, adapter_id: str | None) -> str | None:
+        if adapter_id is None:
+            return self.config.mlora_base_adapter_id if self.config.enable_mlora else None
+        if adapter_id == self.config.mlora_base_adapter_id:
+            return adapter_id
+        if not self.config.enable_mlora or self._mlora_model is None:
+            raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
+        self._validate_adapter_id(adapter_id)
+        if adapter_id in self._mlora_model.adapter_store:
+            return adapter_id
+        raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
 
     def _precompile(self) -> None:
         logger.info("Precompiling model for batch sizes: %s", self.config.precompiled_batch_sizes)
@@ -188,6 +286,7 @@ class GLiClassServer:
         multi_label: bool | list[bool] = True,
         examples: list[dict[str, Any]] | list[list[dict[str, Any]] | None] | None = None,
         prompt: str | list[str] | None = None,
+        adapter_ids: str | list[str] | None = None,
     ) -> list[list[dict[str, Any]]]:
         """Run batch inference using the shared zero-shot pipeline.
 
@@ -198,6 +297,7 @@ class GLiClassServer:
             multi_label: Shared mode or one mode flag per text
             examples: Shared examples or one example set per text
             prompt: Shared prompt or one prompt per text
+            adapter_ids: Shared LoRA adapter id or one adapter id per text
 
         Returns:
             List of prediction dicts
@@ -207,6 +307,11 @@ class GLiClassServer:
         else:
             classification_type = "multi-label" if multi_label else "single-label"
 
+        if isinstance(adapter_ids, list):
+            adapter_ids = [self.ensure_adapter_loaded(adapter_id) for adapter_id in adapter_ids]
+        elif adapter_ids is not None:
+            adapter_ids = self.ensure_adapter_loaded(adapter_ids)
+
         return self.pipeline(
             texts,
             labels,
@@ -215,6 +320,7 @@ class GLiClassServer:
             classification_type=classification_type,
             examples=examples,
             prompt=prompt,
+            adapter_ids=adapter_ids,
         )
 
     def predict(
@@ -225,6 +331,7 @@ class GLiClassServer:
         multi_label: bool = True,
         examples: list[dict[str, Any]] | None = None,
         prompt: str | list[str] | None = None,
+        adapter_id: str | None = None,
     ) -> list[list[dict[str, Any]]]:
         if isinstance(texts, str):
             texts = [texts]
@@ -241,6 +348,7 @@ class GLiClassServer:
             multi_label=multi_label,
             examples=examples,
             prompt=prompt,
+            adapter_ids=adapter_id,
         )
 
         return results
@@ -281,6 +389,7 @@ def _build_deployment(config: GLiClassServeConfig):
             multi_label_list: list[bool],
             examples_list: list[list[dict[str, Any]] | None],
             prompts_list: list[str | None],
+            adapter_ids: list[str | None],
         ) -> list[list[dict[str, Any]]]:
             """Single forward pass over the Ray-accumulated batch.
 
@@ -309,6 +418,7 @@ def _build_deployment(config: GLiClassServeConfig):
                 multi_label=multi_label_list,
                 examples=examples_list,
                 prompt=prompts_list,
+                adapter_ids=adapter_ids,
             )
 
             return results
@@ -321,6 +431,7 @@ def _build_deployment(config: GLiClassServeConfig):
             multi_label: bool = True,
             examples: list[dict[str, Any]] | None = None,
             prompt: str | None = None,
+            adapter_id: str | None = None,
         ) -> list[dict[str, Any]]:
             """Single prediction endpoint - one text per request."""
             if threshold is None:
@@ -334,24 +445,39 @@ def _build_deployment(config: GLiClassServeConfig):
                 multi_label,
                 examples,
                 prompt,
+                adapter_id,
             )
             return results
 
         async def __call__(self, request) -> list[dict[str, Any]]:
             """HTTP endpoint - accepts single text per request."""
+            path = request.url.path.rstrip("/")
+            if path.endswith("/adapter-cache"):
+                adapter_id = request.query_params.get("adapter_id")
+                try:
+                    return self.server.adapter_cache_status(adapter_id)
+                except ValueError as exc:
+                    return JSONResponse({"error": str(exc)}, status_code=400)
+
             payload = await request.json()
             text = payload.get("text") or payload.get("texts")
             if isinstance(text, list):
                 # If list provided, take first element for compatibility
                 text = text[0] if text else ""
-            return await self.predict(
-                text=text,
-                labels=payload["labels"],
-                threshold=payload.get("threshold"),
-                multi_label=payload.get("multi_label", True),
-                examples=payload.get("examples"),
-                prompt=payload.get("prompt"),
-            )
+            try:
+                return await self.predict(
+                    text=text,
+                    labels=payload["labels"],
+                    threshold=payload.get("threshold"),
+                    multi_label=payload.get("multi_label", True),
+                    examples=payload.get("examples"),
+                    prompt=payload.get("prompt"),
+                    adapter_id=payload.get("adapter_id"),
+                )
+            except KeyError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=404)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
 
     return GLiClassDeployment.bind(config)
 
@@ -359,18 +485,35 @@ def _build_deployment(config: GLiClassServeConfig):
 def serve_gliclass(
     config: GLiClassServeConfig,
     blocking: bool = False,
+    host: str = "127.0.0.1",
 ) -> Any:
     import ray
 
     if not ray.is_initialized():
         ray.init(address=config.ray_address, ignore_reinit_error=True)
 
-    serve.start(detached=True, http_options={"port": config.http_port})
+    serve.start(
+        detached=True,
+        http_options={"host": host, "port": config.http_port},
+    )
+    serve_client = serve_private_api._get_global_client(_health_check_controller=True)
 
     app = _build_deployment(config)
-    handle = serve.run(app, name="gliclass", route_prefix=config.route_prefix)
+    built_app = build_app(
+        app,
+        name="gliclass",
+        route_prefix=config.route_prefix,
+        default_runtime_env=ray.get_runtime_context().runtime_env,
+    )
+    handle = serve_client.deploy_applications([built_app])[0]
+    serve_client.wait_for_proxies_serving()
 
-    logger.info("GLiClass server running at http://localhost:%d%s", config.http_port, config.route_prefix)
+    logger.info(
+        "GLiClass server running at http://%s:%d%s",
+        host,
+        config.http_port,
+        config.route_prefix,
+    )
 
     if blocking:
         import time
@@ -450,6 +593,7 @@ class GLiClassFactory:
         multi_label: bool = True,
         examples: list[dict[str, Any]] | None = None,
         prompt: str | list[str] | None = None,
+        adapter_id: str | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Blocking prediction. Returns dict for str input, list for list input."""
         single = isinstance(texts, str)
@@ -463,6 +607,7 @@ class GLiClassFactory:
                 multi_label,
                 examples,
                 prompt,
+                adapter_id,
             )
             for t in items
         ]
@@ -477,6 +622,7 @@ class GLiClassFactory:
         multi_label: bool = True,
         examples: list[dict[str, Any]] | None = None,
         prompt: str | list[str] | None = None,
+        adapter_id: str | None = None,
     ) -> dict[str, Any] | list[dict[str, Any]]:
         """Async prediction. Concurrent calls accumulate into one batch."""
         import asyncio
@@ -492,6 +638,7 @@ class GLiClassFactory:
                 multi_label,
                 examples,
                 prompt,
+                adapter_id,
             )
             for t in items
         ]
