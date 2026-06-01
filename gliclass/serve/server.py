@@ -31,8 +31,8 @@ class GLiClassServer:
             config: Server configuration with model and serving parameters
         """
         self.config = config
-        self._mlora_model = None
-        self._adapter_id_re = re.compile(config.mlora_adapter_id_pattern)
+        self._polylora_model = None
+        self._adapter_id_re = re.compile(config.polylora_adapter_id_pattern)
 
         env_vars = config.to_env_vars()
         for key, value in env_vars.items():
@@ -66,8 +66,8 @@ class GLiClassServer:
         logger.info("Loading model: %s", config.model)
 
         self.model = GLiClassModel.from_pretrained(config.model)
-        if config.enable_mlora:
-            self._initialize_mlora()
+        if config.enable_polylora:
+            self._initialize_polylora()
         self.model.config.max_labels_alloc = config.max_labels_alloc
         self.model.to(device=self.device, dtype=self.torch_dtype)
         self.model.eval()
@@ -97,72 +97,72 @@ class GLiClassServer:
 
         logger.info("GLiClass server initialized successfully")
 
-    def _initialize_mlora(self) -> None:
+    def _initialize_polylora(self) -> None:
         try:
-            from mlora import CustomLoraConfig, CustomPeftModel
+            from polylora import PolyLoraConfig, PolyLoraModel
         except ImportError as exc:
-            raise ImportError("enable_mlora=True requires the mlora package to be importable") from exc
+            raise ImportError("enable_polylora=True requires the polylora package to be importable") from exc
 
-        target_model = self._get_mlora_target_model()
-        mlora_config = CustomLoraConfig(
-            max_gpu_adapters=self.config.mlora_max_gpu_adapters,
-            max_cpu_adapters=self.config.mlora_max_cpu_adapters,
-            disk_cache_dir=self.config.mlora_disk_cache_dir,
-            max_disk_adapters=self.config.mlora_max_disk_adapters,
-            max_rank=self.config.mlora_max_rank,
-            target_modules=self.config.mlora_adapter_weight_modules,
-            base_adapter_id=self.config.mlora_base_adapter_id,
-            use_triton_kernels=self.config.mlora_use_triton_kernels,
+        target_model = self._get_polylora_target_model()
+        polylora_config = PolyLoraConfig(
+            max_gpu_adapters=self.config.polylora_max_gpu_adapters,
+            max_cpu_adapters=self.config.polylora_max_cpu_adapters,
+            disk_cache_dir=self.config.polylora_disk_cache_dir,
+            max_disk_adapters=self.config.polylora_max_disk_adapters,
+            max_rank=self.config.polylora_max_rank,
+            target_modules=self.config.polylora_adapter_weight_modules,
+            base_adapter_id=self.config.polylora_base_adapter_id,
+            use_triton_kernels=self.config.polylora_use_triton_kernels,
         )
-        self._mlora_model = CustomPeftModel(target_model, mlora_config)
-        self._set_mlora_target_model(self._mlora_model)
+        self._polylora_model = PolyLoraModel(target_model, polylora_config)
+        self._set_polylora_target_model(self._polylora_model)
 
         logger.info(
-            "mLoRA enabled with %d GPU slots, max rank %d, disk cache %s",
-            self.config.mlora_max_gpu_adapters,
-            self.config.mlora_max_rank,
-            self.config.mlora_disk_cache_dir or "disabled",
+            "PolyLoRA enabled with %d GPU slots, max rank %d, disk cache %s",
+            self.config.polylora_max_gpu_adapters,
+            self.config.polylora_max_rank,
+            self.config.polylora_disk_cache_dir or "disabled",
         )
 
-    def _get_mlora_target_model(self):
+    def _get_polylora_target_model(self):
         architecture = self.model.config.architecture_type
         if architecture in {"uni-encoder", "bi-encoder", "bi-encoder-fused"}:
             return self.model.model.encoder_model
         if architecture in {"encoder-decoder", "encoder-decoder-cls"}:
             return self.model.model.encoder_decoder_model
-        raise NotImplementedError(f"mLoRA is not implemented for architecture {architecture!r}")
+        raise NotImplementedError(f"PolyLoRA is not implemented for architecture {architecture!r}")
 
-    def _set_mlora_target_model(self, wrapped_model) -> None:
+    def _set_polylora_target_model(self, wrapped_model) -> None:
         architecture = self.model.config.architecture_type
         if architecture in {"uni-encoder", "bi-encoder", "bi-encoder-fused"}:
             self.model.model.encoder_model = wrapped_model
         elif architecture in {"encoder-decoder", "encoder-decoder-cls"}:
             self.model.model.encoder_decoder_model = wrapped_model
         else:
-            raise NotImplementedError(f"mLoRA is not implemented for architecture {architecture!r}")
+            raise NotImplementedError(f"PolyLoRA is not implemented for architecture {architecture!r}")
 
     def _validate_adapter_id(self, adapter_id: str) -> None:
         if not isinstance(adapter_id, str) or not self._adapter_id_re.fullmatch(adapter_id):
-            raise ValueError("adapter_id must match mlora_adapter_id_pattern")
-        if adapter_id == self.config.mlora_base_adapter_id:
+            raise ValueError("adapter_id must match polylora_adapter_id_pattern")
+        if adapter_id == self.config.polylora_base_adapter_id:
             raise ValueError(f"{adapter_id!r} is reserved for base-only inference")
 
     def adapter_cache_status(self, adapter_id: str | None = None) -> dict[str, Any]:
-        if not self.config.enable_mlora or self._mlora_model is None:
-            return {"enabled": False, "base_adapter_id": self.config.mlora_base_adapter_id}
-        store = self._mlora_model.adapter_store
+        if not self.config.enable_polylora or self._polylora_model is None:
+            return {"enabled": False, "base_adapter_id": self.config.polylora_base_adapter_id}
+        store = self._polylora_model.adapter_store
         disk_cache = getattr(store, "disk_cache", None)
         response: dict[str, Any] = {
             "enabled": True,
-            "base_adapter_id": self.config.mlora_base_adapter_id,
+            "base_adapter_id": self.config.polylora_base_adapter_id,
             "loaded": sorted(store.adapters.keys()),
             "disk_cached": sorted(disk_cache.entries.keys()) if disk_cache is not None else [],
             "disk_cache_dir": str(disk_cache.cache_dir) if disk_cache is not None else None,
             "max_disk_adapters": disk_cache.max_adapters if disk_cache is not None else None,
-            "gpu_slots": list(self._mlora_model.adapter_cache.slot_to_adapter),
+            "gpu_slots": list(self._polylora_model.adapter_cache.slot_to_adapter),
         }
         if adapter_id is not None:
-            if adapter_id == self.config.mlora_base_adapter_id:
+            if adapter_id == self.config.polylora_base_adapter_id:
                 response["adapter_id"] = adapter_id
                 response["cached"] = True
                 response["cpu_resident"] = False
@@ -172,18 +172,18 @@ class GLiClassServer:
             response["adapter_id"] = adapter_id
             response["cached"] = disk_cache is not None and adapter_id in disk_cache
             response["cpu_resident"] = adapter_id in store.adapters
-            response["gpu_resident"] = adapter_id in self._mlora_model.adapter_cache.adapter_to_slot
+            response["gpu_resident"] = adapter_id in self._polylora_model.adapter_cache.adapter_to_slot
         return response
 
     def ensure_adapter_loaded(self, adapter_id: str | None) -> str | None:
         if adapter_id is None:
-            return self.config.mlora_base_adapter_id if self.config.enable_mlora else None
-        if adapter_id == self.config.mlora_base_adapter_id:
+            return self.config.polylora_base_adapter_id if self.config.enable_polylora else None
+        if adapter_id == self.config.polylora_base_adapter_id:
             return adapter_id
-        if not self.config.enable_mlora or self._mlora_model is None:
+        if not self.config.enable_polylora or self._polylora_model is None:
             raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
         self._validate_adapter_id(adapter_id)
-        if adapter_id in self._mlora_model.adapter_store:
+        if adapter_id in self._polylora_model.adapter_store:
             return adapter_id
         raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
 
