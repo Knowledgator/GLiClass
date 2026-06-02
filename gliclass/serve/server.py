@@ -7,10 +7,10 @@ from typing import Any
 
 import torch
 from ray import serve
-from ray.serve._private import api as serve_private_api
-from ray.serve._private.build_app import build_app
-from starlette.responses import JSONResponse
 from transformers import AutoTokenizer
+from ray.serve._private import api as serve_private_api
+from starlette.responses import JSONResponse
+from ray.serve._private.build_app import build_app
 
 from gliclass.model import GLiClassModel
 from gliclass.pipeline import ZeroShotClassificationPipeline
@@ -72,6 +72,12 @@ class GLiClassServer:
         self.model.to(device=self.device, dtype=self.torch_dtype)
         self.model.eval()
 
+        if config.quantization:
+            if not hasattr(self.model, "quantize"):
+                raise ValueError("quantization is configured, but this GLiClass model does not support quantize()")
+            logger.info("Applying quantization: %s", config.quantization)
+            self.model.quantize(config.quantization)
+
         self.tokenizer = AutoTokenizer.from_pretrained(config.model)
         pipeline_kwargs = {
             "model": self.model,
@@ -89,17 +95,21 @@ class GLiClassServer:
         if torch.cuda.is_available():
             self.memory_estimator.measure_model_memory()
 
-        if config.enable_compilation:
+        if config.enable_compilation and hasattr(self.model, "compile"):
+            logger.info("Compiling GLiClass model")
+            self.model.compile()
+
+        if config.precompile_on_startup:
             self._precompile()
 
-        if torch.cuda.is_available():
+        if config.calibrate_on_startup and torch.cuda.is_available():
             self._calibrate_memory()
 
         logger.info("GLiClass server initialized successfully")
 
     def _initialize_polylora(self) -> None:
         try:
-            from polylora import PolyLoraConfig, PolyLoraModel
+            from polylora import PolyLoraModel, PolyLoraConfig
         except ImportError as exc:
             raise ImportError("enable_polylora=True requires the polylora package to be importable") from exc
 
@@ -190,9 +200,6 @@ class GLiClassServer:
     def _precompile(self) -> None:
         logger.info("Precompiling model for batch sizes: %s", self.config.precompiled_batch_sizes)
 
-        if hasattr(self.model, "compile"):
-            self.model.compile()
-
         dummy_labels = ["person", "organization", "location"]
 
         for batch_size in self.config.precompiled_batch_sizes:
@@ -233,7 +240,11 @@ class GLiClassServer:
         Returns:
             Optimal batch size from precompiled sizes
         """
-        if not torch.cuda.is_available():
+        if not self.config.use_memory_aware_batching or not torch.cuda.is_available():
+            return self.config.precompiled_batch_sizes[-1]
+
+        if not self.memory_estimator.per_sample_table:
+            logger.warning("Memory-aware batching is enabled, but memory estimator is not calibrated")
             return self.config.precompiled_batch_sizes[-1]
 
         if seq_len is None:
@@ -365,6 +376,7 @@ def _build_deployment(config: GLiClassServeConfig):
             "num_cpus": config.num_cpus_per_replica,
         },
         max_ongoing_requests=config.max_ongoing_requests,
+        max_queued_requests=config.queue_capacity,
     )
     class GLiClassDeployment:
         def __init__(self, serve_config: GLiClassServeConfig):
