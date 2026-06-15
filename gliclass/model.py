@@ -795,8 +795,15 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=-1, eps=self.epsilon)
         return text_embeddings
 
-    def encode_text(self, input_ids, attention_mask):
-        outputs = self.encoder_model(input_ids.squeeze(1), attention_mask=attention_mask.squeeze(1))
+    def encode_text(self, input_ids, attention_mask, adapter_ids=None):
+        encoder_kwargs = {}
+        if adapter_ids is not None:
+            encoder_kwargs["adapter_ids"] = adapter_ids
+        outputs = self.encoder_model(
+            input_ids.squeeze(1),
+            attention_mask=attention_mask.squeeze(1),
+            **encoder_kwargs,
+        )
         text_embeddings = self.pool_outputs(outputs)
         return text_embeddings
 
@@ -843,11 +850,12 @@ class GLiClassBiEncoder(GLiClassBaseModel):
         output_text_embeddings: bool | None = None,
         output_class_embeddings: bool | None = None,
         return_dict: bool | None = None,
+        adapter_ids: list[str] | None = None,
         **kwargs,
     ) -> Tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        text_embeddings = self.encode_text(input_ids, attention_mask)
+        text_embeddings = self.encode_text(input_ids, attention_mask, adapter_ids=adapter_ids)
         class_embeddings = self.encode_classes(class_input_ids, class_attention_mask, labels_mask)
         logits = self.scorer(text_embeddings, class_embeddings) * self.logit_scale.to(class_embeddings.device)
 
@@ -872,7 +880,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
     def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
         super().__init__(config, from_pretrained)
 
-    def encode_text(self, input_ids, attention_mask, class_embeddings, labels_mask):
+    def encode_text(self, input_ids, attention_mask, class_embeddings, labels_mask, adapter_ids=None):
         embedding_layer = self.encoder_model.get_input_embeddings()
         inputs_embeds = embedding_layer(input_ids)
 
@@ -884,7 +892,14 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         selected_class_embeddings = class_embeddings[labels_batch_indices, labels_indices]
 
         inputs_embeds[batch_indices, class_token_indices] = selected_class_embeddings
-        encoder_outputs = self.encoder_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask.squeeze(1))
+        encoder_kwargs = {}
+        if adapter_ids is not None:
+            encoder_kwargs["adapter_ids"] = adapter_ids
+        encoder_outputs = self.encoder_model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask.squeeze(1),
+            **encoder_kwargs,
+        )
 
         post_class_embeddings = torch.zeros_like(class_embeddings)
         post_class_embeddings[labels_batch_indices, labels_indices] = encoder_outputs[0][
@@ -903,6 +918,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         output_text_embeddings: bool | None = None,
         output_class_embeddings: bool | None = None,
         return_dict: bool | None = None,
+        adapter_ids: list[str] | None = None,
         **kwargs,
     ) -> Tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -910,7 +926,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         raw_class_embeddings = self.encode_classes(class_input_ids, class_attention_mask, labels_mask)
 
         encoder_outputs, class_embeddings = self.encode_text(
-            input_ids, attention_mask, raw_class_embeddings, labels_mask
+            input_ids, attention_mask, raw_class_embeddings, labels_mask, adapter_ids=adapter_ids
         )
 
         text_embeddings = self.pool_outputs(encoder_outputs)
@@ -1037,5 +1053,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
         return model_embeds
 
     def forward(self, *args, **kwargs):
+        if kwargs.get("adapter_ids") is None:
+            kwargs.pop("adapter_ids", None)
         outputs = self.model(*args, **kwargs)
         return outputs

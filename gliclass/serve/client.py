@@ -22,6 +22,7 @@ class GLiClassClient:
         multi_label: bool = True,
         examples: list[dict] | None = None,
         prompt: str | list[str] | None = None,
+        adapter_id: str | None = None,
     ) -> list[list[dict]]:
         """Classify text(s) - same interface as pipeline.
 
@@ -32,6 +33,7 @@ class GLiClassClient:
             multi_label: Whether to enable multi-label classification
             examples: Optional list of example classifications
             prompt: Optional task description prompt (string or list)
+            adapter_id: Optional LoRA adapter id
 
         Returns:
             List of results, one per text. Each result is a list of {"label": ..., "score": ...}
@@ -46,6 +48,8 @@ class GLiClassClient:
             payload["examples"] = examples
         if prompt is not None:
             payload["prompt"] = prompt
+        if adapter_id is not None:
+            payload["adapter_id"] = adapter_id
 
         response = requests.post(self.url, json=payload, timeout=30)
         response.raise_for_status()
@@ -60,6 +64,7 @@ class GLiClassClient:
         multi_label: bool = True,
         examples: list[dict] | None = None,
         prompt: str | None = None,
+        adapter_id: str | None = None,
     ) -> list[dict]:
         """Classify a single text (convenience method).
 
@@ -70,12 +75,22 @@ class GLiClassClient:
             multi_label: Whether to enable multi-label classification
             examples: Optional list of example classifications
             prompt: Optional task description prompt
+            adapter_id: Optional LoRA adapter id
 
         Returns:
             List of predictions: [{"label": ..., "score": ...}, ...]
         """
-        results = self(text, labels, threshold, multi_label, examples, prompt)
+        results = self(text, labels, threshold, multi_label, examples, prompt, adapter_id)
         return results[0]
+
+    def adapter_cache_status(self, adapter_id: str | None = None) -> dict:
+        params = {"adapter_id": adapter_id} if adapter_id is not None else None
+        response = requests.get(f"{self.url}/adapter-cache", params=params, timeout=30)
+        response.raise_for_status()
+        return response.json()
+
+    def is_adapter_cached(self, adapter_id: str) -> bool:
+        return bool(self.adapter_cache_status(adapter_id).get("cached"))
 
     def health_check(self) -> bool:
         """Check if the server is healthy.
