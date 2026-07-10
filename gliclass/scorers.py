@@ -169,10 +169,147 @@ class CrossAttnScorer(nn.Module):
         return self.score_mlp(torch.cat([context, label_rep], dim=-1)).squeeze(-1)
 
 
+class DecoderKVScorer(nn.Module):
+    """
+    Scorer for decoder-kv architecture with built-in bidirectional encoder and representation extraction.
+
+    Sequence format: [prompt][examples]text<<SEP>>label1<<LABEL>>label2<<LABEL>>...<<SEP>>
+
+    Flow:
+    1. Takes hidden states from decoder backbone
+    2. Applies bidirectional scorer_encoder (DebertaV2Encoder without embeddings)
+    3. Extracts text repr from last <<SEP>> before labels
+    4. Extracts label repr from each <<LABEL>> token
+    5. Computes scores via MLP (concat text + label)
+    """
+
+    def __init__(self, config, **kwargs):
+        super().__init__()
+        self.config = config
+
+        from transformers import DebertaV2Config
+        from transformers.models.deberta_v2.modeling_deberta_v2 import DebertaV2Encoder
+
+        num_layers = getattr(config, "scorer_encoder_num_layers", 2)
+        num_heads = max(1, config.hidden_size // 64)
+
+        encoder_config = DebertaV2Config(
+            hidden_size=config.hidden_size,
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_heads,
+            intermediate_size=config.hidden_size * 4,
+            relative_attention=True,
+            pos_att_type=["p2c", "c2p"],
+            max_relative_positions=512,
+        )
+        self.scorer_encoder = DebertaV2Encoder(encoder_config)
+
+        self.text_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        self.label_projector = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+
+        mlp_hidden_size = getattr(config, "scorer_mlp_hidden_size", 1024)
+        total_input_size = config.hidden_size * 2
+
+        self.mlp = nn.Sequential(
+            nn.Linear(total_input_size, mlp_hidden_size),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_size, mlp_hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(mlp_hidden_size // 2, 1),
+        )
+
+        self.epsilon = 1e-8
+
+    def _extract_representations(self, hidden_states, input_ids, attention_mask):
+        """
+        Extract text and label representations from hidden states.
+
+        Sequence: text<<SEP>>label1<<LABEL>>label2<<LABEL>><<SEP>>
+        Text repr: LAST <<SEP>> token (after all labels) - sees both text and labels
+        Label repr: each <<LABEL>> token
+        """
+        batch_size, _, hidden_size = hidden_states.shape
+
+        sep_token_id = self.config.sep_token_index
+        label_token_id = self.config.class_token_index
+
+        sep_mask = input_ids == sep_token_id
+        label_mask = input_ids == label_token_id
+
+        sep_positions = torch.where(sep_mask)
+        label_positions = torch.where(label_mask)
+
+        text_repr = torch.zeros(batch_size, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
+
+        for batch_idx in range(batch_size):
+            batch_sep_positions = sep_positions[1][sep_positions[0] == batch_idx]
+            if len(batch_sep_positions) > 0:
+                # Take LAST SEP (after all labels) so text repr sees both text and labels
+                last_sep_pos = batch_sep_positions[-1]
+                text_repr[batch_idx] = hidden_states[batch_idx, last_sep_pos]
+
+        num_labels_per_batch = torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
+        for batch_idx in range(batch_size):
+            num_labels_per_batch[batch_idx] = (label_positions[0] == batch_idx).sum()
+
+        max_labels = num_labels_per_batch.max().item()
+        label_repr = torch.zeros(
+            batch_size,
+            max_labels,
+            hidden_size,
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+
+        for batch_idx in range(batch_size):
+            batch_label_positions = label_positions[1][label_positions[0] == batch_idx]
+            for label_idx, pos in enumerate(batch_label_positions):
+                if label_idx < max_labels:
+                    label_repr[batch_idx, label_idx] = hidden_states[batch_idx, pos]
+
+        return text_repr, label_repr
+
+    def forward(self, hidden_states, input_ids, attention_mask, **kwargs):
+        """Forward pass.
+
+        Args:
+            hidden_states: (batch_size, seq_length, hidden_size) from decoder backbone
+            input_ids: (batch_size, seq_length)
+            attention_mask: (batch_size, seq_length)
+
+        Returns:
+            logits: (batch_size, num_labels)
+        """
+        encoder_outputs = self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True)
+
+        contextualized_hidden_states = encoder_outputs.last_hidden_state
+
+        text_repr, label_repr = self._extract_representations(contextualized_hidden_states, input_ids, attention_mask)
+
+        text_repr = self.text_projector(text_repr)
+        text_repr = self.dropout(text_repr)
+
+        label_repr = self.label_projector(label_repr)
+
+        if self.config.normalize_features:
+            text_repr = text_repr / (text_repr.norm(p=2, dim=-1, keepdim=True) + self.epsilon)
+            label_repr = label_repr / (label_repr.norm(p=2, dim=-1, keepdim=True) + self.epsilon)
+
+        batch_size, num_labels, dim = label_repr.shape
+        text_repr_expanded = text_repr.unsqueeze(1).expand(batch_size, num_labels, dim)
+        combined_rep = torch.cat([text_repr_expanded, label_repr], dim=-1)
+
+        logits = self.mlp(combined_rep).squeeze(-1)
+
+        return logits
+
+
 SCORER2OBJECT = {
     "weighted-dot": ScorerWeightedDot,
     "simple": ScorerDot,
     "mlp": MLPScorer,
     "hopfield": HopfieldScorer,
     "cross-attn": CrossAttnScorer,
+    "decoder-kv": DecoderKVScorer,
 }
