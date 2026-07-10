@@ -760,6 +760,55 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
         return tokenized_inputs
 
 
+class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
+    """Classic (non-streaming) pipeline for decoder-kv architecture.
+
+    Formats input as: [prompt][examples<<SEP>>]text<<SEP>>label1<<LABEL>>...<<SEP>>
+    Runs a single batched forward pass per batch — no KV cache reuse.
+    """
+
+    def prepare_input(self, text: str, labels: list[str], examples=None, prompt: str | None = None) -> str:
+        parts = []
+        if prompt:
+            parts.append(prompt)
+        if examples:
+            parts.append(self._format_examples_for_input(examples))
+        parts.append(text)
+        parts.append(self.sep_token)
+        for label in labels:
+            parts.append(label)
+            parts.append(self.label_token)
+        parts.append(self.sep_token)
+        return "".join(parts)
+
+    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
+        inputs = []
+        if same_labels:
+            for i, text in enumerate(texts):
+                inputs.append(
+                    self.prepare_input(
+                        text,
+                        labels,
+                        self._get_text_examples(examples, i),
+                        self._format_prompt(prompt, i),
+                    )
+                )
+        else:
+            for i, (text, labels_) in enumerate(zip(texts, labels)):
+                inputs.append(
+                    self.prepare_input(
+                        text,
+                        labels_,
+                        self._get_text_examples(examples, i),
+                        self._format_prompt(prompt, i),
+                    )
+                )
+
+        return self.tokenizer(
+            inputs, truncation=True, max_length=self.max_length, padding="longest", return_tensors="pt"
+        ).to(self.device)
+
+
 class ZeroShotClassificationPipeline:
     """
     Main pipeline class for zero-shot classification with GLiClass models.
@@ -878,6 +927,10 @@ class ZeroShotClassificationPipeline:
             )
         elif model.config.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
             self.pipe = BiEncoderZeroShotClassificationPipeline(
+                model, tokenizer, max_classes, max_length, classification_type, device, progress_bar, label_separator
+            )
+        elif model.config.architecture_type == "decoder-kv":
+            self.pipe = DecoderKVZeroShotClassificationPipeline(
                 model, tokenizer, max_classes, max_length, classification_type, device, progress_bar, label_separator
             )
         else:
