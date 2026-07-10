@@ -93,6 +93,28 @@ class StreamingPipeline:
     # Session management
     # ------------------------------------------------------------------
 
+    def delete_session(self, *session_ids: str) -> list[str]:
+        """Delete one or more sessions and free their KV caches.
+
+        Returns the list of session IDs that were actually deleted
+        (unknown IDs are silently ignored).
+        """
+        deleted = []
+        for sid in session_ids:
+            if sid in self._caches:
+                del self._caches[sid]
+                deleted.append(sid)
+        return deleted
+
+    def clear_sessions(self) -> None:
+        """Delete all active sessions and free all KV caches."""
+        self._caches.clear()
+
+    @property
+    def active_sessions(self) -> list[str]:
+        """Return the list of currently active session IDs."""
+        return list(self._caches.keys())
+
     def _cleanup_dead_sessions(self, inputs: list[SessionInput]) -> None:
         active = {inp.session_id for inp in inputs}
         for sid in list(self._caches):
