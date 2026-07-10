@@ -105,12 +105,59 @@ Sessions are identified by a string `session_id`. The pipeline maintains a dict 
 
 **Updating.** On every call, the session's cache is extended with new tokens if `text` is non-empty. Empty text causes the update stage to be skipped for that session (`tokens_added = 0`), which also skips classification regardless of strategy.
 
-**Cleanup.** Sessions that are absent from the current input batch are deleted. The pipeline does not keep stale sessions alive across calls: any `session_id` not present in the current `inputs` list will have its cache freed. If a session should remain alive without receiving new text, pass it with `text=""`.
+**Cleanup.** Sessions that are absent from the current input batch are deleted. The pipeline does not keep stale sessions alive across calls: any `session_id` not present in the current `inputs` list will have its cache freed.
 
-**Manual reset.** Delete the cache entry directly:
+**Manual reset.** Use the explicit API:
 ```python
-del pipeline._caches["my_session"]
+pipeline.delete_session("my_session")          # delete one
+pipeline.delete_session("session_a", "session_b")  # delete several at once
+pipeline.clear_sessions()                      # delete all
+print(pipeline.active_sessions)                # ["session_c", ...]
 ```
+
+---
+
+### Session survival rule
+
+> **A session lives only as long as its `session_id` appears in every `__call__`.**
+
+The cleanup runs at the very beginning of each call, before any processing. Any session absent from the current batch is immediately deleted — its entire KV cache is freed with no warning and no recovery.
+
+This means:
+
+**If you have a long-running session but no new text to add on a given call, you must still include it in the batch with `text=""`:**
+
+```python
+# Session "doc_A" has no new text this tick, but must stay alive
+pipeline([
+    SessionInput("doc_A", "", labels, strategy),   # keeps cache, no update
+    SessionInput("doc_B", new_chunk, labels, strategy),
+])
+```
+
+Passing `text=""` preserves the cache exactly as it is — no tokens are added, no classification is triggered regardless of strategy.
+
+**If you omit a session entirely, its cache is gone:**
+
+```python
+# Round 1 — both sessions created
+pipeline([SessionInput("doc_A", chunk1, ...), SessionInput("doc_B", chunk1, ...)])
+
+# Round 2 — doc_A is absent → its cache is deleted immediately
+pipeline([SessionInput("doc_B", chunk2, ...)])
+
+# Round 3 — doc_A reappears, but starts from scratch (empty cache)
+pipeline([SessionInput("doc_A", chunk2, ...), SessionInput("doc_B", chunk3, ...)])
+```
+
+**Typical patterns:**
+
+| Situation | What to pass |
+|---|---|
+| New text available | `text=chunk` |
+| Session idle (no new text), keep alive | `text=""` |
+| Session finished, free its memory | Omit it from the next call |
+| Explicit reset mid-stream | `pipeline.delete_session("session_id")`, then pass as new |
 
 ---
 
@@ -234,6 +281,31 @@ StreamingPipeline(
 ### `__call__(inputs: list[SessionInput]) -> list[SessionOutput]`
 
 Processes a batch of sessions. Returns one `SessionOutput` per input in the same order. Sessions not present in the current batch have their caches deleted.
+
+### `delete_session(*session_ids: str) -> list[str]`
+
+Explicitly delete one or more sessions and free their KV caches. Returns the list of IDs that were actually deleted; unknown IDs are silently ignored.
+
+```python
+pipeline.delete_session("doc_001")
+pipeline.delete_session("doc_001", "doc_002", "doc_003")
+```
+
+### `clear_sessions() -> None`
+
+Delete all active sessions and free all KV caches at once.
+
+```python
+pipeline.clear_sessions()
+```
+
+### `active_sessions -> list[str]`
+
+Read-only property. Returns the list of currently active session IDs.
+
+```python
+print(pipeline.active_sessions)   # ["doc_001", "doc_002"]
+```
 
 ---
 
