@@ -36,6 +36,10 @@ dependencies = [
 dynamic = ["version"]
 
 [project.optional-dependencies]
+streaming = [
+    "torch>=2.0.0",
+    "transformers>=5.0.0",
+]
 serve = [
     "ray[serve]>=2.0.0",
     "requests>=2.31.0",
