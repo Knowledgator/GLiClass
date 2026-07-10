@@ -294,7 +294,7 @@ class TrainingArguments(transformers.TrainingArguments):
         default=True,
         metadata={
             "help": "Save optimizer/scheduler state in checkpoints. Set False for large models to save disk space."
-        },  # noqa: E501
+        },
     )
 
 
