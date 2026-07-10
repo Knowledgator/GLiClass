@@ -292,6 +292,40 @@ class GLiClassDataset(Dataset):
         tokenized_inputs["input_texts"] = example["text"]
         return tokenized_inputs
 
+    def tokenize_and_prepare_labels_for_decoder_kv(self, example):
+        """
+        Prepare input for decoder-kv architecture.
+
+        Format: [prompt][examples]text<<SEP>>label1<<LABEL>>label2<<LABEL>>...<<SEP>>
+        """
+        if self.shuffle_labels:
+            random.shuffle(example["all_labels"])
+
+        prompt = example.get("prompt", "")
+        examples_text = self.format_examples(example)
+        text = str(example["text"])
+
+        input_parts = []
+        if prompt:
+            input_parts.append(prompt)
+        input_parts.append(examples_text)
+        input_parts.append(text)
+        input_parts.append(self.sep_token)
+
+        for label in example["all_labels"]:
+            input_parts.append(label)
+            input_parts.append(self.label_token)
+        input_parts.append(self.sep_token)
+
+        input_text = "".join(input_parts)
+        label2idx = {label: idx for idx, label in enumerate(example["all_labels"])}
+
+        tokenized_inputs = self.tokenize(input_text)
+        tokenized_inputs["labels"] = self.prepare_labels(example, label2idx, self.problem_type)
+        tokenized_inputs["labels_text"] = example["all_labels"]
+        tokenized_inputs["input_texts"] = example["text"]
+        return tokenized_inputs
+
     def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
         if self.shuffle_labels:
             random.shuffle(example["all_labels"])
@@ -357,6 +391,8 @@ class GLiClassDataset(Dataset):
             model_inputs = self.tokenize_and_prepare_labels_for_encoder_decoder(example)
         elif self.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
             model_inputs = self.tokenize_and_prepare_labels_for_biencoder(example)
+        elif self.architecture_type == "decoder-kv":
+            model_inputs = self.tokenize_and_prepare_labels_for_decoder_kv(example)
         else:
             raise NotImplementedError("This architecture type is not implemented.")
         return model_inputs
