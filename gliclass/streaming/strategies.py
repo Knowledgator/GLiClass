@@ -19,7 +19,7 @@ class ClassificationStrategy(ABC):
     @abstractmethod
     def should_classify(self, tokens_added: int, cached_length: int, text: str) -> bool: ...
 
-    def get_window(self, cache_state: "CacheState") -> "CacheState":
+    def get_window(self, cache_state: CacheState) -> CacheState:
         """Return the cache slice to classify over. Default: full context."""
         return cache_state
 
@@ -76,8 +76,9 @@ class SlidingWindowStrategy(ClassificationStrategy):
     def should_classify(self, tokens_added: int, cached_length: int, text: str) -> bool:
         return tokens_added > 0
 
-    def get_window(self, cache_state: "CacheState") -> "CacheState":
+    def get_window(self, cache_state: CacheState) -> CacheState:
         from .cache import truncate_cache
+
         return truncate_cache(cache_state, self.window_size)
 
 
@@ -96,5 +97,5 @@ class ComposedStrategy(ClassificationStrategy):
     def should_classify(self, tokens_added: int, cached_length: int, text: str) -> bool:
         return self.trigger.should_classify(tokens_added, cached_length, text)
 
-    def get_window(self, cache_state: "CacheState") -> "CacheState":
+    def get_window(self, cache_state: CacheState) -> CacheState:
         return self.window.get_window(cache_state)

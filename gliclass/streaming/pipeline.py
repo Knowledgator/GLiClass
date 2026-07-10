@@ -1,18 +1,18 @@
 """
-StreamingPipeline – batched multi-session streaming classification.
+StreamingPipeline - batched multi-session streaming classification.
 
 Flow per __call__:
   1. Cleanup sessions absent from current batch.
   2. Create CacheState for new session_ids.
-  3. Stage 1 – batch update KV caches with new text (skip empty text).
-  4. Stage 2 – resolve strategies; batch classify sessions that triggered.
+  3. Stage 1 - batch update KV caches with new text (skip empty text).
+  4. Stage 2 - resolve strategies; batch classify sessions that triggered.
 """
 
 from __future__ import annotations
 
 import torch
 
-from .cache import BatchedKVHelper, CacheState, create_empty_cache, truncate_cache
+from .cache import CacheState, BatchedKVHelper, truncate_cache, create_empty_cache
 from .types import SessionInput, SessionOutput
 
 
@@ -107,9 +107,7 @@ class StreamingPipeline:
     def _ensure_sessions(self, inputs: list[SessionInput]) -> None:
         for inp in inputs:
             if inp.session_id not in self._caches:
-                self._caches[inp.session_id] = create_empty_cache(
-                    session_id=inp.session_id, device=self.device
-                )
+                self._caches[inp.session_id] = create_empty_cache(session_id=inp.session_id, device=self.device)
 
     # ------------------------------------------------------------------
     # Stage 1: update KV caches
@@ -130,10 +128,7 @@ class StreamingPipeline:
         active_inputs = [inp for _, inp in to_update]
 
         # Tokenize new text per session
-        tokenized = [
-            self.tokenizer(inp.text, return_tensors="pt", add_special_tokens=False)
-            for inp in active_inputs
-        ]
+        tokenized = [self.tokenizer(inp.text, return_tensors="pt", add_special_tokens=False) for inp in active_inputs]
         new_ids = [t["input_ids"].to(self.device) for t in tokenized]
         new_masks = [t["attention_mask"].to(self.device) for t in tokenized]
 
@@ -156,11 +151,9 @@ class StreamingPipeline:
                     return_dict=True,
                 )
 
-            updated = BatchedKVHelper.unstack_after_update(
-                out.past_key_values, stacked, caches, new_ids, new_masks
-            )
+            updated = BatchedKVHelper.unstack_after_update(out.past_key_values, stacked, caches, new_ids, new_masks)
         else:
-            # All caches empty – simple batched forward without stacking
+            # All caches empty - simple batched forward without stacking
             updated = self._update_from_scratch(caches, new_ids, new_masks)
 
         for session_idx, cache, new_len in zip(
@@ -211,14 +204,16 @@ class StreamingPipeline:
             sliced_kv = BatchedKVHelper._slice_past_kv(out.past_key_values, i, 0, nlen)
             flat_ids = new_ids[i][0] if new_ids[i].dim() == 2 else new_ids[i]
             flat_mask = new_masks[i][0] if new_masks[i].dim() == 2 else new_masks[i]
-            results.append(CacheState(
-                past_key_values=sliced_kv,
-                input_ids=flat_ids[:nlen],
-                attention_mask=flat_mask[:nlen],
-                cached_length=nlen,
-                session_id=cache.session_id,
-                metadata=cache.metadata.copy(),
-            ))
+            results.append(
+                CacheState(
+                    past_key_values=sliced_kv,
+                    input_ids=flat_ids[:nlen],
+                    attention_mask=flat_mask[:nlen],
+                    cached_length=nlen,
+                    session_id=cache.session_id,
+                    metadata=cache.metadata.copy(),
+                )
+            )
 
         return results
 
@@ -226,9 +221,7 @@ class StreamingPipeline:
     # Stage 2: classify triggered sessions
     # ------------------------------------------------------------------
 
-    def _stage_classify(
-        self, inputs: list[SessionInput], tokens_added: list[int]
-    ) -> list[SessionOutput]:
+    def _stage_classify(self, inputs: list[SessionInput], tokens_added: list[int]) -> list[SessionOutput]:
         # Resolve which sessions trigger classification
         triggered_indices = []
         for i, (inp, n_added) in enumerate(zip(inputs, tokens_added)):
@@ -258,23 +251,15 @@ class StreamingPipeline:
         # Prepare label sequences for triggered sessions
         triggered_inputs = [inputs[i] for i in triggered_indices]
         triggered_caches = [
-            inputs[i].strategy.get_window(self._caches[inputs[i].session_id])
-            for i in triggered_indices
+            inputs[i].strategy.get_window(self._caches[inputs[i].session_id]) for i in triggered_indices
         ]
 
-        label_seqs = [
-            self._prepare_label_seq(inp.labels) for inp in triggered_inputs
-        ]
-        tokenized_labels = [
-            self.tokenizer(seq, return_tensors="pt", add_special_tokens=False)
-            for seq in label_seqs
-        ]
+        label_seqs = [self._prepare_label_seq(inp.labels) for inp in triggered_inputs]
+        tokenized_labels = [self.tokenizer(seq, return_tensors="pt", add_special_tokens=False) for seq in label_seqs]
         label_ids = [t["input_ids"].to(self.device) for t in tokenized_labels]
         label_masks = [t["attention_mask"].to(self.device) for t in tokenized_labels]
 
-        stacked = BatchedKVHelper.stack_for_classify(
-            triggered_caches, label_ids, label_masks, self.device
-        )
+        stacked = BatchedKVHelper.stack_for_classify(triggered_caches, label_ids, label_masks, self.device)
 
         decoder = self.model.model.decoder_model
         with torch.no_grad():
@@ -288,8 +273,8 @@ class StreamingPipeline:
             )
 
         # Slice label hidden states and pass to scorer
-        hidden = out.last_hidden_state          # [batch, max_cached + max_label, hidden]
-        max_cached = stacked["past_key_values"] and max(c.cached_length for c in triggered_caches) or 0
+        hidden = out.last_hidden_state  # [batch, max_cached + max_label, hidden]
+        max_cached = max(c.cached_length for c in triggered_caches) if stacked["past_key_values"] else 0  # noqa: F841
         label_lengths = stacked["label_lengths"]
         max_label = stacked["max_label_len"]
 
@@ -297,14 +282,18 @@ class StreamingPipeline:
         # but we need the actual label slice per session
         scorer = self.model.model.scorer
         batch_logits = self._run_scorer_batched(
-            scorer, hidden, stacked["input_ids"], stacked["label_mask"],
-            label_lengths, max_label,
+            scorer,
+            hidden,
+            stacked["input_ids"],
+            stacked["label_mask"],
+            label_lengths,
+            max_label,
         )
 
         for local_idx, global_idx in enumerate(triggered_indices):
             inp = inputs[global_idx]
             cache = self._caches[inp.session_id]
-            logits = batch_logits[local_idx]               # [num_labels]
+            logits = batch_logits[local_idx]  # [num_labels]
             preds = self._decode_predictions(logits, inp.labels, inp.classification_type)
             outputs[global_idx] = SessionOutput(
                 session_id=inp.session_id,
@@ -347,7 +336,7 @@ class StreamingPipeline:
         label_ids / label_mask are already label-only ([batch, max_label]).
         """
         max_cached_in_hidden = hidden.shape[1] - max_label
-        label_hidden = hidden[:, max_cached_in_hidden:, :]   # [batch, max_label, hidden]
+        label_hidden = hidden[:, max_cached_in_hidden:, :]  # [batch, max_label, hidden]
 
         if self.score_on_cpu:
             label_hidden = label_hidden.cpu()
@@ -362,25 +351,21 @@ class StreamingPipeline:
 
         return [logits[i] for i in range(logits.shape[0])]
 
-    def _decode_predictions(
-        self, logits: torch.Tensor, labels: list[str], classification_type: str
-    ) -> list[dict]:
-        logits = logits[:len(labels)]
+    def _decode_predictions(self, logits: torch.Tensor, labels: list[str], classification_type: str) -> list[dict]:
+        logits = logits[: len(labels)]
         if classification_type == "single-label":
             scores = torch.softmax(logits, dim=-1)
             best = int(scores.argmax().item())
             return [{"label": labels[best], "score": float(scores[best].detach())}]
         else:
             probs = torch.sigmoid(logits)
-            return [
-                {"label": label, "score": float(prob.detach())}
-                for label, prob in zip(labels, probs)
-            ]
+            return [{"label": label, "score": float(prob.detach())} for label, prob in zip(labels, probs)]
 
 
-def _move_cache_pinned(cache: "CacheState") -> "CacheState":
+def _move_cache_pinned(cache: CacheState) -> CacheState:
     """Move KV cache to CPU pinned memory for fast async GPU uploads."""
     from transformers.cache_utils import DynamicCache, DynamicLayer
+
     from .cache import CacheState
 
     past_kv = cache.past_key_values
@@ -414,9 +399,10 @@ def _move_cache_pinned(cache: "CacheState") -> "CacheState":
     )
 
 
-def _move_cache_nonblocking(cache: "CacheState", device: torch.device) -> "CacheState":
+def _move_cache_nonblocking(cache: CacheState, device: torch.device) -> CacheState:
     """Move KV cache to device with non_blocking=True (async when src is pinned)."""
     from transformers.cache_utils import DynamicCache
+
     from .cache import CacheState
 
     past_kv = cache.past_key_values

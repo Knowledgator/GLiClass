@@ -8,15 +8,15 @@ Includes:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any
+from dataclasses import field, dataclass
 
 import torch
-
 
 # ---------------------------------------------------------------------------
 # CacheState
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class CacheState:
@@ -28,7 +28,7 @@ class CacheState:
     session_id: str | None = None
     metadata: dict = field(default_factory=dict)
 
-    def to(self, device: torch.device) -> "CacheState":
+    def to(self, device: torch.device) -> CacheState:
         return CacheState(
             past_key_values=_move_past_kv(self.past_key_values, device),
             input_ids=self.input_ids.to(device),
@@ -85,6 +85,7 @@ def _deep_copy_past_kv(past_kv):
     if past_kv is None:
         return None
     from transformers.cache_utils import DynamicCache
+
     if isinstance(past_kv, DynamicCache):
         new = DynamicCache()
         for i, layer in enumerate(past_kv.layers):
@@ -103,19 +104,20 @@ def _crop_past_kv(past_kv, max_length: int):
     if past_kv is None:
         return None
     from transformers.cache_utils import DynamicCache
+
     if isinstance(past_kv, DynamicCache):
         new = DynamicCache()
         for i, layer in enumerate(past_kv.layers):
             if layer.is_initialized:
-                new.update(layer.keys[:, :, -max_length:, :].clone(),
-                           layer.values[:, :, -max_length:, :].clone(), i)
+                new.update(layer.keys[:, :, -max_length:, :].clone(), layer.values[:, :, -max_length:, :].clone(), i)
         return new
     return None
 
 
 # ---------------------------------------------------------------------------
-# BatchedKVHelper  – stack / unstack heterogeneous KV caches
+# BatchedKVHelper  - stack / unstack heterogeneous KV caches
 # ---------------------------------------------------------------------------
+
 
 class BatchedKVHelper:
     """
@@ -132,7 +134,7 @@ class BatchedKVHelper:
     @staticmethod
     def stack_for_update(
         caches: list[CacheState],
-        new_input_ids: list[torch.Tensor],      # one per session, already on device
+        new_input_ids: list[torch.Tensor],  # one per session, already on device
         new_attention_masks: list[torch.Tensor],
         device: torch.device,
     ) -> dict:
@@ -165,7 +167,7 @@ class BatchedKVHelper:
         full_mask = torch.zeros(batch_size, max_cached + max_new, dtype=torch.long, device=device)
         for i, (clen, nlen) in enumerate(zip(cached_lengths, new_lengths)):
             pad = max_cached - clen
-            full_mask[i, pad : pad + clen] = 1          # real cached tokens
+            full_mask[i, pad : pad + clen] = 1  # real cached tokens
             full_mask[i, max_cached : max_cached + nlen] = 1  # real new tokens
 
         # --- stack past_key_values (prepend-pad to max_cached) ---
@@ -224,15 +226,17 @@ class BatchedKVHelper:
                 full_ids = new_ids[:nlen]
                 full_mask = new_mask[:nlen]
 
-            results.append(CacheState(
-                past_key_values=sliced_kv,
-                input_ids=full_ids,
-                attention_mask=full_mask,
-                position_ids=None,
-                cached_length=new_clen,
-                session_id=old.session_id,
-                metadata=old.metadata.copy(),
-            ))
+            results.append(
+                CacheState(
+                    past_key_values=sliced_kv,
+                    input_ids=full_ids,
+                    attention_mask=full_mask,
+                    position_ids=None,
+                    cached_length=new_clen,
+                    session_id=old.session_id,
+                    metadata=old.metadata.copy(),
+                )
+            )
 
         return results
 
@@ -260,9 +264,7 @@ class BatchedKVHelper:
         padded_label_mask = label_ids[0].new_zeros(batch_size, max_label)
         position_ids = label_ids[0].new_zeros(batch_size, max_label)
 
-        for i, (ids, mask, clen, llen) in enumerate(
-            zip(label_ids, label_masks, cached_lengths, label_lengths)
-        ):
+        for i, (ids, mask, clen, llen) in enumerate(zip(label_ids, label_masks, cached_lengths, label_lengths)):
             flat_ids = ids[0] if ids.dim() == 2 else ids
             flat_mask = mask[0] if mask.dim() == 2 else mask
             padded_label_ids[i, :llen] = flat_ids
@@ -281,8 +283,8 @@ class BatchedKVHelper:
 
         return {
             "input_ids": padded_label_ids,
-            "attention_mask": full_mask,          # full: cache + labels (for decoder)
-            "label_mask": padded_label_mask,      # labels only (for scorer)
+            "attention_mask": full_mask,  # full: cache + labels (for decoder)
+            "label_mask": padded_label_mask,  # labels only (for scorer)
             "position_ids": position_ids,
             "past_key_values": stacked_past_kv,
             "label_lengths": label_lengths,
@@ -311,12 +313,11 @@ class BatchedKVHelper:
             for c in caches:
                 kv = c.past_key_values
                 if kv is None or not kv.layers[layer_idx].is_initialized:
-                    k = torch.zeros(1, ref_k.shape[1], max_cached, ref_k.shape[3],
-                                    device=device, dtype=ref_k.dtype)
+                    k = torch.zeros(1, ref_k.shape[1], max_cached, ref_k.shape[3], device=device, dtype=ref_k.dtype)
                     v = torch.zeros_like(k)
                 else:
                     layer = kv.layers[layer_idx]
-                    k = layer.keys.to(device)   # [1, heads, clen, head_dim]
+                    k = layer.keys.to(device)  # [1, heads, clen, head_dim]
                     v = layer.values.to(device)
                     clen = k.shape[2]
                     pad = max_cached - clen
@@ -339,6 +340,7 @@ class BatchedKVHelper:
             return None
 
         from transformers.cache_utils import DynamicCache
+
         sliced = DynamicCache()
         for i, layer in enumerate(past_kv.layers):
             if not layer.is_initialized:

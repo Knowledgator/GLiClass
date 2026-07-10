@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
+from dataclasses import field, dataclass
 
 if TYPE_CHECKING:
     from .strategies import ClassificationStrategy
@@ -12,7 +12,7 @@ class SessionInput:
     session_id: str
     text: str
     labels: list[str]
-    strategy: "ClassificationStrategy"
+    strategy: ClassificationStrategy
     classification_type: str = "multi-label"  # "multi-label" or "single-label"
 
 
