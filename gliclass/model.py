@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 import transformers
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from packaging import version
 from transformers import AutoModel, AutoConfig, PreTrainedModel
 from transformers.utils import logging
@@ -1059,7 +1060,7 @@ class GLiClassDecoderKV(nn.Module):
             padded_ids:    (batch, max_label_len)
             label_mask:    (batch, max_label_len)
         """
-        batch_size, _, hidden_size = hidden_states.shape
+        batch_size = hidden_states.shape[0]
         sep_id = self.sep_token_id
         label_id = self.config.class_token_index
 
@@ -1092,16 +1093,15 @@ class GLiClassDecoderKV(nn.Module):
             slices_h.append(hidden_states[i, start:real_len])
             slices_ids.append(ids_i[start:real_len])
 
-        max_len = max(s.shape[0] for s in slices_h)
-        padded_hidden = hidden_states.new_zeros(batch_size, max_len, hidden_size)
-        padded_ids = input_ids.new_zeros(batch_size, max_len)
-        label_mask = attention_mask.new_zeros(batch_size, max_len)
+        padded_hidden = pad_sequence(slices_h, batch_first=True)
+        padded_ids = pad_sequence(slices_ids, batch_first=True)
 
-        for i, (h, ids) in enumerate(zip(slices_h, slices_ids)):
-            length = h.shape[0]
-            padded_hidden[i, :length] = h
-            padded_ids[i, :length] = ids
-            label_mask[i, :length] = 1
+        section_lengths = torch.tensor(
+            [section.shape[0] for section in slices_h],
+            device=attention_mask.device,
+        )
+        positions = torch.arange(padded_hidden.shape[1], device=attention_mask.device)
+        label_mask = (positions.unsqueeze(0) < section_lengths.unsqueeze(1)).to(attention_mask.dtype)
 
         return padded_hidden, padded_ids, label_mask
 
