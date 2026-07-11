@@ -229,44 +229,34 @@ class DecoderKVScorer(nn.Module):
         Text repr: LAST <<SEP>> token (after all labels) - sees both text and labels
         Label repr: each <<LABEL>> token
         """
-        batch_size, _, hidden_size = hidden_states.shape
+        batch_size, seq_length, hidden_size = hidden_states.shape
 
         sep_token_id = self.config.sep_token_index
         label_token_id = self.config.class_token_index
 
-        sep_mask = input_ids == sep_token_id
-        label_mask = input_ids == label_token_id
+        valid_mask = attention_mask.bool()
+        sep_mask = input_ids.eq(sep_token_id) & valid_mask
+        label_mask = input_ids.eq(label_token_id) & valid_mask
 
-        sep_positions = torch.where(sep_mask)
-        label_positions = torch.where(label_mask)
+        positions = torch.arange(seq_length, device=input_ids.device).expand(batch_size, -1)
+        last_sep_positions = positions.masked_fill(~sep_mask, -1).amax(dim=1)
+        has_sep = last_sep_positions.ge(0)
+        batch_indices = torch.arange(batch_size, device=input_ids.device)
+        text_repr = hidden_states[batch_indices, last_sep_positions.clamp_min(0)]
+        text_repr = text_repr * has_sep.unsqueeze(-1)
 
-        text_repr = torch.zeros(batch_size, hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
-
-        for batch_idx in range(batch_size):
-            batch_sep_positions = sep_positions[1][sep_positions[0] == batch_idx]
-            if len(batch_sep_positions) > 0:
-                # Take LAST SEP (after all labels) so text repr sees both text and labels
-                last_sep_pos = batch_sep_positions[-1]
-                text_repr[batch_idx] = hidden_states[batch_idx, last_sep_pos]
-
-        num_labels_per_batch = torch.zeros(batch_size, dtype=torch.long, device=hidden_states.device)
-        for batch_idx in range(batch_size):
-            num_labels_per_batch[batch_idx] = (label_positions[0] == batch_idx).sum()
-
+        num_labels_per_batch = label_mask.sum(dim=1)
         max_labels = num_labels_per_batch.max().item()
-        label_repr = torch.zeros(
+        label_repr = hidden_states.new_zeros(
             batch_size,
             max_labels,
             hidden_size,
-            device=hidden_states.device,
-            dtype=hidden_states.dtype,
         )
 
-        for batch_idx in range(batch_size):
-            batch_label_positions = label_positions[1][label_positions[0] == batch_idx]
-            for label_idx, pos in enumerate(batch_label_positions):
-                if label_idx < max_labels:
-                    label_repr[batch_idx, label_idx] = hidden_states[batch_idx, pos]
+        label_batch_indices, label_token_indices = label_mask.nonzero(as_tuple=True)
+        label_ranks = label_mask.long().cumsum(dim=1) - 1
+        label_indices = label_ranks[label_batch_indices, label_token_indices]
+        label_repr[label_batch_indices, label_indices] = hidden_states[label_batch_indices, label_token_indices]
 
         return text_repr, label_repr
 
