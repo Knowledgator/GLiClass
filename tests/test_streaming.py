@@ -1,30 +1,33 @@
-"""Tests for gliclass.streaming — strategies, cache management, BatchedKVHelper."""
+"""Tests for streaming strategies, cache management, and classification."""
 
-import pytest
+from types import SimpleNamespace
+
 import torch
+import pytest
+from torch import nn
 from transformers.cache_utils import DynamicCache
 
 from gliclass.streaming.cache import (
     CacheState,
     BatchedKVHelper,
-    create_empty_cache,
     truncate_cache,
+    create_empty_cache,
 )
+from gliclass.streaming.pipeline import StreamingZeroShotClassificationPipeline
 from gliclass.streaming.strategies import (
-    ClassificationStrategy,
-    EveryChunkStrategy,
-    EveryNTokensStrategy,
-    OnDelimiterStrategy,
     NeverStrategy,
-    SlidingWindowStrategy,
     ComposedStrategy,
+    EveryChunkStrategy,
+    OnDelimiterStrategy,
+    EveryNTokensStrategy,
+    SlidingWindowStrategy,
+    ClassificationStrategy,
 )
-from gliclass.streaming.types import SessionInput, SessionOutput
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_dynamic_cache(num_layers: int, num_heads: int, seq_len: int, head_dim: int, batch: int = 1) -> DynamicCache:
     cache = DynamicCache()
@@ -42,12 +45,14 @@ def _make_cache_state(seq_len: int, num_layers: int = 2, num_heads: int = 2, hea
         input_ids=torch.ones(seq_len, dtype=torch.long),
         attention_mask=torch.ones(seq_len, dtype=torch.long),
         cached_length=seq_len,
+        next_position_id=seq_len,
     )
 
 
 # ---------------------------------------------------------------------------
 # Strategy tests
 # ---------------------------------------------------------------------------
+
 
 class TestEveryChunkStrategy:
     def test_triggers_on_any_positive_tokens(self):
@@ -74,7 +79,7 @@ class TestEveryNTokensStrategy:
 
     def test_counter_resets_after_trigger(self):
         s = EveryNTokensStrategy(n=10)
-        s.should_classify(10, 10, "")   # trigger, reset
+        s.should_classify(10, 10, "")  # trigger, reset
         assert s._accumulated == 0
         assert s.should_classify(5, 15, "") is False
 
@@ -204,6 +209,7 @@ class TestCustomStrategy:
 # CacheState tests
 # ---------------------------------------------------------------------------
 
+
 class TestCacheState:
     def test_create_empty_cache(self):
         cache = create_empty_cache(session_id="test")
@@ -229,6 +235,11 @@ class TestCacheState:
         cache.metadata = {"key": "value"}
         moved = cache.to(torch.device("cpu"))
         assert moved.metadata == {"key": "value"}
+
+    def test_next_position_preserved_on_move(self):
+        cache = _make_cache_state(5)
+        cache.next_position_id = 12
+        assert cache.to(torch.device("cpu")).next_position == 12
 
 
 class TestTruncateCache:
@@ -279,10 +290,18 @@ class TestTruncateCache:
         truncated = truncate_cache(cache, max_length=5)
         assert truncated.metadata == {"info": 42}
 
+    def test_truncate_preserves_absolute_next_position(self):
+        cache = _make_cache_state(10)
+        cache.next_position_id = 20
+        truncated = truncate_cache(cache, max_length=4)
+        assert truncated.cached_length == 4
+        assert truncated.next_position == 20
+
 
 # ---------------------------------------------------------------------------
 # BatchedKVHelper tests
 # ---------------------------------------------------------------------------
+
 
 class TestBatchedKVHelperStack:
     @pytest.fixture
@@ -290,8 +309,8 @@ class TestBatchedKVHelperStack:
         return torch.device("cpu")
 
     def _make_inputs(self, lengths, device):
-        ids = [torch.ones(l, dtype=torch.long, device=device) for l in lengths]
-        masks = [torch.ones(l, dtype=torch.long, device=device) for l in lengths]
+        ids = [torch.ones(length, dtype=torch.long, device=device) for length in lengths]
+        masks = [torch.ones(length, dtype=torch.long, device=device) for length in lengths]
         return ids, masks
 
     def test_stack_homogeneous_caches(self, device):
@@ -351,10 +370,8 @@ class TestBatchedKVHelperStack:
 
     def test_padded_new_tokens_are_zero(self, device):
         caches = [_make_cache_state(5), _make_cache_state(5)]
-        ids = [torch.ones(6, dtype=torch.long, device=device),
-               torch.ones(3, dtype=torch.long, device=device)]
-        masks = [torch.ones(6, dtype=torch.long, device=device),
-                 torch.ones(3, dtype=torch.long, device=device)]
+        ids = [torch.ones(6, dtype=torch.long, device=device), torch.ones(3, dtype=torch.long, device=device)]
+        masks = [torch.ones(6, dtype=torch.long, device=device), torch.ones(3, dtype=torch.long, device=device)]
         result = BatchedKVHelper.stack_for_update(caches, ids, masks, device)
 
         # session 1 has 3 tokens, padded to 6 — positions 3,4,5 should be 0
@@ -368,10 +385,8 @@ class TestBatchedKVHelperUnstack:
 
     def test_unstack_restores_cache_lengths(self, device):
         caches = [_make_cache_state(5), _make_cache_state(10)]
-        ids = [torch.ones(3, dtype=torch.long, device=device),
-               torch.ones(3, dtype=torch.long, device=device)]
-        masks = [torch.ones(3, dtype=torch.long, device=device),
-                 torch.ones(3, dtype=torch.long, device=device)]
+        ids = [torch.ones(3, dtype=torch.long, device=device), torch.ones(3, dtype=torch.long, device=device)]
+        masks = [torch.ones(3, dtype=torch.long, device=device), torch.ones(3, dtype=torch.long, device=device)]
 
         stacked = BatchedKVHelper.stack_for_update(caches, ids, masks, device)
 
@@ -392,8 +407,7 @@ class TestBatchedKVHelperUnstack:
         c2.session_id = "bob"
         caches = [c1, c2]
 
-        ids = [torch.ones(2, dtype=torch.long, device=device),
-               torch.ones(2, dtype=torch.long, device=device)]
+        ids = [torch.ones(2, dtype=torch.long, device=device), torch.ones(2, dtype=torch.long, device=device)]
         masks = ids[:]
 
         stacked = BatchedKVHelper.stack_for_update(caches, ids, masks, device)
@@ -419,6 +433,22 @@ class TestBatchedKVHelperUnstack:
 
         assert updated[0].input_ids.tolist() == [1, 2, 3, 4, 5]
 
+    def test_unstack_advances_absolute_position(self, device):
+        cache = _make_cache_state(3)
+        cache.next_position_id = 10
+        ids = [torch.ones(2, dtype=torch.long, device=device)]
+        masks = [torch.ones(2, dtype=torch.long, device=device)]
+        stacked = BatchedKVHelper.stack_for_update([cache], ids, masks, device)
+        new_kv = _make_dynamic_cache(2, 2, 5, 8, batch=1)
+        updated = BatchedKVHelper.unstack_after_update(new_kv, stacked, [cache], ids, masks)
+        assert updated[0].next_position == 12
+
+    def test_sliced_cache_owns_its_storage(self):
+        source = _make_dynamic_cache(1, 2, 8, 4, batch=2)
+        sliced = BatchedKVHelper._slice_past_kv(source, 0, 2, 6)
+        source.layers[0].keys.fill_(123)
+        assert not torch.all(sliced.layers[0].keys == 123)
+
 
 class TestBatchedKVHelperClassify:
     @pytest.fixture
@@ -427,22 +457,19 @@ class TestBatchedKVHelperClassify:
 
     def test_stack_for_classify_shapes(self, device):
         caches = [_make_cache_state(10), _make_cache_state(15)]
-        label_ids = [torch.ones(8, dtype=torch.long, device=device),
-                     torch.ones(6, dtype=torch.long, device=device)]
-        label_masks = [torch.ones(8, dtype=torch.long, device=device),
-                       torch.ones(6, dtype=torch.long, device=device)]
+        label_ids = [torch.ones(8, dtype=torch.long, device=device), torch.ones(6, dtype=torch.long, device=device)]
+        label_masks = [torch.ones(8, dtype=torch.long, device=device), torch.ones(6, dtype=torch.long, device=device)]
 
         result = BatchedKVHelper.stack_for_classify(caches, label_ids, label_masks, device)
 
-        assert result["input_ids"].shape == (2, 8)   # max_label = 8
-        assert result["attention_mask"].shape == (2, 15 + 8)   # max_cached + max_label
+        assert result["input_ids"].shape == (2, 8)  # max_label = 8
+        assert result["attention_mask"].shape == (2, 15 + 8)  # max_cached + max_label
         assert result["label_lengths"] == [8, 6]
         assert result["max_label_len"] == 8
 
     def test_stack_for_classify_position_ids(self, device):
         caches = [_make_cache_state(5), _make_cache_state(12)]
-        label_ids = [torch.ones(4, dtype=torch.long, device=device),
-                     torch.ones(4, dtype=torch.long, device=device)]
+        label_ids = [torch.ones(4, dtype=torch.long, device=device), torch.ones(4, dtype=torch.long, device=device)]
         label_masks = label_ids[:]
 
         result = BatchedKVHelper.stack_for_classify(caches, label_ids, label_masks, device)
@@ -462,41 +489,135 @@ class TestBatchedKVHelperClassify:
         assert result["label_mask"].shape == (1, 5)
 
 
-# ---------------------------------------------------------------------------
-# Data types tests
-# ---------------------------------------------------------------------------
+class _Tokenizer:
+    def __call__(self, text, return_tensors="pt", add_special_tokens=False):
+        del return_tensors, add_special_tokens
+        ids = []
+        cursor = 0
+        special = {"<<SEP>>": 98, "<<LABEL>>": 99, "<<EXAMPLE>>": 97}
+        while cursor < len(text):
+            match = next((token for token in special if text.startswith(token, cursor)), None)
+            if match is not None:
+                ids.append(special[match])
+                cursor += len(match)
+            else:
+                ids.append((ord(text[cursor]) % 90) + 1)
+                cursor += 1
+        tensor = torch.tensor([ids], dtype=torch.long)
+        return {"input_ids": tensor, "attention_mask": torch.ones_like(tensor)}
 
-class TestDataTypes:
-    def test_session_input_defaults(self):
-        from gliclass.streaming.strategies import EveryChunkStrategy
-        inp = SessionInput(
-            session_id="s1",
-            text="hello",
-            labels=["a", "b"],
-            strategy=EveryChunkStrategy(),
-        )
-        assert inp.classification_type == "multi-label"
 
-    def test_session_output_not_triggered(self):
-        out = SessionOutput(
-            session_id="s1",
-            triggered=False,
-            predictions=None,
-            cached_length=10,
-            tokens_added=5,
-        )
-        assert out.predictions is None
-        assert not out.triggered
-        assert out.metadata == {}
+class _StreamingModel:
+    def __init__(self):
+        self.config = SimpleNamespace(architecture_type="decoder-kv", max_labels_alloc="dynamic")
+        self.device = torch.device("cpu")
+        self.model = SimpleNamespace(scorer=nn.Linear(1, 1))
+        self.position_history = []
 
-    def test_session_output_triggered(self):
-        preds = [{"label": "positive", "score": 0.9}]
-        out = SessionOutput(
-            session_id="s1",
-            triggered=True,
-            predictions=preds,
-            cached_length=50,
-            tokens_added=10,
-        )
-        assert out.triggered
-        assert out.predictions[0]["label"] == "positive"
+    def to(self, device):
+        self.device = torch.device(device)
+        return self
+
+    def eval(self):
+        return self
+
+    def update_decoder_cache(self, input_ids, attention_mask, position_ids, past_key_values):
+        del attention_mask
+        self.position_history.append(position_ids.clone())
+        batch, new_length = input_ids.shape
+        old_length = 0 if past_key_values is None else past_key_values.layers[0].keys.shape[2]
+        cache = _make_dynamic_cache(1, 1, old_length + new_length, 2, batch=batch)
+        return SimpleNamespace(past_key_values=cache)
+
+    def classify_from_decoder_cache(
+        self,
+        input_ids,
+        attention_mask,
+        label_mask,
+        position_ids,
+        past_key_values,
+    ):
+        del attention_mask, label_mask, position_ids, past_key_values
+        counts = input_ids.eq(99).sum(dim=1)
+        max_labels = int(counts.max().item())
+        logits = torch.zeros(input_ids.shape[0], max_labels)
+        if max_labels:
+            logits[:, 0] = 2.0
+        return SimpleNamespace(logits=logits)
+
+
+def _make_pipeline(**kwargs):
+    return StreamingZeroShotClassificationPipeline(
+        _StreamingModel(),
+        _Tokenizer(),
+        device="cpu",
+        **kwargs,
+    )
+
+
+class TestStreamingPipeline:
+    def test_new_api_and_automatic_session_cleanup(self):
+        pipeline = _make_pipeline()
+        first = pipeline(["ab", "cd"], ["x", "y"], session_ids=["a", "b"])
+        assert [item["session_id"] for item in first] == ["a", "b"]
+        assert pipeline.active_sessions == ["a", "b"]
+
+        pipeline("ef", ["x", "y"], session_ids="b")
+        assert pipeline.active_sessions == ["b"]
+        assert "a" not in pipeline._session_strategies
+
+    def test_duplicate_session_ids_are_rejected_before_cleanup(self):
+        pipeline = _make_pipeline()
+        pipeline("a", ["x"], session_ids="kept")
+        with pytest.raises(ValueError, match="unique"):
+            pipeline(["b", "c"], ["x"], session_ids=["dup", "dup"])
+        assert pipeline.active_sessions == ["kept"]
+
+    def test_invalid_batch_size_is_rejected_before_cleanup(self):
+        pipeline = _make_pipeline()
+        pipeline("a", ["x"], session_ids="kept")
+        with pytest.raises(ValueError, match="batch_size"):
+            pipeline("b", ["x"], session_ids="new", batch_size=0)
+        assert pipeline.active_sessions == ["kept"]
+
+    def test_multi_label_threshold_matches_regular_pipeline_behavior(self):
+        pipeline = _make_pipeline()
+        output = pipeline("a", ["first", "second"], session_ids="s", threshold=0.6)[0]
+        assert output["triggered"] is True
+        assert [item["label"] for item in output["predictions"]] == ["first"]
+
+    def test_strategy_state_is_independent_per_session(self):
+        pipeline = _make_pipeline(default_strategy=EveryNTokensStrategy(3))
+        first = pipeline(["a", "a"], ["x"], session_ids=["a", "b"])
+        assert [item["triggered"] for item in first] == [False, False]
+        second = pipeline(["aa", "a"], ["x"], session_ids=["a", "b"])
+        assert [item["triggered"] for item in second] == [True, False]
+
+    def test_prompt_is_cached_only_once(self):
+        pipeline = _make_pipeline()
+        first = pipeline("a", ["x"], session_ids="s", prompt="p")[0]
+        second = pipeline("b", ["x"], session_ids="s", prompt="p")[0]
+        assert first["tokens_added"] == 2
+        assert second["tokens_added"] == 1
+        assert second["cached_length"] == 3
+
+    def test_prefix_only_update_does_not_classify(self):
+        pipeline = _make_pipeline()
+        output = pipeline("", ["x"], session_ids="s", prompt="prefix")[0]
+        assert output["tokens_added"] == len("prefix")
+        assert output["triggered"] is False
+
+    def test_truncated_cache_keeps_monotonic_positions(self):
+        pipeline = _make_pipeline(max_cache_len=3)
+        pipeline("abcde", ["x"], session_ids="s")
+        assert pipeline._caches["s"].cached_length == 3
+        assert pipeline._caches["s"].next_position == 5
+        pipeline("fg", ["x"], session_ids="s")
+        assert pipeline.model.position_history[-1][0, :2].tolist() == [5, 6]
+        assert pipeline._caches["s"].next_position == 7
+
+    def test_empty_call_clears_sessions(self):
+        pipeline = _make_pipeline()
+        pipeline("a", ["x"], session_ids="s")
+        assert pipeline([], [], session_ids=[]) == []
+        assert pipeline.active_sessions == []

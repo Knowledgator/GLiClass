@@ -1,15 +1,15 @@
 import os
 import warnings
-from typing import Tuple
+from typing import Any, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
 import torch
 import transformers
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from packaging import version
 from transformers import AutoModel, AutoConfig, PreTrainedModel
+from torch.nn.utils.rnn import pad_sequence
 from transformers.utils import logging
 from transformers.modeling_outputs import SequenceClassifierOutput
 
@@ -61,6 +61,7 @@ if IS_PEFT:
 class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: torch.Tensor | None = None
     class_embeddings: torch.Tensor | None = None
+    past_key_values: Any | None = None
 
 
 class GLiClassPreTrainedModel(PreTrainedModel):
@@ -1105,6 +1106,50 @@ class GLiClassDecoderKV(nn.Module):
 
         return padded_hidden, padded_ids, label_mask
 
+    def update_decoder_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        past_key_values=None,
+    ):
+        """Extend a text-only decoder cache without running the scorer."""
+        return self.decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+
+    def classify_from_decoder_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        label_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values,
+    ) -> GLiClassOutput:
+        """Classify label tokens against a text cache without persisting labels."""
+        decoder_outputs = self.decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=False,
+            return_dict=True,
+        )
+
+        label_hidden = decoder_outputs.last_hidden_state[:, -input_ids.shape[1] :, :]
+        scorer_device = next(self.scorer.parameters()).device
+        logits = self.scorer(
+            hidden_states=label_hidden.to(scorer_device),
+            input_ids=input_ids.to(scorer_device),
+            attention_mask=label_mask.to(scorer_device),
+        )
+        return GLiClassOutput(logits=logits)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1165,6 +1210,7 @@ class GLiClassDecoderKV(nn.Module):
             logits=logits,
             hidden_states=decoder_outputs.hidden_states if hasattr(decoder_outputs, "hidden_states") else None,
             attentions=decoder_outputs.attentions if hasattr(decoder_outputs, "attentions") else None,
+            past_key_values=decoder_outputs.past_key_values if use_cache else None,
         )
 
 
@@ -1281,3 +1327,15 @@ class GLiClassModel(GLiClassPreTrainedModel):
             kwargs.pop("adapter_ids", None)
         outputs = self.model(*args, **kwargs)
         return outputs
+
+    def update_decoder_cache(self, **kwargs):
+        """Extend a decoder-KV text cache."""
+        if self.config.architecture_type != "decoder-kv":
+            raise ValueError("Decoder cache updates require architecture_type='decoder-kv'.")
+        return self.model.update_decoder_cache(**kwargs)
+
+    def classify_from_decoder_cache(self, **kwargs) -> GLiClassOutput:
+        """Classify labels against a decoder-KV text cache."""
+        if self.config.architecture_type != "decoder-kv":
+            raise ValueError("Cached classification requires architecture_type='decoder-kv'.")
+        return self.model.classify_from_decoder_cache(**kwargs)

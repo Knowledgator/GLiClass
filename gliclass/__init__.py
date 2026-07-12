@@ -5,6 +5,7 @@ from .pipeline import (
     BiEncoderZeroShotClassificationPipeline,
     ZeroShotClassificationWithChunkingPipeline,
 )
+from .streaming import StreamingZeroShotClassificationPipeline
 
 __version__ = "0.1.20"
 

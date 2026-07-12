@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
+from .data_processing import format_decoder_kv_sequence
 
 
 def flatten_hierarchical_labels(
@@ -258,6 +259,26 @@ class BaseZeroShotClassificationPipeline(ABC):
             raise ValueError("Length of adapter_ids list must match number of texts.")
         return adapter_ids
 
+    @staticmethod
+    def _postprocess_logits(
+        logits: torch.Tensor,
+        labels: List[str],
+        classification_type: str,
+        threshold: float,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
+        """Convert one row of logits into predictions and a complete score map."""
+        logits = logits[: len(labels)]
+        if classification_type == "single-label":
+            scores = torch.softmax(logits, dim=-1)
+            all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
+            best = int(scores.argmax().item())
+            return [{"label": labels[best], "score": float(scores[best].detach())}], all_scores
+
+        scores = torch.sigmoid(logits)
+        all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
+        predictions = [{"label": label, "score": score} for label, score in all_scores.items() if score >= threshold]
+        return predictions, all_scores
+
     def _process_labels(
         self, labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]]
     ) -> List[str] | List[List[str]]:
@@ -484,7 +505,6 @@ class BaseZeroShotClassificationPipeline(ABC):
                 adapter_ids=batch_adapter_ids,
             )
             logits = model_output.logits
-            probs = torch.sigmoid(logits)
 
             for i in range(len(batch_texts)):
                 global_idx = idx + i
@@ -496,29 +516,15 @@ class BaseZeroShotClassificationPipeline(ABC):
                 else:
                     curr_labels = batch_labels[i]
 
-                if item_classification_type == "single-label":
-                    score = torch.softmax(logits[i][: len(curr_labels)], dim=-1)
-
-                    if return_hierarchical:
-                        all_scores = {curr_labels[j]: score[j].item() for j in range(len(curr_labels))}
-                        all_scores_list.append(all_scores)
-
-                    pred_label = curr_labels[torch.argmax(score).item()]
-                    results.append([{"label": pred_label, "score": score.max().item()}])
-                elif item_classification_type == "multi-label":
-                    text_results = []
-
-                    if return_hierarchical:
-                        all_scores = {curr_labels[j]: probs[i][j].item() for j in range(len(curr_labels))}
-                        all_scores_list.append(all_scores)
-
-                    for j, prob in enumerate(probs[i][: len(curr_labels)]):
-                        score = prob.item()
-                        if score >= item_threshold:
-                            text_results.append({"label": curr_labels[j], "score": score})
-                    results.append(text_results)
-                else:
-                    raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
+                predictions, all_scores = self._postprocess_logits(
+                    logits[i],
+                    curr_labels,
+                    item_classification_type,
+                    item_threshold,
+                )
+                results.append(predictions)
+                if return_hierarchical:
+                    all_scores_list.append(all_scores)
 
         if return_hierarchical:
             hierarchical_results = []
@@ -768,18 +774,15 @@ class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
     """
 
     def prepare_input(self, text: str, labels: list[str], examples=None, prompt: str | None = None) -> str:
-        parts = []
-        if prompt:
-            parts.append(prompt)
-        if examples:
-            parts.append(self._format_examples_for_input(examples))
-        parts.append(text)
-        parts.append(self.sep_token)
-        for label in labels:
-            parts.append(label)
-            parts.append(self.label_token)
-        parts.append(self.sep_token)
-        return "".join(parts)
+        examples_text = self._format_examples_for_input(examples) if examples else ""
+        return format_decoder_kv_sequence(
+            text,
+            labels,
+            prompt=prompt or "",
+            examples=examples_text,
+            label_token=self.label_token,
+            sep_token=self.sep_token,
+        )
 
     def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
         inputs = []

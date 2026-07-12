@@ -1,437 +1,274 @@
-# GLiClass Streaming Classification
+# Streaming classification
 
-`gliclass.streaming` provides incremental, multi-session text classification over a decoder-KV model. Instead of classifying a complete document at once, it processes text in arbitrary chunks, maintains a persistent KV cache per session, and triggers classification only when a pluggable strategy decides it is appropriate.
+`StreamingZeroShotClassificationPipeline` incrementally classifies text with a decoder-KV model. It keeps one text-only KV cache per active session and evaluates label sequences without adding those labels to the persistent cache.
 
----
+## Installation
 
-## Contents
-
-- [Architecture overview](#architecture-overview)
-- [KV cache management](#kv-cache-management)
-- [Session lifecycle](#session-lifecycle)
-- [Classification strategies](#classification-strategies)
-- [StreamingPipeline reference](#streamingpipeline-reference)
-- [Data types](#data-types)
-- [Usage examples](#usage-examples)
-- [Memory and performance considerations](#memory-and-performance-considerations)
-
----
-
-## Architecture overview
-
-GLiClass Decoder-KV separates the model into two components:
-
-- **`decoder_model`** — a causal language model (e.g. Qwen3.5) that encodes text into a sequence of hidden states and accumulates a KV cache.
-- **`scorer`** — a lightweight cross-attention encoder that reads the label hidden states produced by the decoder and outputs per-label logits.
-
-In standard (non-streaming) inference, both components run on the full text each time. In streaming mode, the decoder runs once per chunk to *extend* the KV cache; the scorer runs only when a strategy decides classification should fire. The result is:
-
-```
-chunk_1 → decoder → KV₁
-chunk_2 → decoder (KV₁ as prefix) → KV₂
-chunk_3 → decoder (KV₂ as prefix) → KV₃  ← strategy triggers → scorer → predictions
-chunk_4 → ...
+```bash
+pip install gliclass[streaming]
 ```
 
-Each forward pass of the decoder is O(n_chunk × n_cache) rather than O(n_total²), because the attention over cached tokens is handled by the KV cache mechanism and never recomputed.
-
-### Two-stage per call
-
-Every `StreamingPipeline.__call__` runs two sequential stages over the input batch:
-
-**Stage 1 — cache update.**  
-New text is tokenized per session, then all sessions in the batch are forwarded through `decoder_model` together. The resulting `past_key_values` are sliced per session and stored in `_caches`.
-
-**Stage 2 — classification.**  
-Sessions whose strategy returns `True` from `should_classify` are forwarded again through `decoder_model` with their KV cache as prefix and the label token sequence as input. The decoder's `last_hidden_state` over label positions is then passed to `scorer`, which produces logits. Sigmoid (multi-label) or softmax (single-label) is applied to produce probabilities.
-
-Sessions that did not trigger classification return `triggered=False` with `predictions=None`.
-
----
-
-## KV cache management
-
-### CacheState
-
-`CacheState` is the per-session container that travels through the pipeline:
+## Basic usage
 
 ```python
-@dataclass
-class CacheState:
-    past_key_values: Any          # transformers DynamicCache or None
-    input_ids: torch.Tensor       # flat 1-D tensor of all cached token ids
-    attention_mask: torch.Tensor  # flat 1-D tensor of all cached attention mask values
-    position_ids: torch.Tensor | None
-    cached_length: int            # total number of cached tokens
-    session_id: str | None
-    metadata: dict                # arbitrary user data
+from gliclass.streaming import EveryNTokensStrategy, StreamingZeroShotClassificationPipeline
+
+pipeline = StreamingZeroShotClassificationPipeline(
+    model,
+    tokenizer,
+    device="cuda",
+    max_cache_len=1024,
+    default_strategy=EveryNTokensStrategy(50),
+)
+
+for chunk in text_chunks:
+    output = pipeline(
+        chunk,
+        ["science", "politics", "finance"],
+        session_ids="document-1",
+        threshold=0.5,
+    )[0]
+    if output["triggered"]:
+        print(output["predictions"])
 ```
 
-A fresh empty cache is created via `create_empty_cache(session_id, device)`.
+The call returns one dictionary per input text:
 
-### Batched stacking with heterogeneous cache lengths
-
-When multiple sessions exist in a batch and have different numbers of cached tokens, their KV caches cannot be naively stacked: different sequence lengths mean different position embeddings baked into the K/V tensors.
-
-`BatchedKVHelper` resolves this with **prepend-padding**:
-
-- KV caches shorter than `max_cached_len` are zero-padded on the **left** (prepend), not the right.
-- The attention mask marks these prepended zeros as not-attended, so the model ignores them.
-- `position_ids` for the new tokens in each session are set to `[cached_len_i, ..., cached_len_i + new_len_i)`, so RoPE offsets remain correct regardless of padding.
-
-This means a batch of sessions with cache lengths `[150, 400, 300]` is padded to `max_cached=400`, with sessions 0 and 2 receiving 250 and 100 prepend zeros respectively.
-
-After the forward pass, the updated KV is sliced back per session using the real token range `[max_cached - clen_i : max_cached + new_len_i]`.
-
-### Cache truncation
-
-`truncate_cache(cache_state, max_length)` crops the KV to the **last** `max_length` tokens. Only `DynamicCache` is supported for cropping; other cache formats are returned unchanged. The pipeline applies this automatically after each stage-1 update when `max_cache_len` is set.
-
-Truncation discards the oldest context first. This is a simple sliding-window policy; for more selective eviction (e.g. keeping the first few tokens as a persistent prefix), extend or replace the default behavior by subclassing `StreamingPipeline._enforce_max_cache_len`.
-
-### Device offloading
-
-When running more sessions than fit in GPU memory simultaneously, `offload_to_cpu=True` keeps inactive session caches in CPU RAM and moves them to GPU only for the active sub-batch.
-
-With `use_pinned_memory=True`, KV caches are allocated in CPU pinned (page-locked) memory, enabling asynchronous DMA transfers to the GPU via `non_blocking=True`. A `torch.cuda.synchronize` call before the forward pass ensures transfers are complete before the kernel launches.
-
----
-
-## Session lifecycle
-
-Sessions are identified by a string `session_id`. The pipeline maintains a dict `_caches: dict[str, CacheState]` internally.
-
-**Creation.** A session is created implicitly when a `session_id` appears for the first time in an input batch. `create_empty_cache` is called and stored.
-
-**Updating.** On every call, the session's cache is extended with new tokens if `text` is non-empty. Empty text causes the update stage to be skipped for that session (`tokens_added = 0`), which also skips classification regardless of strategy.
-
-**Cleanup.** Sessions that are absent from the current input batch are deleted. The pipeline does not keep stale sessions alive across calls: any `session_id` not present in the current `inputs` list will have its cache freed.
-
-**Manual reset.** Use the explicit API:
 ```python
-pipeline.delete_session("my_session")          # delete one
-pipeline.delete_session("session_a", "session_b")  # delete several at once
-pipeline.clear_sessions()                      # delete all
-print(pipeline.active_sessions)                # ["session_c", ...]
+{
+    "session_id": "document-1",
+    "triggered": True,
+    "predictions": [{"label": "science", "score": 0.91}],
+    "cached_length": 128,
+    "tokens_added": 17,
+}
 ```
 
----
-
-### Session survival rule
-
-> **A session lives only as long as its `session_id` appears in every `__call__`.**
-
-The cleanup runs at the very beginning of each call, before any processing. Any session absent from the current batch is immediately deleted — its entire KV cache is freed with no warning and no recovery.
-
-This means:
-
-**If you have a long-running session but no new text to add on a given call, you must still include it in the batch with `text=""`:**
+## Batched sessions
 
 ```python
-# Session "doc_A" has no new text this tick, but must stay alive
-pipeline([
-    SessionInput("doc_A", "", labels, strategy),   # keeps cache, no update
-    SessionInput("doc_B", new_chunk, labels, strategy),
-])
-```
-
-Passing `text=""` preserves the cache exactly as it is — no tokens are added, no classification is triggered regardless of strategy.
-
-**If you omit a session entirely, its cache is gone:**
-
-```python
-# Round 1 — both sessions created
-pipeline([SessionInput("doc_A", chunk1, ...), SessionInput("doc_B", chunk1, ...)])
-
-# Round 2 — doc_A is absent → its cache is deleted immediately
-pipeline([SessionInput("doc_B", chunk2, ...)])
-
-# Round 3 — doc_A reappears, but starts from scratch (empty cache)
-pipeline([SessionInput("doc_A", chunk2, ...), SessionInput("doc_B", chunk3, ...)])
-```
-
-**Typical patterns:**
-
-| Situation | What to pass |
-|---|---|
-| New text available | `text=chunk` |
-| Session idle (no new text), keep alive | `text=""` |
-| Session finished, free its memory | Omit it from the next call |
-| Explicit reset mid-stream | `pipeline.delete_session("session_id")`, then pass as new |
-
----
-
-## Classification strategies
-
-Strategies implement `ClassificationStrategy` and control:
-
-1. **`should_classify(tokens_added, cached_length, text) -> bool`** — whether to trigger classification this call.
-2. **`get_window(cache_state) -> CacheState`** — which portion of the cache to classify over (default: full cache).
-
-### Built-in strategies
-
-#### `EveryChunkStrategy`
-
-Classifies on every call that adds at least one token. Use when latency is acceptable and you want the most up-to-date prediction at every step.
-
-```python
-EveryChunkStrategy()
-```
-
-#### `EveryNTokensStrategy`
-
-Accumulates tokens across calls and classifies once every `n` tokens. The counter resets after each trigger. Useful for throttling classification frequency over a fast-arriving stream.
-
-```python
-EveryNTokensStrategy(n=100)
-```
-
-Note: the internal `_accumulated` counter is per-instance. If the same strategy object is shared across sessions, the counter is shared too. Create one instance per session or use `ComposedStrategy` with per-session instantiation.
-
-#### `OnDelimiterStrategy`
-
-Classifies when the incoming text chunk contains a specific string, such as a sentence boundary or a paragraph marker.
-
-```python
-OnDelimiterStrategy(delimiter="\n\n")   # paragraph boundary
-OnDelimiterStrategy(delimiter=". ")    # sentence boundary (approximate)
-```
-
-The delimiter check is a plain substring search on the raw text string, not on tokens.
-
-#### `NeverStrategy`
-
-Never triggers classification. Use this for a pre-filling phase where you want to build up a long context cache before any classification runs.
-
-```python
-NeverStrategy()
-```
-
-Switch to a different strategy object after pre-filling is complete.
-
-#### `SlidingWindowStrategy`
-
-Classifies on every chunk (same trigger condition as `EveryChunkStrategy`), but passes only the last `window_size` cached tokens to the scorer via `get_window`. This limits the attention span of the classification pass without discarding the full KV cache.
-
-```python
-SlidingWindowStrategy(window_size=512)
-```
-
-Note that this does not truncate the stored KV cache — the full cache is retained for future updates. Only the classification forward sees the windowed slice.
-
-#### `ComposedStrategy`
-
-Combines a **trigger strategy** (controls `should_classify`) with a **window strategy** (controls `get_window`). This is the standard way to pair a frequency policy with a context window policy.
-
-```python
-ComposedStrategy(
-    trigger=EveryNTokensStrategy(200),
-    window=SlidingWindowStrategy(512),
+outputs = pipeline(
+    texts=[chunk_a, chunk_b],
+    labels=["positive", "negative"],
+    session_ids=["session-a", "session-b"],
+    strategies=[strategy_a, strategy_b],
+    batch_size=8,
 )
 ```
 
-Classifies every 200 new tokens, but uses only the last 512 cached tokens for scoring.
+`texts`, `session_ids`, and a per-session `strategies` list must have matching lengths. Labels may be shared, specified per input, or provided as a hierarchical dictionary like the regular zero-shot pipeline. A single strategy is copied independently for every new session; a strategy list assigns one strategy to each new session.
 
-### Custom strategies
+Session IDs must be unique within a call.
 
-Subclass `ClassificationStrategy` and implement `should_classify`. Optionally override `get_window` for windowed classification.
+## Session lifecycle
+
+The session IDs in each top-level call are the complete active set. A cached session is deleted automatically when it is absent from the next call.
 
 ```python
-class SentenceCountStrategy(ClassificationStrategy):
-    def __init__(self, every_n_sentences: int):
-        self.n = every_n_sentences
-        self._count = 0
+pipeline([chunk_a, chunk_b], labels, session_ids=["a", "b"])
+pipeline([next_b, chunk_c], labels, session_ids=["b", "c"])
 
-    def should_classify(self, tokens_added, cached_length, text):
-        self._count += text.count(". ")
-        if self._count >= self.n:
-            self._count = 0
-            return True
-        return False
+# Session "a" has been deleted; "b" was extended; "c" was created.
+assert pipeline.active_sessions == ["b", "c"]
 ```
 
----
+Cleanup is performed once for the complete call, before internal `batch_size` splitting. Therefore, sessions are not accidentally removed merely because they belong to different internal sub-batches.
 
-## StreamingPipeline reference
+To retain a session without adding text, include it with an empty string:
 
 ```python
-StreamingPipeline(
+pipeline(
+    texts=["", next_chunk_b],
+    labels=labels,
+    session_ids=["a", "b"],
+)
+```
+
+Session `a` remains active, reports `tokens_added=0`, and is not classified. Omitting `a` would delete it.
+
+Manual lifecycle methods are also available:
+
+```python
+pipeline.delete_session("b")
+pipeline.clear_sessions()
+print(pipeline.active_sessions)
+```
+
+Calling the pipeline with empty `texts` and `session_ids` clears all sessions:
+
+```python
+pipeline([], [], session_ids=[])
+```
+
+## Prompt and examples
+
+Prompt and few-shot examples become a one-time prefix when a session is created:
+
+```python
+pipeline(
+    first_chunk,
+    labels,
+    session_ids="document-1",
+    prompt="Classify this document: ",
+    examples=examples,
+)
+```
+
+The prefix is not appended again on later calls. Repeating the same prompt/examples is allowed. Once a session contains cached tokens, changing its prompt or examples raises an error; delete the session first when a different prefix is required.
+
+If a new session has an empty text but a non-empty prompt or examples, the prefix is still cached and counted in `tokens_added`. Prefix-only updates never trigger classification.
+
+## Classification strategies
+
+Available strategies:
+
+- `EveryChunkStrategy`: classify every non-empty update.
+- `EveryNTokensStrategy(n)`: classify after accumulating `n` tokens.
+- `OnDelimiterStrategy(delimiter)`: classify when the incoming text contains the delimiter.
+- `NeverStrategy`: update the cache without classifying.
+- `SlidingWindowStrategy(window_size)`: classify every chunk using only the newest cached tokens.
+- `ComposedStrategy(trigger, window)`: combine a trigger with a classification window.
+
+Each session owns an independent copy of its strategy. Stateful counters are never shared across sessions, even when one strategy is supplied as the pipeline default. `default_strategy=None` selects `EveryChunkStrategy`.
+
+The `strategies` call argument initializes new sessions. Passing another strategy for an already-active session does not reset its state. Replace an active strategy explicitly with:
+
+```python
+pipeline.set_session_strategy("document-1", EveryChunkStrategy())
+```
+
+## Two-stage execution
+
+Each call has two stages:
+
+1. New text is passed to `model.update_decoder_cache(...)` with `use_cache=True`. The resulting text-only cache replaces the cache for that session.
+2. Triggered sessions pass `<<SEP>>label<<LABEL>>...<<SEP>>` to `model.classify_from_decoder_cache(...)`. This stage uses the text cache as context but does not save label KV tensors.
+
+Existing sessions with empty text receive `tokens_added=0` and are not classified. A new prefix-only session may add prompt/example tokens, but it is also not classified until a non-empty text chunk arrives.
+
+## Heterogeneous batching
+
+Sessions may have different cache lengths. Before a decoder call, shorter caches are padded on the left to the longest cache in the batch. The attention mask hides padding, and explicit position IDs preserve each session's logical positions. After updating, the batched KV tensors are copied back into independent per-session caches.
+
+## Cache truncation
+
+Set `max_cache_len` to retain only the newest KV entries:
+
+```python
+pipeline = StreamingZeroShotClassificationPipeline(
     model,
     tokenizer,
-    device="cpu",
+    max_cache_len=512,
+)
+```
+
+The physical cache length is capped, while the next absolute position ID continues increasing. This avoids reusing RoPE positions after truncation. Cropping currently requires the Transformers `DynamicCache` format used by supported decoder-KV models.
+
+## CPU offload
+
+```python
+pipeline = StreamingZeroShotClassificationPipeline(
+    model,
+    tokenizer,
+    device="cuda",
+    offload_to_cpu=True,
+    use_pinned_memory=True,
+    score_on_cpu=True,
+)
+```
+
+With CPU offload enabled, caches are loaded for the active internal batch and moved back to CPU afterward. Pinned memory enables non-blocking GPU transfers when CUDA is used.
+
+## Constructor
+
+```python
+StreamingZeroShotClassificationPipeline(
+    model,
+    tokenizer,
+    max_classes=25,
+    max_length=1024,
+    classification_type="multi-label",
+    device="cuda:0",
+    progress_bar=False,
+    label_separator=".",
     max_cache_len=None,
-    batch_size=None,
+    default_batch_size=8,
+    default_strategy=None,
     offload_to_cpu=False,
     use_pinned_memory=False,
     score_on_cpu=False,
 )
 ```
 
-| Parameter | Type | Description |
-|---|---|---|
-| `model` | `GLiClassModel` | Loaded GLiClass decoder-KV model in eval mode. |
-| `tokenizer` | `PreTrainedTokenizer` | Matching tokenizer with `<<LABEL>>`, `<<SEP>>`, `<<EXAMPLE>>` special tokens. |
-| `device` | `str \| torch.device` | Device for decoder forward passes. |
-| `max_cache_len` | `int \| None` | Hard cap on cached tokens per session. Oldest tokens are dropped when exceeded. `None` means unbounded. |
-| `batch_size` | `int \| None` | Maximum sessions per decoder forward. When `len(inputs) > batch_size`, sessions are chunked. With `offload_to_cpu=True`, only the active chunk is on GPU at once. |
-| `offload_to_cpu` | `bool` | Move inactive session caches to CPU RAM between sub-batches. |
-| `use_pinned_memory` | `bool` | Allocate CPU caches in pinned memory for async GPU uploads. Only effective when `offload_to_cpu=True` and `device` is CUDA. |
-| `score_on_cpu` | `bool` | Run the scorer on CPU. Useful when GPU VRAM is the bottleneck and the scorer is small relative to the decoder. |
+The model must use `architecture_type="decoder-kv"`.
 
-### `__call__(inputs: list[SessionInput]) -> list[SessionOutput]`
+| Parameter | Behavior |
+|---|---|
+| `model` | A loaded GLiClass decoder-KV model. The pipeline moves it to `device` and enables evaluation mode. |
+| `tokenizer` | Matching tokenizer instance or pretrained tokenizer name. |
+| `max_classes` | Inherited compatibility setting; decoder-KV streaming does not currently split labels using it. |
+| `max_length` | Inherited pipeline configuration value. Streaming cache length is controlled separately by `max_cache_len`. |
+| `classification_type` | Default `"multi-label"` or `"single-label"` behavior. |
+| `device` | Decoder execution device. Falls back to CPU when CUDA is requested but unavailable. |
+| `progress_bar` | Inherited pipeline option; streaming calls do not display a progress bar. |
+| `label_separator` | Separator used to flatten and rebuild hierarchical labels. |
+| `max_cache_len` | Maximum physically retained tokens per session; `None` is unbounded. Must be positive when provided. |
+| `default_batch_size` | Internal session batch size when `batch_size` is omitted from a call. Must be positive. |
+| `default_strategy` | Strategy copied into each new session; `None` means `EveryChunkStrategy`. |
+| `offload_to_cpu` | Move each processed internal batch's caches back to CPU. |
+| `use_pinned_memory` | Use pinned CPU cache memory for CUDA transfers; effective only with CUDA offload. |
+| `score_on_cpu` | Move the decoder-KV scorer and its inputs to CPU. |
 
-Processes a batch of sessions. Returns one `SessionOutput` per input in the same order. Sessions not present in the current batch have their caches deleted.
-
-### `delete_session(*session_ids: str) -> list[str]`
-
-Explicitly delete one or more sessions and free their KV caches. Returns the list of IDs that were actually deleted; unknown IDs are silently ignored.
-
-```python
-pipeline.delete_session("doc_001")
-pipeline.delete_session("doc_001", "doc_002", "doc_003")
-```
-
-### `clear_sessions() -> None`
-
-Delete all active sessions and free all KV caches at once.
+## Call interface
 
 ```python
-pipeline.clear_sessions()
-```
-
-### `active_sessions -> list[str]`
-
-Read-only property. Returns the list of currently active session IDs.
-
-```python
-print(pipeline.active_sessions)   # ["doc_001", "doc_002"]
-```
-
----
-
-## Data types
-
-### `SessionInput`
-
-```python
-@dataclass
-class SessionInput:
-    session_id: str                    # unique identifier for this session
-    text: str                          # new text chunk to append (empty = no update)
-    labels: list[str]                  # candidate label strings
-    strategy: ClassificationStrategy   # per-session strategy instance
-    classification_type: str           # "multi-label" (sigmoid) or "single-label" (softmax)
-```
-
-### `SessionOutput`
-
-```python
-@dataclass
-class SessionOutput:
-    session_id: str
-    triggered: bool                    # True if classification ran this call
-    predictions: list[dict] | None     # [{"label": str, "score": float}, ...] or None
-    cached_length: int                 # total cached tokens after this call
-    tokens_added: int                  # tokens added in stage 1 (0 if text was empty)
-    metadata: dict                     # pass-through from CacheState.metadata
-```
-
-For `multi-label`, `predictions` contains one entry per label with a sigmoid probability. For `single-label`, it contains only the top-1 label with its softmax probability.
-
----
-
-## Usage examples
-
-### Minimal single-session loop
-
-```python
-import torch
-from transformers import AutoTokenizer
-from gliclass import GLiClassModel
-from gliclass.streaming import StreamingPipeline, SessionInput, EveryNTokensStrategy
-
-tokenizer = AutoTokenizer.from_pretrained("path/to/model")
-model = GLiClassModel.from_pretrained("path/to/model")
-model = model.to("cuda", dtype=torch.bfloat16).eval()
-
-pipeline = StreamingPipeline(model, tokenizer, device="cuda", max_cache_len=1024)
-
-labels = ["science", "politics", "finance", "sports"]
-strategy = EveryNTokensStrategy(n=50)
-
-chunks = ["The Fed raised interest rates", " by 25 basis points", " amid inflation concerns."]
-
-for chunk in chunks:
-    outputs = pipeline([
-        SessionInput(
-            session_id="doc_001",
-            text=chunk,
-            labels=labels,
-            strategy=strategy,
-            classification_type="multi-label",
-        )
-    ])
-    out = outputs[0]
-    print(f"cached={out.cached_length} +{out.tokens_added} triggered={out.triggered}")
-    if out.triggered:
-        for p in sorted(out.predictions, key=lambda x: -x["score"]):
-            print(f"  {p['label']}: {p['score']:.3f}")
-```
-
-### Multiple concurrent sessions
-
-```python
-session_strategies = {
-    "session_A": EveryNTokensStrategy(n=100),
-    "session_B": OnDelimiterStrategy(delimiter="\n"),
-    "session_C": ComposedStrategy(
-        trigger=EveryNTokensStrategy(50),
-        window=SlidingWindowStrategy(256),
-    ),
-}
-
-batch = [
-    SessionInput("session_A", chunk_a, labels, session_strategies["session_A"]),
-    SessionInput("session_B", chunk_b, labels, session_strategies["session_B"]),
-    SessionInput("session_C", chunk_c, labels, session_strategies["session_C"]),
-]
-
-outputs = pipeline(batch)
-```
-
-All three sessions are updated and classified (if triggered) in a single batched forward pass per stage.
-
-### Pre-filling a long context before classification
-
-```python
-from gliclass.streaming import NeverStrategy, EveryChunkStrategy
-
-# Phase 1: ingest background context without any classification overhead
-for paragraph in background_paragraphs:
-    pipeline([SessionInput("doc", paragraph, labels, NeverStrategy())])
-
-# Phase 2: stream the main document and classify on every chunk
-for chunk in main_document_chunks:
-    outputs = pipeline([SessionInput("doc", chunk, labels, EveryChunkStrategy())])
-    if outputs[0].triggered:
-        handle(outputs[0].predictions)
-```
-
-### Memory-constrained deployment with CPU offload
-
-```python
-pipeline = StreamingPipeline(
-    model=model,
-    tokenizer=tokenizer,
-    device="cuda",
-    max_cache_len=512,
-    batch_size=8,           # process 8 sessions per GPU forward
-    offload_to_cpu=True,    # keep inactive caches in RAM
-    use_pinned_memory=True, # async DMA transfers
-    score_on_cpu=True,      # scorer stays in CPU RAM
+pipeline(
+    texts,
+    labels,
+    *,
+    session_ids,
+    threshold=0.5,
+    batch_size=None,
+    classification_type=None,
+    strategies=None,
+    examples=None,
+    prompt=None,
+    return_hierarchical=False,
 )
 ```
 
-With 32 concurrent sessions and `batch_size=8`, the GPU holds at most 8 KV caches at a time. Inactive caches are evicted to CPU pinned memory and uploaded asynchronously before their sub-batch runs.
+Multi-label predictions are filtered by `threshold`. Single-label classification applies softmax and returns the highest-scoring label. `return_hierarchical=True` reconstructs the same hierarchical output format as the regular zero-shot pipeline.
 
----
+| Argument | Accepted values |
+|---|---|
+| `texts` | One chunk string or a list of chunk strings. |
+| `labels` | Shared label list, per-text label lists, one hierarchical dictionary, or per-text hierarchical dictionaries. At least one label is required whenever the call contains sessions, including sessions with empty chunks. |
+| `session_ids` | One non-empty ID or a list matching `texts`. IDs must be unique within the call. |
+| `threshold` | One multi-label threshold or a list matching `texts`. |
+| `batch_size` | Positive internal batch size override; `None` uses `default_batch_size`. |
+| `classification_type` | Default, one supported mode, or one mode per text. Aliases such as `"single"` and `"multi_label"` are normalized. |
+| `strategies` | Default, one strategy copied for new sessions, or one strategy per input. Use `set_session_strategy()` for active sessions. |
+| `examples` | Shared examples or one examples list per input. Applied once when a session cache is empty. |
+| `prompt` | Shared prompt or one prompt per input. Applied once when a session cache is empty. |
+| `return_hierarchical` | Rebuild prediction scores into the supplied hierarchical label structure. |
+
+## Return values
+
+The pipeline always returns a list in input order. Each item contains:
+
+| Field | Meaning |
+|---|---|
+| `session_id` | Session associated with this result. |
+| `triggered` | Whether classification ran in this call. |
+| `predictions` | Flat prediction list, hierarchical score dictionary, or `None` when not triggered. |
+| `cached_length` | Physical text-cache length after update and optional truncation. |
+| `tokens_added` | Number of context tokens added in this call, including a new session's one-time prefix. |
+
+For multi-label classification, a triggered call may legitimately return an empty prediction list when every score is below `threshold`.
+
+## Session methods
+
+- `active_sessions` returns active IDs in insertion order.
+- `delete_session(*session_ids)` removes cache and strategy state and returns the IDs that actually existed.
+- `clear_sessions()` removes all cache and strategy state.
+- `set_session_strategy(session_id, strategy)` deep-copies a new strategy into an active session and raises `KeyError` for an unknown ID.

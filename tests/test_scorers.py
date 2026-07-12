@@ -1,5 +1,7 @@
 """Tests for gliclass.scorers module."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -9,6 +11,7 @@ from gliclass.scorers import (
     MLPScorer,
     HopfieldScorer,
     CrossAttnScorer,
+    DecoderKVScorer,
 )
 
 
@@ -189,3 +192,56 @@ class TestCrossAttnScorer:
 
         assert scores.shape == (4, 10)
         assert not torch.isnan(scores).any()
+
+
+class TestDecoderKVScorerRepresentationExtraction:
+    @pytest.fixture
+    def scorer(self):
+        scorer = DecoderKVScorer.__new__(DecoderKVScorer)
+        torch.nn.Module.__init__(scorer)
+        scorer.config = SimpleNamespace(sep_token_index=98, class_token_index=99)
+        return scorer
+
+    def test_extracts_last_sep_and_labels_with_padding(self, scorer):
+        hidden_states = torch.arange(2 * 8 * 3, dtype=torch.float32).reshape(2, 8, 3)
+        input_ids = torch.tensor(
+            [
+                [98, 4, 99, 5, 99, 98, 0, 0],
+                [98, 6, 99, 98, 0, 99, 98, 0],
+            ]
+        )
+        attention_mask = torch.tensor(
+            [
+                [1, 1, 1, 1, 1, 1, 0, 0],
+                [1, 1, 1, 1, 0, 0, 0, 0],
+            ]
+        )
+
+        text_repr, label_repr = scorer._extract_representations(hidden_states, input_ids, attention_mask)
+
+        torch.testing.assert_close(text_repr, torch.stack([hidden_states[0, 5], hidden_states[1, 3]]))
+        torch.testing.assert_close(label_repr[0], torch.stack([hidden_states[0, 2], hidden_states[0, 4]]))
+        torch.testing.assert_close(label_repr[1, 0], hidden_states[1, 2])
+        torch.testing.assert_close(label_repr[1, 1], torch.zeros(3))
+
+    def test_missing_sep_returns_zero_representation(self, scorer):
+        hidden_states = torch.randn(1, 4, 3)
+        input_ids = torch.tensor([[1, 99, 2, 0]])
+        attention_mask = torch.tensor([[1, 1, 1, 0]])
+
+        text_repr, label_repr = scorer._extract_representations(hidden_states, input_ids, attention_mask)
+
+        torch.testing.assert_close(text_repr, torch.zeros_like(text_repr))
+        torch.testing.assert_close(label_repr[0, 0], hidden_states[0, 1])
+
+    def test_extracted_representations_preserve_gradients(self, scorer):
+        hidden_states = torch.randn(1, 5, 3, requires_grad=True)
+        input_ids = torch.tensor([[98, 1, 99, 2, 98]])
+        attention_mask = torch.ones_like(input_ids)
+
+        text_repr, label_repr = scorer._extract_representations(hidden_states, input_ids, attention_mask)
+        (text_repr.sum() + label_repr.sum()).backward()
+
+        assert hidden_states.grad is not None
+        torch.testing.assert_close(hidden_states.grad[0, 2], torch.ones(3))
+        torch.testing.assert_close(hidden_states.grad[0, 4], torch.ones(3))

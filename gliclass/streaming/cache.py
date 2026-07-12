@@ -25,8 +25,14 @@ class CacheState:
     attention_mask: torch.Tensor
     position_ids: torch.Tensor | None = None
     cached_length: int = 0
+    next_position_id: int | None = None
     session_id: str | None = None
     metadata: dict = field(default_factory=dict)
+
+    @property
+    def next_position(self) -> int:
+        """Return the absolute position for the next appended token."""
+        return self.cached_length if self.next_position_id is None else self.next_position_id
 
     def to(self, device: torch.device) -> CacheState:
         return CacheState(
@@ -35,6 +41,7 @@ class CacheState:
             attention_mask=self.attention_mask.to(device),
             position_ids=self.position_ids.to(device) if self.position_ids is not None else None,
             cached_length=self.cached_length,
+            next_position_id=self.next_position_id,
             session_id=self.session_id,
             metadata=self.metadata.copy(),
         )
@@ -59,6 +66,7 @@ def create_empty_cache(session_id: str | None = None, device=None) -> CacheState
         attention_mask=torch.empty(0, dtype=torch.long, **kw),
         position_ids=None,
         cached_length=0,
+        next_position_id=0,
         session_id=session_id,
         metadata={},
     )
@@ -76,6 +84,7 @@ def truncate_cache(cache_state: CacheState, max_length: int) -> CacheState:
         attention_mask=cache_state.attention_mask[-max_length:],
         position_ids=cache_state.position_ids[-max_length:] if cache_state.position_ids is not None else None,
         cached_length=max_length,
+        next_position_id=cache_state.next_position,
         session_id=cache_state.session_id,
         metadata=cache_state.metadata.copy(),
     )
@@ -156,12 +165,13 @@ class BatchedKVHelper:
         padded_new_mask = new_input_ids[0].new_zeros(batch_size, max_new)
         position_ids = new_input_ids[0].new_zeros(batch_size, max_new)
 
-        for i, (ids, mask, clen, nlen) in enumerate(
+        for i, (ids, mask, _clen, nlen) in enumerate(
             zip(new_input_ids, new_attention_masks, cached_lengths, new_lengths)
         ):
             padded_ids[i, :nlen] = ids[0] if ids.dim() == 2 else ids
             padded_new_mask[i, :nlen] = mask[0] if mask.dim() == 2 else mask
-            position_ids[i, :nlen] = torch.arange(clen, clen + nlen, device=device)
+            next_position = caches[i].next_position
+            position_ids[i, :nlen] = torch.arange(next_position, next_position + nlen, device=device)
 
         # --- build full attention mask: [prepend_zeros | cached | new | new_pad] ---
         full_mask = torch.zeros(batch_size, max_cached + max_new, dtype=torch.long, device=device)
@@ -233,6 +243,7 @@ class BatchedKVHelper:
                     attention_mask=full_mask,
                     position_ids=None,
                     cached_length=new_clen,
+                    next_position_id=old.next_position + nlen,
                     session_id=old.session_id,
                     metadata=old.metadata.copy(),
                 )
@@ -264,12 +275,13 @@ class BatchedKVHelper:
         padded_label_mask = label_ids[0].new_zeros(batch_size, max_label)
         position_ids = label_ids[0].new_zeros(batch_size, max_label)
 
-        for i, (ids, mask, clen, llen) in enumerate(zip(label_ids, label_masks, cached_lengths, label_lengths)):
+        for i, (ids, mask, _clen, llen) in enumerate(zip(label_ids, label_masks, cached_lengths, label_lengths)):
             flat_ids = ids[0] if ids.dim() == 2 else ids
             flat_mask = mask[0] if mask.dim() == 2 else mask
             padded_label_ids[i, :llen] = flat_ids
             padded_label_mask[i, :llen] = flat_mask
-            position_ids[i, :llen] = torch.arange(clen, clen + llen, device=device)
+            next_position = caches[i].next_position
+            position_ids[i, :llen] = torch.arange(next_position, next_position + llen, device=device)
 
         full_mask = torch.zeros(batch_size, max_cached + max_label, dtype=torch.long, device=device)
         for i, (clen, llen) in enumerate(zip(cached_lengths, label_lengths)):
@@ -346,8 +358,8 @@ class BatchedKVHelper:
             if not layer.is_initialized:
                 continue
             sliced.update(
-                layer.keys[batch_idx : batch_idx + 1, :, start:end, :],
-                layer.values[batch_idx : batch_idx + 1, :, start:end, :],
+                layer.keys[batch_idx : batch_idx + 1, :, start:end, :].clone(),
+                layer.values[batch_idx : batch_idx + 1, :, start:end, :].clone(),
                 i,
             )
         return sliced

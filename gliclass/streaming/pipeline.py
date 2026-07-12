@@ -1,190 +1,307 @@
-"""
-StreamingPipeline - batched multi-session streaming classification.
-
-Flow per __call__:
-  1. Cleanup sessions absent from current batch.
-  2. Create CacheState for new session_ids.
-  3. Stage 1 - batch update KV caches with new text (skip empty text).
-  4. Stage 2 - resolve strategies; batch classify sessions that triggered.
-"""
+"""Stateful, batched streaming classification for decoder-KV models."""
 
 from __future__ import annotations
+
+import copy
+from typing import Any
 
 import torch
 
 from .cache import CacheState, BatchedKVHelper, truncate_cache, create_empty_cache
-from .types import SessionInput, SessionOutput
+from ..pipeline import DecoderKVZeroShotClassificationPipeline, build_hierarchical_output
+from .strategies import EveryChunkStrategy, ClassificationStrategy
+from ..data_processing import format_decoder_kv_labels, format_decoder_kv_context
 
 
-class StreamingPipeline:
+class StreamingZeroShotClassificationPipeline(DecoderKVZeroShotClassificationPipeline):
+    """Incrementally classify multiple decoder-KV sessions with persistent KV caches."""
+
     def __init__(
         self,
         model,
         tokenizer,
-        device: str | torch.device = "cpu",
+        max_classes: int = 25,
+        max_length: int = 1024,
+        classification_type: str = "multi-label",
+        device: str | torch.device = "cuda:0",
+        progress_bar: bool = False,
+        label_separator: str = ".",
         max_cache_len: int | None = None,
-        batch_size: int | None = None,
+        default_batch_size: int = 8,
+        default_strategy: ClassificationStrategy | None = None,
         offload_to_cpu: bool = False,
         use_pinned_memory: bool = False,
         score_on_cpu: bool = False,
     ):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.device = torch.device(device) if isinstance(device, str) else device
+        if model.config.architecture_type != "decoder-kv":
+            raise ValueError("Streaming classification requires architecture_type='decoder-kv'.")
+
+        super().__init__(
+            model,
+            tokenizer,
+            max_classes=max_classes,
+            max_length=max_length,
+            classification_type=classification_type,
+            device=device,
+            progress_bar=progress_bar,
+            label_separator=label_separator,
+        )
+        if default_batch_size <= 0:
+            raise ValueError("default_batch_size must be greater than zero.")
+        if max_cache_len is not None and max_cache_len <= 0:
+            raise ValueError("max_cache_len must be greater than zero when provided.")
+        if default_strategy is not None and not isinstance(default_strategy, ClassificationStrategy):
+            raise TypeError("default_strategy must implement ClassificationStrategy.")
+
         self.max_cache_len = max_cache_len
-        self.batch_size = batch_size
+        self.default_batch_size = default_batch_size
+        self.default_strategy = default_strategy or EveryChunkStrategy()
         self.offload_to_cpu = offload_to_cpu
         self.use_pinned_memory = use_pinned_memory and offload_to_cpu and self.device.type == "cuda"
         self.score_on_cpu = score_on_cpu
         self._caches: dict[str, CacheState] = {}
+        self._session_strategies: dict[str, ClassificationStrategy] = {}
 
-        scorer_target = "cpu" if score_on_cpu else self.device
-        self.model.model.scorer.to(scorer_target)
+        if score_on_cpu:
+            self.model.model.scorer.to("cpu")
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+    @torch.no_grad()
+    def __call__(
+        self,
+        texts: str | list[str],
+        labels: list[str] | dict[str, Any] | list[list[str]] | list[dict[str, Any]],
+        *,
+        session_ids: str | list[str],
+        threshold: float | list[float] = 0.5,
+        batch_size: int | None = None,
+        classification_type: str | list[str] | None = None,
+        strategies: ClassificationStrategy | list[ClassificationStrategy] | None = None,
+        examples: list[dict[str, Any]] | list[list[dict[str, Any]]] | None = None,
+        prompt: str | list[str] | None = None,
+        return_hierarchical: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Append text chunks and classify sessions selected by their strategies."""
+        normalized = self._normalize_streaming_inputs(
+            texts=texts,
+            labels=labels,
+            session_ids=session_ids,
+            threshold=threshold,
+            classification_type=classification_type,
+            strategies=strategies,
+            examples=examples,
+            prompt=prompt,
+            return_hierarchical=return_hierarchical,
+        )
 
-    def __call__(self, inputs: list[SessionInput]) -> list[SessionOutput]:
-        self._cleanup_dead_sessions(inputs)
-        self._ensure_sessions(inputs)
+        batch_size = self.default_batch_size if batch_size is None else batch_size
+        if batch_size <= 0:
+            raise ValueError("batch_size must be greater than zero.")
 
-        if self.batch_size is None or len(inputs) <= self.batch_size:
-            return self._process_batch(inputs)
+        active_ids = set(normalized["session_ids"])
+        self._cleanup_absent_sessions(active_ids)
+        if not active_ids:
+            return []
 
-        outputs = [None] * len(inputs)
-        for start in range(0, len(inputs), self.batch_size):
-            chunk = inputs[start : start + self.batch_size]
-            chunk_ids = {inp.session_id for inp in chunk}
+        outputs: list[dict[str, Any] | None] = [None] * len(normalized["texts"])
+        for start in range(0, len(normalized["texts"]), batch_size):
+            end = start + batch_size
+            batch = {key: value[start:end] for key, value in normalized.items()}
+            batch_ids = set(batch["session_ids"])
+            self._ensure_sessions(batch)
 
             if self.offload_to_cpu:
-                self._load_to_device(chunk_ids, self.device)
+                self._load_to_device(batch_ids, self.device)
 
-            for i, out in enumerate(self._process_batch(chunk)):
-                outputs[start + i] = out
+            batch_outputs = self._process_batch(batch)
+            outputs[start:end] = batch_outputs
 
             if self.offload_to_cpu:
-                self._load_to_device(chunk_ids, torch.device("cpu"))
+                self._load_to_device(batch_ids, torch.device("cpu"))
 
         return outputs
 
-    def _process_batch(self, inputs: list[SessionInput]) -> list[SessionOutput]:
-        tokens_added = self._stage_update(inputs)
-        if self.max_cache_len is not None:
-            self._enforce_max_cache_len()
-        return self._stage_classify(inputs, tokens_added)
-
-    def _load_to_device(self, session_ids: set[str], device: torch.device) -> None:
-        to_cpu = device.type == "cpu"
-        for sid in session_ids:
-            cache = self._caches.get(sid)
-            if cache is None or cache.past_key_values is None:
-                continue
-            if to_cpu and self.use_pinned_memory:
-                self._caches[sid] = _move_cache_pinned(cache)
-            else:
-                self._caches[sid] = _move_cache_nonblocking(cache, device)
-
-        # synchronize before using on GPU so non_blocking transfers complete
-        if not to_cpu and self.use_pinned_memory and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-
-    # ------------------------------------------------------------------
-    # Session management
-    # ------------------------------------------------------------------
+    @property
+    def active_sessions(self) -> list[str]:
+        """Return active session IDs in insertion order."""
+        return list(self._caches)
 
     def delete_session(self, *session_ids: str) -> list[str]:
-        """Delete one or more sessions and free their KV caches.
-
-        Returns the list of session IDs that were actually deleted
-        (unknown IDs are silently ignored).
-        """
+        """Delete sessions and all cache and strategy state associated with them."""
         deleted = []
-        for sid in session_ids:
-            if sid in self._caches:
-                del self._caches[sid]
-                deleted.append(sid)
+        for session_id in session_ids:
+            if session_id in self._caches:
+                del self._caches[session_id]
+                self._session_strategies.pop(session_id, None)
+                deleted.append(session_id)
         return deleted
 
     def clear_sessions(self) -> None:
-        """Delete all active sessions and free all KV caches."""
+        """Delete every active session."""
         self._caches.clear()
+        self._session_strategies.clear()
 
-    @property
-    def active_sessions(self) -> list[str]:
-        """Return the list of currently active session IDs."""
-        return list(self._caches.keys())
+    def set_session_strategy(self, session_id: str, strategy: ClassificationStrategy) -> None:
+        """Replace the classification strategy for an active session."""
+        if session_id not in self._caches:
+            raise KeyError(f"Unknown session_id: {session_id}")
+        self._session_strategies[session_id] = copy.deepcopy(strategy)
 
-    def _cleanup_dead_sessions(self, inputs: list[SessionInput]) -> None:
-        active = {inp.session_id for inp in inputs}
-        for sid in list(self._caches):
-            if sid not in active:
-                del self._caches[sid]
+    def _normalize_streaming_inputs(
+        self,
+        *,
+        texts,
+        labels,
+        session_ids,
+        threshold,
+        classification_type,
+        strategies,
+        examples,
+        prompt,
+        return_hierarchical,
+    ) -> dict[str, list]:
+        texts = self._normalize_texts(texts)
+        if isinstance(session_ids, str):
+            session_ids = [session_ids]
+        else:
+            session_ids = list(session_ids)
 
-    def _enforce_max_cache_len(self) -> None:
-        for sid, cache in self._caches.items():
-            if cache.cached_length > self.max_cache_len:
-                self._caches[sid] = truncate_cache(cache, self.max_cache_len)
+        if len(session_ids) != len(texts):
+            raise ValueError("session_ids and texts must have the same length.")
+        if len(set(session_ids)) != len(session_ids):
+            raise ValueError("session_ids must be unique within a streaming call.")
+        if any(not isinstance(session_id, str) or not session_id for session_id in session_ids):
+            raise ValueError("Every session_id must be a non-empty string.")
 
-    def _ensure_sessions(self, inputs: list[SessionInput]) -> None:
-        for inp in inputs:
-            if inp.session_id not in self._caches:
-                self._caches[inp.session_id] = create_empty_cache(session_id=inp.session_id, device=self.device)
+        thresholds = self._normalize_thresholds(threshold, len(texts))
+        classification_types = self._normalize_classification_types(classification_type, len(texts))
+        processed_labels = self._process_labels(labels)
+        if texts and not processed_labels:
+            raise ValueError("At least one label is required.")
 
-    # ------------------------------------------------------------------
-    # Stage 1: update KV caches
-    # ------------------------------------------------------------------
+        same_labels = not texts or isinstance(processed_labels[0], str)
+        if same_labels:
+            labels_per_text = [processed_labels] * len(texts)
+            original_labels = [labels] * len(texts)
+        else:
+            if len(processed_labels) != len(texts):
+                raise ValueError("Per-text labels and texts must have the same length.")
+            labels_per_text = processed_labels
+            original_labels = list(labels)
 
-    def _stage_update(self, inputs: list[SessionInput]) -> list[int]:
-        """
-        Update KV cache for each session. Returns tokens_added per input.
-        Sessions with empty text are skipped (tokens_added = 0).
-        """
-        tokens_added = [0] * len(inputs)
-        to_update = [(i, inp) for i, inp in enumerate(inputs) if inp.text]
+        if strategies is None:
+            strategies_per_text = [None] * len(texts)
+        elif isinstance(strategies, ClassificationStrategy):
+            strategies_per_text = [strategies] * len(texts)
+        else:
+            strategies_per_text = list(strategies)
+            if len(strategies_per_text) != len(texts):
+                raise ValueError("strategies and texts must have the same length.")
+            if not all(isinstance(strategy, ClassificationStrategy) for strategy in strategies_per_text):
+                raise TypeError("Every strategy must implement ClassificationStrategy.")
 
-        if not to_update:
+        prefixes = []
+        for index, session_id in enumerate(session_ids):
+            text_prompt = self._format_prompt(prompt, index)
+            text_examples = self._get_text_examples(examples, index)
+            examples_text = self._format_examples_for_input(text_examples) if text_examples else ""
+            prefix = format_decoder_kv_context("", text_prompt, examples_text)
+            existing = self._caches.get(session_id)
+            if (
+                existing is not None
+                and existing.cached_length > 0
+                and prefix
+                and prefix != existing.metadata.get("prefix", "")
+            ):
+                raise ValueError(
+                    f"Prompt or examples changed for active session {session_id!r}; "
+                    "delete the session before changing them."
+                )
+            prefixes.append(prefix)
+
+        return {
+            "texts": texts,
+            "labels": labels_per_text,
+            "original_labels": original_labels,
+            "session_ids": session_ids,
+            "thresholds": thresholds,
+            "classification_types": classification_types,
+            "strategies": strategies_per_text,
+            "prefixes": prefixes,
+            "return_hierarchical": [return_hierarchical] * len(texts),
+        }
+
+    def _cleanup_absent_sessions(self, active_ids: set[str]) -> None:
+        for session_id in list(self._caches):
+            if session_id not in active_ids:
+                del self._caches[session_id]
+                self._session_strategies.pop(session_id, None)
+
+    def _ensure_sessions(self, batch: dict[str, list]) -> None:
+        for session_id, strategy, prefix in zip(
+            batch["session_ids"], batch["strategies"], batch["prefixes"], strict=True
+        ):
+            if session_id in self._caches:
+                if self._caches[session_id].cached_length == 0 and prefix:
+                    self._caches[session_id].metadata["prefix"] = prefix
+                continue
+            cache = create_empty_cache(session_id=session_id, device=self.device)
+            cache.metadata["prefix"] = prefix
+            self._caches[session_id] = cache
+            self._session_strategies[session_id] = copy.deepcopy(strategy or self.default_strategy)
+
+    def _process_batch(self, batch: dict[str, list]) -> list[dict[str, Any]]:
+        texts = []
+        for session_id, text, prefix in zip(batch["session_ids"], batch["texts"], batch["prefixes"], strict=True):
+            cache = self._caches[session_id]
+            texts.append(f"{prefix}{text}" if cache.cached_length == 0 else text)
+
+        tokens_added = self._update_caches(batch["session_ids"], texts)
+        if self.max_cache_len is not None:
+            for session_id in batch["session_ids"]:
+                cache = self._caches[session_id]
+                if cache.cached_length > self.max_cache_len:
+                    self._caches[session_id] = truncate_cache(cache, self.max_cache_len)
+        return self._classify(batch, tokens_added)
+
+    def _update_caches(self, session_ids: list[str], texts: list[str]) -> list[int]:
+        tokens_added = [0] * len(texts)
+        active = [
+            (index, session_id, text)
+            for index, (session_id, text) in enumerate(zip(session_ids, texts, strict=True))
+            if text
+        ]
+        if not active:
             return tokens_added
 
-        indices = [i for i, _ in to_update]
-        active_inputs = [inp for _, inp in to_update]
+        indices = [item[0] for item in active]
+        active_ids = [item[1] for item in active]
+        tokenized = [self.tokenizer(item[2], return_tensors="pt", add_special_tokens=False) for item in active]
+        new_ids = [item["input_ids"].to(self.device) for item in tokenized]
+        new_masks = [item["attention_mask"].to(self.device) for item in tokenized]
+        caches = [self._caches[session_id] for session_id in active_ids]
 
-        # Tokenize new text per session
-        tokenized = [self.tokenizer(inp.text, return_tensors="pt", add_special_tokens=False) for inp in active_inputs]
-        new_ids = [t["input_ids"].to(self.device) for t in tokenized]
-        new_masks = [t["attention_mask"].to(self.device) for t in tokenized]
-
-        caches = [self._caches[inp.session_id] for inp in active_inputs]
-
-        # Check if any session has a non-empty cache (need KV stacking)
-        has_cache = any(c.cached_length > 0 for c in caches)
-
-        if has_cache:
+        if any(cache.cached_length > 0 for cache in caches):
             stacked = BatchedKVHelper.stack_for_update(caches, new_ids, new_masks, self.device)
-            decoder = self.model.model.decoder_model
-
-            with torch.no_grad():
-                out = decoder(
-                    input_ids=stacked["input_ids"],
-                    attention_mask=stacked["attention_mask"],
-                    position_ids=stacked["position_ids"],
-                    past_key_values=stacked["past_key_values"],
-                    use_cache=True,
-                    return_dict=True,
-                )
-
-            updated = BatchedKVHelper.unstack_after_update(out.past_key_values, stacked, caches, new_ids, new_masks)
+            model_output = self.model.update_decoder_cache(
+                input_ids=stacked["input_ids"],
+                attention_mask=stacked["attention_mask"],
+                position_ids=stacked["position_ids"],
+                past_key_values=stacked["past_key_values"],
+            )
+            updated = BatchedKVHelper.unstack_after_update(
+                model_output.past_key_values,
+                stacked,
+                caches,
+                new_ids,
+                new_masks,
+            )
+            new_lengths = stacked["new_lengths"]
         else:
-            # All caches empty - simple batched forward without stacking
-            updated = self._update_from_scratch(caches, new_ids, new_masks)
+            updated, new_lengths = self._update_from_scratch(caches, new_ids, new_masks)
 
-        for session_idx, cache, new_len in zip(
-            indices, updated, stacked["new_lengths"] if has_cache else [ids.shape[-1] for ids in new_ids]
-        ):
-            inp = inputs[session_idx]
-            self._caches[inp.session_id] = cache
-            tokens_added[session_idx] = new_len
-
+        for index, session_id, cache, new_length in zip(indices, active_ids, updated, new_lengths, strict=True):
+            self._caches[session_id] = cache
+            tokens_added[index] = new_length
         return tokens_added
 
     def _update_from_scratch(
@@ -192,222 +309,168 @@ class StreamingPipeline:
         caches: list[CacheState],
         new_ids: list[torch.Tensor],
         new_masks: list[torch.Tensor],
-    ) -> list[CacheState]:
-        """Batched update when all caches are empty (no KV stacking needed)."""
-        max_len = max(ids.shape[-1] for ids in new_ids)
+    ) -> tuple[list[CacheState], list[int]]:
+        new_lengths = [ids.shape[-1] for ids in new_ids]
+        max_length = max(new_lengths)
         batch_size = len(caches)
+        padded_ids = new_ids[0].new_zeros(batch_size, max_length)
+        padded_masks = new_ids[0].new_zeros(batch_size, max_length)
+        position_ids = new_ids[0].new_zeros(batch_size, max_length)
 
-        padded_ids = new_ids[0].new_zeros(batch_size, max_len)
-        padded_masks = new_ids[0].new_zeros(batch_size, max_len)
-        position_ids = new_ids[0].new_zeros(batch_size, max_len)
-
-        new_lengths = []
-        for i, (ids, mask) in enumerate(zip(new_ids, new_masks)):
-            flat = ids[0] if ids.dim() == 2 else ids
-            flat_m = mask[0] if mask.dim() == 2 else mask
-            nlen = flat.shape[0]
-            padded_ids[i, :nlen] = flat
-            padded_masks[i, :nlen] = flat_m
-            position_ids[i, :nlen] = torch.arange(nlen, device=self.device)
-            new_lengths.append(nlen)
-
-        decoder = self.model.model.decoder_model
-        with torch.no_grad():
-            out = decoder(
-                input_ids=padded_ids,
-                attention_mask=padded_masks,
-                position_ids=position_ids,
-                use_cache=True,
-                return_dict=True,
+        for index, (ids, mask, cache, length) in enumerate(zip(new_ids, new_masks, caches, new_lengths, strict=True)):
+            flat_ids = ids[0] if ids.dim() == 2 else ids
+            flat_mask = mask[0] if mask.dim() == 2 else mask
+            padded_ids[index, :length] = flat_ids
+            padded_masks[index, :length] = flat_mask
+            position_ids[index, :length] = torch.arange(
+                cache.next_position,
+                cache.next_position + length,
+                device=self.device,
             )
 
+        model_output = self.model.update_decoder_cache(
+            input_ids=padded_ids,
+            attention_mask=padded_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+        )
+
         results = []
-        for i, (cache, nlen) in enumerate(zip(caches, new_lengths)):
-            sliced_kv = BatchedKVHelper._slice_past_kv(out.past_key_values, i, 0, nlen)
-            flat_ids = new_ids[i][0] if new_ids[i].dim() == 2 else new_ids[i]
-            flat_mask = new_masks[i][0] if new_masks[i].dim() == 2 else new_masks[i]
+        for index, (cache, length) in enumerate(zip(caches, new_lengths, strict=True)):
+            flat_ids = new_ids[index][0] if new_ids[index].dim() == 2 else new_ids[index]
+            flat_mask = new_masks[index][0] if new_masks[index].dim() == 2 else new_masks[index]
             results.append(
                 CacheState(
-                    past_key_values=sliced_kv,
-                    input_ids=flat_ids[:nlen],
-                    attention_mask=flat_mask[:nlen],
-                    cached_length=nlen,
+                    past_key_values=BatchedKVHelper._slice_past_kv(
+                        model_output.past_key_values,
+                        index,
+                        0,
+                        length,
+                    ),
+                    input_ids=flat_ids[:length],
+                    attention_mask=flat_mask[:length],
+                    cached_length=length,
+                    next_position_id=cache.next_position + length,
                     session_id=cache.session_id,
                     metadata=cache.metadata.copy(),
                 )
             )
+        return results, new_lengths
 
-        return results
-
-    # ------------------------------------------------------------------
-    # Stage 2: classify triggered sessions
-    # ------------------------------------------------------------------
-
-    def _stage_classify(self, inputs: list[SessionInput], tokens_added: list[int]) -> list[SessionOutput]:
-        # Resolve which sessions trigger classification
+    def _classify(
+        self,
+        batch: dict[str, list],
+        tokens_added: list[int],
+    ) -> list[dict[str, Any]]:
         triggered_indices = []
-        for i, (inp, n_added) in enumerate(zip(inputs, tokens_added)):
-            if n_added == 0:
-                continue  # no new tokens → cache unchanged, skip classification
-            cache = self._caches[inp.session_id]
-            if inp.strategy.should_classify(n_added, cache.cached_length, inp.text):
-                triggered_indices.append(i)
+        for index, (session_id, text, added) in enumerate(
+            zip(batch["session_ids"], batch["texts"], tokens_added, strict=True)
+        ):
+            cache = self._caches[session_id]
+            strategy = self._session_strategies[session_id]
+            if text and added > 0 and strategy.should_classify(added, cache.cached_length, text):
+                triggered_indices.append(index)
 
-        outputs: list[SessionOutput | None] = [None] * len(inputs)
-
-        # Fill non-triggered outputs
-        for i, inp in enumerate(inputs):
-            if i not in triggered_indices:
-                cache = self._caches[inp.session_id]
-                outputs[i] = SessionOutput(
-                    session_id=inp.session_id,
-                    triggered=False,
-                    predictions=None,
-                    cached_length=cache.cached_length,
-                    tokens_added=tokens_added[i],
-                )
-
+        outputs = [
+            {
+                "session_id": session_id,
+                "triggered": False,
+                "predictions": None,
+                "cached_length": self._caches[session_id].cached_length,
+                "tokens_added": tokens_added[index],
+            }
+            for index, session_id in enumerate(batch["session_ids"])
+        ]
         if not triggered_indices:
             return outputs
 
-        # Prepare label sequences for triggered sessions
-        triggered_inputs = [inputs[i] for i in triggered_indices]
-        triggered_caches = [
-            inputs[i].strategy.get_window(self._caches[inputs[i].session_id]) for i in triggered_indices
-        ]
-
-        label_seqs = [self._prepare_label_seq(inp.labels) for inp in triggered_inputs]
-        tokenized_labels = [self.tokenizer(seq, return_tensors="pt", add_special_tokens=False) for seq in label_seqs]
-        label_ids = [t["input_ids"].to(self.device) for t in tokenized_labels]
-        label_masks = [t["attention_mask"].to(self.device) for t in tokenized_labels]
+        triggered_caches = []
+        label_ids = []
+        label_masks = []
+        for index in triggered_indices:
+            session_id = batch["session_ids"][index]
+            cache = self._session_strategies[session_id].get_window(self._caches[session_id])
+            triggered_caches.append(cache)
+            sequence = format_decoder_kv_labels(
+                batch["labels"][index],
+                label_token=self.label_token,
+                sep_token=self.sep_token,
+            )
+            tokenized = self.tokenizer(sequence, return_tensors="pt", add_special_tokens=False)
+            label_ids.append(tokenized["input_ids"].to(self.device))
+            label_masks.append(tokenized["attention_mask"].to(self.device))
 
         stacked = BatchedKVHelper.stack_for_classify(triggered_caches, label_ids, label_masks, self.device)
-
-        decoder = self.model.model.decoder_model
-        with torch.no_grad():
-            out = decoder(
-                input_ids=stacked["input_ids"],
-                attention_mask=stacked["attention_mask"],
-                position_ids=stacked["position_ids"],
-                past_key_values=stacked["past_key_values"],
-                use_cache=False,
-                return_dict=True,
-            )
-
-        # Slice label hidden states and pass to scorer
-        hidden = out.last_hidden_state  # [batch, max_cached + max_label, hidden]
-        max_cached = max(c.cached_length for c in triggered_caches) if stacked["past_key_values"] else 0  # noqa: F841
-        label_lengths = stacked["label_lengths"]
-        max_label = stacked["max_label_len"]
-
-        # hidden for labels starts at index max_cached (prepend-padded KV)
-        # but we need the actual label slice per session
-        scorer = self.model.model.scorer
-        batch_logits = self._run_scorer_batched(
-            scorer,
-            hidden,
-            stacked["input_ids"],
-            stacked["label_mask"],
-            label_lengths,
-            max_label,
+        model_output = self.model.classify_from_decoder_cache(
+            input_ids=stacked["input_ids"],
+            attention_mask=stacked["attention_mask"],
+            label_mask=stacked["label_mask"],
+            position_ids=stacked["position_ids"],
+            past_key_values=stacked["past_key_values"],
         )
 
-        for local_idx, global_idx in enumerate(triggered_indices):
-            inp = inputs[global_idx]
-            cache = self._caches[inp.session_id]
-            logits = batch_logits[local_idx]  # [num_labels]
-            preds = self._decode_predictions(logits, inp.labels, inp.classification_type)
-            outputs[global_idx] = SessionOutput(
-                session_id=inp.session_id,
-                triggered=True,
-                predictions=preds,
-                cached_length=cache.cached_length,
-                tokens_added=tokens_added[global_idx],
+        for local_index, batch_index in enumerate(triggered_indices):
+            labels = batch["labels"][batch_index]
+            logits = model_output.logits[local_index, : len(labels)]
+            predictions, all_scores = self._postprocess_logits(
+                logits,
+                labels,
+                batch["classification_types"][batch_index],
+                batch["thresholds"][batch_index],
             )
+            if batch["return_hierarchical"][batch_index]:
+                predictions = build_hierarchical_output(
+                    predictions,
+                    batch["original_labels"][batch_index],
+                    self.label_separator,
+                    all_scores,
+                )
 
+            session_id = batch["session_ids"][batch_index]
+            outputs[batch_index] = {
+                "session_id": session_id,
+                "triggered": True,
+                "predictions": predictions,
+                "cached_length": self._caches[session_id].cached_length,
+                "tokens_added": tokens_added[batch_index],
+            }
         return outputs
 
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    def _load_to_device(self, session_ids: set[str], device: torch.device) -> None:
+        to_cpu = device.type == "cpu"
+        for session_id in session_ids:
+            cache = self._caches.get(session_id)
+            if cache is None or cache.past_key_values is None:
+                continue
+            if to_cpu and self.use_pinned_memory:
+                self._caches[session_id] = _move_cache_pinned(cache)
+            else:
+                self._caches[session_id] = _move_cache_nonblocking(cache, device)
 
-    def _prepare_label_seq(self, labels: list[str]) -> str:
-        label_token = "<<LABEL>>"
-        sep_token = "<<SEP>>"
-        # Opening <<SEP>> matches training format: text<<SEP>>label1<<LABEL>>...<<SEP>>
-        # Cache contains only text; <<SEP>> boundary must be part of label sequence
-        parts = [sep_token]
-        for label in labels:
-            parts.append(label)
-            parts.append(label_token)
-        parts.append(sep_token)
-        return "".join(parts)
-
-    def _run_scorer_batched(
-        self,
-        scorer,
-        hidden: torch.Tensor,
-        label_ids: torch.Tensor,
-        label_mask: torch.Tensor,
-        label_lengths: list[int],
-        max_label: int,
-    ) -> list[torch.Tensor]:
-        """
-        hidden: [batch, max_cached + max_label, hidden_size]  (full decoder output)
-        We slice out only the label part [max_cached :] per session before scorer.
-        label_ids / label_mask are already label-only ([batch, max_label]).
-        """
-        max_cached_in_hidden = hidden.shape[1] - max_label
-        label_hidden = hidden[:, max_cached_in_hidden:, :]  # [batch, max_label, hidden]
-
-        if self.score_on_cpu:
-            label_hidden = label_hidden.cpu()
-            label_ids = label_ids.cpu()
-            label_mask = label_mask.cpu()
-
-        logits = scorer(
-            hidden_states=label_hidden,
-            input_ids=label_ids,
-            attention_mask=label_mask,
-        )  # [batch, num_labels]
-
-        return [logits[i] for i in range(logits.shape[0])]
-
-    def _decode_predictions(self, logits: torch.Tensor, labels: list[str], classification_type: str) -> list[dict]:
-        logits = logits[: len(labels)]
-        if classification_type == "single-label":
-            scores = torch.softmax(logits, dim=-1)
-            best = int(scores.argmax().item())
-            return [{"label": labels[best], "score": float(scores[best].detach())}]
-        else:
-            probs = torch.sigmoid(logits)
-            return [{"label": label, "score": float(prob.detach())} for label, prob in zip(labels, probs)]
+        if not to_cpu and self.use_pinned_memory and self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
 
 def _move_cache_pinned(cache: CacheState) -> CacheState:
-    """Move KV cache to CPU pinned memory for fast async GPU uploads."""
+    """Move a DynamicCache to CPU pinned memory."""
     from transformers.cache_utils import DynamicCache, DynamicLayer
 
-    from .cache import CacheState
-
-    past_kv = cache.past_key_values
-    if not isinstance(past_kv, DynamicCache):
+    if not isinstance(cache.past_key_values, DynamicCache):
         return cache.to(torch.device("cpu"))
 
     new_kv = DynamicCache()
-    for i, layer in enumerate(past_kv.layers):
+    for index, layer in enumerate(cache.past_key_values.layers):
         if not layer.is_initialized:
             continue
-        pinned_k = layer.keys.cpu().pin_memory()
-        pinned_v = layer.values.cpu().pin_memory()
-        # bypass update() to avoid torch.cat losing pinned property
-        while len(new_kv.layers) <= i:
+        pinned_keys = layer.keys.cpu().pin_memory()
+        pinned_values = layer.values.cpu().pin_memory()
+        while len(new_kv.layers) <= index:
             new_kv.layers.append(DynamicLayer())
-        new_layer = new_kv.layers[i]
-        new_layer.dtype = pinned_k.dtype
-        new_layer.device = pinned_k.device
-        new_layer.keys = pinned_k
-        new_layer.values = pinned_v
+        new_layer = new_kv.layers[index]
+        new_layer.dtype = pinned_keys.dtype
+        new_layer.device = pinned_keys.device
+        new_layer.keys = pinned_keys
+        new_layer.values = pinned_values
         new_layer.is_initialized = True
 
     return CacheState(
@@ -416,28 +479,26 @@ def _move_cache_pinned(cache: CacheState) -> CacheState:
         attention_mask=cache.attention_mask.cpu(),
         position_ids=cache.position_ids.cpu() if cache.position_ids is not None else None,
         cached_length=cache.cached_length,
+        next_position_id=cache.next_position_id,
         session_id=cache.session_id,
         metadata=cache.metadata.copy(),
     )
 
 
 def _move_cache_nonblocking(cache: CacheState, device: torch.device) -> CacheState:
-    """Move KV cache to device with non_blocking=True (async when src is pinned)."""
+    """Move a DynamicCache to a device, asynchronously when possible."""
     from transformers.cache_utils import DynamicCache
 
-    from .cache import CacheState
-
-    past_kv = cache.past_key_values
-    if not isinstance(past_kv, DynamicCache):
+    if not isinstance(cache.past_key_values, DynamicCache):
         return cache.to(device)
 
     new_kv = DynamicCache()
-    for i, layer in enumerate(past_kv.layers):
+    for index, layer in enumerate(cache.past_key_values.layers):
         if layer.is_initialized:
             new_kv.update(
                 layer.keys.to(device, non_blocking=True),
                 layer.values.to(device, non_blocking=True),
-                i,
+                index,
             )
 
     return CacheState(
@@ -446,6 +507,7 @@ def _move_cache_nonblocking(cache: CacheState, device: torch.device) -> CacheSta
         attention_mask=cache.attention_mask.to(device, non_blocking=True),
         position_ids=cache.position_ids.to(device, non_blocking=True) if cache.position_ids is not None else None,
         cached_length=cache.cached_length,
+        next_position_id=cache.next_position_id,
         session_id=cache.session_id,
         metadata=cache.metadata.copy(),
     )

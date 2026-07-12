@@ -7,6 +7,42 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 
+def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "") -> str:
+    """Format the persistent context portion of a decoder-KV sequence."""
+    return f"{prompt}{examples}{text}"
+
+
+def format_decoder_kv_labels(
+    labels: list[str],
+    *,
+    label_token: str = "<<LABEL>>",
+    sep_token: str = "<<SEP>>",
+) -> str:
+    """Format the transient label portion of a decoder-KV sequence."""
+    parts = [sep_token]
+    for label in labels:
+        parts.extend((label, label_token))
+    parts.append(sep_token)
+    return "".join(parts)
+
+
+def format_decoder_kv_sequence(
+    text: str,
+    labels: list[str],
+    *,
+    prompt: str = "",
+    examples: str = "",
+    label_token: str = "<<LABEL>>",
+    sep_token: str = "<<SEP>>",
+) -> str:
+    """Format a complete decoder-KV sequence for training or classic inference."""
+    return format_decoder_kv_context(text, prompt, examples) + format_decoder_kv_labels(
+        labels,
+        label_token=label_token,
+        sep_token=sep_token,
+    )
+
+
 @dataclass
 class AugmentationConfig:
     """Configuration for data augmentation."""
@@ -305,19 +341,14 @@ class GLiClassDataset(Dataset):
         examples_text = self.format_examples(example)
         text = str(example["text"])
 
-        input_parts = []
-        if prompt:
-            input_parts.append(prompt)
-        input_parts.append(examples_text)
-        input_parts.append(text)
-        input_parts.append(self.sep_token)
-
-        for label in example["all_labels"]:
-            input_parts.append(label)
-            input_parts.append(self.label_token)
-        input_parts.append(self.sep_token)
-
-        input_text = "".join(input_parts)
+        input_text = format_decoder_kv_sequence(
+            text,
+            example["all_labels"],
+            prompt=prompt,
+            examples=examples_text,
+            label_token=self.label_token,
+            sep_token=self.sep_token,
+        )
         label2idx = {label: idx for idx, label in enumerate(example["all_labels"])}
 
         tokenized_inputs = self.tokenize(input_text)
