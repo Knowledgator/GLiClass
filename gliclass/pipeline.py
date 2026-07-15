@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
-from .data_processing import format_decoder_kv_sequence
+from .data_processing import format_decoder_kv_context, format_decoder_kv_labels, format_decoder_kv_sequence
 
 
 def flatten_hierarchical_labels(
@@ -784,32 +784,56 @@ class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             sep_token=self.sep_token,
         )
 
-    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
-        inputs = []
-        if same_labels:
-            for i, text in enumerate(texts):
-                inputs.append(
-                    self.prepare_input(
-                        text,
-                        labels,
-                        self._get_text_examples(examples, i),
-                        self._format_prompt(prompt, i),
-                    )
-                )
-        else:
-            for i, (text, labels_) in enumerate(zip(texts, labels)):
-                inputs.append(
-                    self.prepare_input(
-                        text,
-                        labels_,
-                        self._get_text_examples(examples, i),
-                        self._format_prompt(prompt, i),
-                    )
-                )
+    def _build_context_and_labels(self, texts, labels, same_labels, examples, prompt):
+        contexts = []
+        label_sequences = []
+        for i, text in enumerate(texts):
+            item_labels = labels if same_labels else labels[i]
+            examples_text = self._format_examples_for_input(self._get_text_examples(examples, i))
+            text_prompt = self._format_prompt(prompt, i) or ""
+            contexts.append(format_decoder_kv_context(text, text_prompt, examples_text))
+            label_sequences.append(
+                format_decoder_kv_labels(item_labels, label_token=self.label_token, sep_token=self.sep_token)
+            )
+        return contexts, label_sequences
 
-        return self.tokenizer(
-            inputs, truncation=True, max_length=self.max_length, padding="longest", return_tensors="pt"
-        ).to(self.device)
+    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
+        contexts, label_sequences = self._build_context_and_labels(texts, labels, same_labels, examples, prompt)
+
+        label_token_ids = self.tokenizer(label_sequences, add_special_tokens=False)["input_ids"]
+
+        input_ids_list = []
+        for context, label_ids in zip(contexts, label_token_ids, strict=True):
+            context_budget = max(1, self.max_length - len(label_ids))
+            context_ids = self.tokenizer(
+                context,
+                truncation=True,
+                max_length=context_budget,
+                add_special_tokens=False,
+            )["input_ids"]
+            input_ids_list.append(context_ids + label_ids)
+
+        max_len = max(len(ids) for ids in input_ids_list)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            pad_len = max_len - len(ids)
+            if padding_side == "left":
+                padded_input_ids.append([pad_token_id] * pad_len + ids)
+                attention_masks.append([0] * pad_len + [1] * len(ids))
+            else:
+                padded_input_ids.append(ids + [pad_token_id] * pad_len)
+                attention_masks.append([1] * len(ids) + [0] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(padded_input_ids, device=self.device),
+            "attention_mask": torch.tensor(attention_masks, device=self.device),
+        }
 
 
 class ZeroShotClassificationPipeline:
