@@ -290,6 +290,13 @@ class TrainingArguments(transformers.TrainingArguments):
     )
     ewc_gamma: float = field(default=0.95, metadata={"help": "Decay factor for Online EWC."})
 
+    save_optimizer_state: bool = field(
+        default=True,
+        metadata={
+            "help": "Save optimizer/scheduler state in checkpoints. Set False for large models to save disk space."
+        },
+    )
+
 
 class Trainer(transformers.Trainer):
     """Extended Trainer with EWC support for continual learning."""
@@ -494,6 +501,22 @@ class Trainer(transformers.Trainer):
         except Exception as e:
             print(f"An error occurred during prediction step: {e!s}")
             return (None, None, None)
+
+    def _save_checkpoint(self, model, trial=None, **kwargs):
+        super()._save_checkpoint(model, trial=trial, **kwargs)
+        if not self.args.save_optimizer_state:
+            import glob
+
+            checkpoint_folder = f"checkpoint-{self.state.global_step}"
+            output_dir = os.path.join(self.args.output_dir, checkpoint_folder)
+            # remove optimizer / scheduler / scaler / accelerator state files
+            for pattern in ["optimizer.pt", "scheduler.pt", "scaler.pt", "optimizer_*", "random_states_*"]:
+                for f in glob.glob(os.path.join(output_dir, pattern)):
+                    os.remove(f)
+            # accelerator saves a subfolder for optimizer state
+            accel_state = os.path.join(output_dir, "optimizer.bin")
+            if os.path.exists(accel_state):
+                os.remove(accel_state)
 
     def create_optimizer(self):
         """

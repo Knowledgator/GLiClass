@@ -59,6 +59,7 @@ class GLiClassModelConfig(PretrainedConfig):
         embed_class_token=True,
         dropout=0.1,
         use_segment_embeddings=False,
+        scorer_encoder_num_layers=2,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -145,4 +146,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.pad_token_id = self.encoder_config.pad_token_id
         self.dropout = dropout
         self.use_segment_embeddings = use_segment_embeddings
-        super().__init__(**kwargs)
+
+        self.scorer_encoder_num_layers = scorer_encoder_num_layers
+
+        super().__init__(problem_type=problem_type, **kwargs)

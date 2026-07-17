@@ -341,6 +341,38 @@ config = GLiClassModelConfig(
 
 ---
 
+### Streaming Classification
+
+GLiClass supports incremental, multi-session text classification over a decoder-KV model. Instead of re-encoding the full document on every update, it maintains a persistent KV cache per session and runs the scorer only when a pluggable strategy decides classification should fire.
+
+```bash
+pip install gliclass[streaming]
+```
+
+```python
+from gliclass.streaming import StreamingPipeline, SessionInput, EveryNTokensStrategy
+
+pipeline = StreamingPipeline(model, tokenizer, device="cuda", max_cache_len=1024)
+strategy = EveryNTokensStrategy(n=50)
+
+for chunk in text_chunks:
+    outputs = pipeline([SessionInput(
+        session_id="doc_001",
+        text=chunk,
+        labels=["science", "politics", "finance"],
+        strategy=strategy,
+        classification_type="multi-label",
+    )])
+    if outputs[0].triggered:
+        print(outputs[0].predictions)
+```
+
+Built-in strategies: `EveryChunkStrategy`, `EveryNTokensStrategy`, `OnDelimiterStrategy`, `SlidingWindowStrategy`, `ComposedStrategy`, `NeverStrategy`.
+
+For full documentation on session management, KV cache internals, batching, CPU offloading, and custom strategies, see [docs/streaming.md](docs/streaming.md).
+
+---
+
 ### Flash Attention Backends
 
 GLiClass supports optional flash attention backends for faster inference.

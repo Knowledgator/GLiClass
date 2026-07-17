@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
+from .data_processing import format_decoder_kv_labels, format_decoder_kv_context, format_decoder_kv_sequence
 
 
 def flatten_hierarchical_labels(
@@ -258,6 +259,26 @@ class BaseZeroShotClassificationPipeline(ABC):
             raise ValueError("Length of adapter_ids list must match number of texts.")
         return adapter_ids
 
+    @staticmethod
+    def _postprocess_logits(
+        logits: torch.Tensor,
+        labels: List[str],
+        classification_type: str,
+        threshold: float,
+    ) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
+        """Convert one row of logits into predictions and a complete score map."""
+        logits = logits[: len(labels)]
+        if classification_type == "single-label":
+            scores = torch.softmax(logits, dim=-1)
+            all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
+            best = int(scores.argmax().item())
+            return [{"label": labels[best], "score": float(scores[best].detach())}], all_scores
+
+        scores = torch.sigmoid(logits)
+        all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
+        predictions = [{"label": label, "score": score} for label, score in all_scores.items() if score >= threshold]
+        return predictions, all_scores
+
     def _process_labels(
         self, labels: List[str] | Dict[str, Any] | List[List[str]] | List[Dict[str, Any]]
     ) -> List[str] | List[List[str]]:
@@ -484,7 +505,6 @@ class BaseZeroShotClassificationPipeline(ABC):
                 adapter_ids=batch_adapter_ids,
             )
             logits = model_output.logits
-            probs = torch.sigmoid(logits)
 
             for i in range(len(batch_texts)):
                 global_idx = idx + i
@@ -496,29 +516,15 @@ class BaseZeroShotClassificationPipeline(ABC):
                 else:
                     curr_labels = batch_labels[i]
 
-                if item_classification_type == "single-label":
-                    score = torch.softmax(logits[i][: len(curr_labels)], dim=-1)
-
-                    if return_hierarchical:
-                        all_scores = {curr_labels[j]: score[j].item() for j in range(len(curr_labels))}
-                        all_scores_list.append(all_scores)
-
-                    pred_label = curr_labels[torch.argmax(score).item()]
-                    results.append([{"label": pred_label, "score": score.max().item()}])
-                elif item_classification_type == "multi-label":
-                    text_results = []
-
-                    if return_hierarchical:
-                        all_scores = {curr_labels[j]: probs[i][j].item() for j in range(len(curr_labels))}
-                        all_scores_list.append(all_scores)
-
-                    for j, prob in enumerate(probs[i][: len(curr_labels)]):
-                        score = prob.item()
-                        if score >= item_threshold:
-                            text_results.append({"label": curr_labels[j], "score": score})
-                    results.append(text_results)
-                else:
-                    raise ValueError("Unsupported classification type: choose 'single-label' or 'multi-label'")
+                predictions, all_scores = self._postprocess_logits(
+                    logits[i],
+                    curr_labels,
+                    item_classification_type,
+                    item_threshold,
+                )
+                results.append(predictions)
+                if return_hierarchical:
+                    all_scores_list.append(all_scores)
 
         if return_hierarchical:
             hierarchical_results = []
@@ -760,6 +766,76 @@ class BiEncoderZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
         return tokenized_inputs
 
 
+class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline):
+    """Classic (non-streaming) pipeline for decoder-kv architecture.
+
+    Formats input as: [prompt][examples<<SEP>>]text<<SEP>>label1<<LABEL>>...<<SEP>>
+    Runs a single batched forward pass per batch — no KV cache reuse.
+    """
+
+    def prepare_input(self, text: str, labels: list[str], examples=None, prompt: str | None = None) -> str:
+        examples_text = self._format_examples_for_input(examples) if examples else ""
+        return format_decoder_kv_sequence(
+            text,
+            labels,
+            prompt=prompt or "",
+            examples=examples_text,
+            label_token=self.label_token,
+            sep_token=self.sep_token,
+        )
+
+    def _build_context_and_labels(self, texts, labels, same_labels, examples, prompt):
+        contexts = []
+        label_sequences = []
+        for i, text in enumerate(texts):
+            item_labels = labels if same_labels else labels[i]
+            examples_text = self._format_examples_for_input(self._get_text_examples(examples, i))
+            text_prompt = self._format_prompt(prompt, i) or ""
+            contexts.append(format_decoder_kv_context(text, text_prompt, examples_text))
+            label_sequences.append(
+                format_decoder_kv_labels(item_labels, label_token=self.label_token, sep_token=self.sep_token)
+            )
+        return contexts, label_sequences
+
+    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
+        contexts, label_sequences = self._build_context_and_labels(texts, labels, same_labels, examples, prompt)
+
+        label_token_ids = self.tokenizer(label_sequences, add_special_tokens=False)["input_ids"]
+
+        input_ids_list = []
+        for context, label_ids in zip(contexts, label_token_ids, strict=True):
+            context_budget = max(1, self.max_length - len(label_ids))
+            context_ids = self.tokenizer(
+                context,
+                truncation=True,
+                max_length=context_budget,
+                add_special_tokens=False,
+            )["input_ids"]
+            input_ids_list.append(context_ids + label_ids)
+
+        max_len = max(len(ids) for ids in input_ids_list)
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.tokenizer.eos_token_id or 0
+        padding_side = getattr(self.tokenizer, "padding_side", "right")
+
+        padded_input_ids = []
+        attention_masks = []
+        for ids in input_ids_list:
+            pad_len = max_len - len(ids)
+            if padding_side == "left":
+                padded_input_ids.append([pad_token_id] * pad_len + ids)
+                attention_masks.append([0] * pad_len + [1] * len(ids))
+            else:
+                padded_input_ids.append(ids + [pad_token_id] * pad_len)
+                attention_masks.append([1] * len(ids) + [0] * pad_len)
+
+        return {
+            "input_ids": torch.tensor(padded_input_ids, device=self.device),
+            "attention_mask": torch.tensor(attention_masks, device=self.device),
+        }
+
+
 class ZeroShotClassificationPipeline:
     """
     Main pipeline class for zero-shot classification with GLiClass models.
@@ -878,6 +954,10 @@ class ZeroShotClassificationPipeline:
             )
         elif model.config.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
             self.pipe = BiEncoderZeroShotClassificationPipeline(
+                model, tokenizer, max_classes, max_length, classification_type, device, progress_bar, label_separator
+            )
+        elif model.config.architecture_type == "decoder-kv":
+            self.pipe = DecoderKVZeroShotClassificationPipeline(
                 model, tokenizer, max_classes, max_length, classification_type, device, progress_bar, label_separator
             )
         else:

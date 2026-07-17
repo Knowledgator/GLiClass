@@ -7,6 +7,42 @@ from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
 
+def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "") -> str:
+    """Format the persistent context portion of a decoder-KV sequence."""
+    return f"{prompt}{examples}{text}"
+
+
+def format_decoder_kv_labels(
+    labels: list[str],
+    *,
+    label_token: str = "<<LABEL>>",
+    sep_token: str = "<<SEP>>",
+) -> str:
+    """Format the transient label portion of a decoder-KV sequence."""
+    parts = [sep_token]
+    for label in labels:
+        parts.extend((label, label_token))
+    parts.append(sep_token)
+    return "".join(parts)
+
+
+def format_decoder_kv_sequence(
+    text: str,
+    labels: list[str],
+    *,
+    prompt: str = "",
+    examples: str = "",
+    label_token: str = "<<LABEL>>",
+    sep_token: str = "<<SEP>>",
+) -> str:
+    """Format a complete decoder-KV sequence for training or classic inference."""
+    return format_decoder_kv_context(text, prompt, examples) + format_decoder_kv_labels(
+        labels,
+        label_token=label_token,
+        sep_token=sep_token,
+    )
+
+
 @dataclass
 class AugmentationConfig:
     """Configuration for data augmentation."""
@@ -292,6 +328,35 @@ class GLiClassDataset(Dataset):
         tokenized_inputs["input_texts"] = example["text"]
         return tokenized_inputs
 
+    def tokenize_and_prepare_labels_for_decoder_kv(self, example):
+        """
+        Prepare input for decoder-kv architecture.
+
+        Format: [prompt][examples]text<<SEP>>label1<<LABEL>>label2<<LABEL>>...<<SEP>>
+        """
+        if self.shuffle_labels:
+            random.shuffle(example["all_labels"])
+
+        prompt = example.get("prompt", "")
+        examples_text = self.format_examples(example)
+        text = str(example["text"])
+
+        input_text = format_decoder_kv_sequence(
+            text,
+            example["all_labels"],
+            prompt=prompt,
+            examples=examples_text,
+            label_token=self.label_token,
+            sep_token=self.sep_token,
+        )
+        label2idx = {label: idx for idx, label in enumerate(example["all_labels"])}
+
+        tokenized_inputs = self.tokenize(input_text)
+        tokenized_inputs["labels"] = self.prepare_labels(example, label2idx, self.problem_type)
+        tokenized_inputs["labels_text"] = example["all_labels"]
+        tokenized_inputs["input_texts"] = example["text"]
+        return tokenized_inputs
+
     def tokenize_and_prepare_labels_for_encoder_decoder(self, example):
         if self.shuffle_labels:
             random.shuffle(example["all_labels"])
@@ -357,6 +422,8 @@ class GLiClassDataset(Dataset):
             model_inputs = self.tokenize_and_prepare_labels_for_encoder_decoder(example)
         elif self.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
             model_inputs = self.tokenize_and_prepare_labels_for_biencoder(example)
+        elif self.architecture_type == "decoder-kv":
+            model_inputs = self.tokenize_and_prepare_labels_for_decoder_kv(example)
         else:
             raise NotImplementedError("This architecture type is not implemented.")
         return model_inputs

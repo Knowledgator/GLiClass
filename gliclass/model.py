@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Tuple
+from typing import Any, Tuple
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -9,6 +9,7 @@ import transformers
 from torch import nn
 from packaging import version
 from transformers import AutoModel, AutoConfig, PreTrainedModel
+from torch.nn.utils.rnn import pad_sequence
 from transformers.utils import logging
 from transformers.modeling_outputs import SequenceClassifierOutput
 
@@ -60,6 +61,7 @@ if IS_PEFT:
 class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: torch.Tensor | None = None
     class_embeddings: torch.Tensor | None = None
+    past_key_values: Any | None = None
 
 
 class GLiClassPreTrainedModel(PreTrainedModel):
@@ -950,6 +952,268 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         )
 
 
+class GLiClassDecoderKV(nn.Module):
+    """
+    Decoder-KV architecture with dynamic KV cache for streaming classification.
+
+    Sequence format: [prompt][examples]text<<SEP>>label1<<LABEL>>label2<<LABEL>>...<<SEP>>
+
+    Cached part: [prompt][examples]
+    New part each time: text<<SEP>>labels...<<SEP>>
+
+    Flow:
+    1. Decoder backbone (Qwen3) processes full sequence with past_key_values
+    2. Update KV cache ONLY with [prompt][examples]text part (before labels <<SEP>>)
+    3. Hidden states → DecoderKVScorer (bidirectional encoder + extraction + MLP)
+    """
+
+    def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
+        super().__init__()
+        self.config = config
+
+        if config.encoder_config is None:
+            if config.encoder_model_name is None:
+                raise ValueError("You need to specify encoder_model_name for decoder backbone (Qwen3).")
+            config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
+
+        config_name = config.encoder_config.__class__.__name__
+
+        if config_name == "Qwen3_5TextConfig":
+            from transformers.models.qwen3_5 import Qwen3_5TextModel
+
+            ModelClass = Qwen3_5TextModel
+        elif config_name == "Qwen3_5Config":
+            from transformers.models.qwen3_5 import Qwen3_5TextModel
+
+            ModelClass = Qwen3_5TextModel
+            config.encoder_config = config.encoder_config.text_config
+        elif config_name == "Qwen3Config":
+            from transformers import Qwen3Model
+
+            ModelClass = Qwen3Model
+        else:
+            raise ValueError(f"decoder-kv architecture requires Qwen3 or Qwen3.5. Got: {config_name}")
+
+        if from_pretrained:
+            self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name)
+        else:
+            self.decoder_model = ModelClass(config.encoder_config)
+
+        if config.vocab_size is not None and hasattr(self.decoder_model, "resize_token_embeddings"):
+            current_vocab = self.decoder_model.config.vocab_size
+            if current_vocab != config.vocab_size:
+                self.decoder_model.resize_token_embeddings(config.vocab_size)
+
+        from .scorers import DecoderKVScorer
+
+        self.scorer = DecoderKVScorer(config)
+
+        self.vocab_size = config.vocab_size
+        self.pad_token_id = config.pad_token_id if config.pad_token_id is not None else -1
+        self.num_labels = -1
+
+        self.sep_token_id = config.sep_token_index
+
+    def get_loss(self, logits, labels):
+        loss = None
+        if labels is not None:
+            # Sequence truncation may cut label tokens → align labels to logits
+            num_labels = logits.shape[-1]
+            if labels.shape[-1] != num_labels:
+                labels = labels[:, :num_labels]
+
+            if self.config.problem_type == "multi_label_classification":
+                from .loss_functions import focal_loss_with_logits
+
+                reduction = self.config.focal_loss_reduction or "none"
+                all_losses = focal_loss_with_logits(
+                    logits,
+                    labels,
+                    self.config.focal_loss_alpha,
+                    self.config.focal_loss_gamma,
+                    reduction,
+                )
+                loss = all_losses.mean()
+            elif self.config.problem_type == "single_label_classification":
+                loss_fct = nn.CrossEntropyLoss()
+                loss = loss_fct(logits.view(-1, num_labels), labels.view(-1))
+            else:
+                raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
+        return loss
+
+    def _extract_label_section(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Extract label section hidden states from full-sequence decoder output.
+
+        Training sequence: [prompt][examples<<SEP>>]text<<SEP>>label1<<LABEL>>...<<SEP>>
+        Scorer receives:   label1<<LABEL>>...<<SEP>>   (matches classify() inference format)
+
+        Start pos = first token after last <<SEP>> before first <<LABEL>>.
+        End pos = last real token (inclusive, determined by attention_mask).
+
+        Returns:
+            padded_hidden: (batch, max_label_len, hidden_size)
+            padded_ids:    (batch, max_label_len)
+            label_mask:    (batch, max_label_len)
+        """
+        batch_size = hidden_states.shape[0]
+        sep_id = self.sep_token_id
+        label_id = self.config.class_token_index
+
+        slices_h, slices_ids = [], []
+
+        for i in range(batch_size):
+            real_len = int(attention_mask[i].sum().item())
+            ids_i = input_ids[i, :real_len]
+
+            label_pos = (ids_i == label_id).nonzero(as_tuple=False)
+            sep_pos = (ids_i == sep_id).nonzero(as_tuple=False)
+
+            if label_pos.numel() == 0 or sep_pos.numel() == 0:
+                # Fallback: use everything up to real_len
+                slices_h.append(hidden_states[i, :real_len])
+                slices_ids.append(ids_i)
+                continue
+
+            first_label = label_pos[0].item()
+            # last <<SEP>> strictly before first <<LABEL>>
+            seps_before = sep_pos[sep_pos < first_label]
+
+            if seps_before.numel() == 0:
+                slices_h.append(hidden_states[i, :real_len])
+                slices_ids.append(ids_i)
+                continue
+
+            # start right after that SEP → first token of "label1<<LABEL>>...<<SEP>>"
+            start = int(seps_before[-1].item()) + 1
+            slices_h.append(hidden_states[i, start:real_len])
+            slices_ids.append(ids_i[start:real_len])
+
+        padded_hidden = pad_sequence(slices_h, batch_first=True)
+        padded_ids = pad_sequence(slices_ids, batch_first=True)
+
+        section_lengths = torch.tensor(
+            [section.shape[0] for section in slices_h],
+            device=attention_mask.device,
+        )
+        positions = torch.arange(padded_hidden.shape[1], device=attention_mask.device)
+        label_mask = (positions.unsqueeze(0) < section_lengths.unsqueeze(1)).to(attention_mask.dtype)
+
+        return padded_hidden, padded_ids, label_mask
+
+    def update_decoder_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        past_key_values=None,
+    ):
+        """Extend a text-only decoder cache without running the scorer."""
+        return self.decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=True,
+            return_dict=True,
+        )
+
+    def classify_from_decoder_cache(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        label_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        past_key_values,
+    ) -> GLiClassOutput:
+        """Classify label tokens against a text cache without persisting labels."""
+        decoder_outputs = self.decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=False,
+            return_dict=True,
+        )
+
+        label_hidden = decoder_outputs.last_hidden_state[:, -input_ids.shape[1] :, :]
+        scorer_device = next(self.scorer.parameters()).device
+        logits = self.scorer(
+            hidden_states=label_hidden.to(scorer_device),
+            input_ids=input_ids.to(scorer_device),
+            attention_mask=label_mask.to(scorer_device),
+        )
+        return GLiClassOutput(logits=logits)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values=None,
+        labels: torch.Tensor | None = None,
+        return_dict: bool | None = None,
+        use_cache: bool = False,
+        **kwargs,
+    ):
+        """Forward pass.
+
+        Args:
+            input_ids: Full sequence [prompt][examples]text<<SEP>>labels...<<SEP>>
+            attention_mask: Attention mask
+            past_key_values: Cached KV for [prompt][examples] (optional)
+            labels: Classification labels
+            return_dict: Return dict output
+            use_cache: Whether to return updated cache
+
+        Returns:
+            GLiClassOutput with logits, loss, and optionally past_key_values
+        """
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        decoder_outputs = self.decoder_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+            return_dict=True,
+            **kwargs,
+        )
+
+        hidden_states = decoder_outputs.last_hidden_state
+
+        label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
+
+        logits = self.scorer(
+            hidden_states=label_hidden,
+            input_ids=label_ids,
+            attention_mask=label_mask,
+        )
+
+        if labels is not None:
+            self.num_labels = logits.shape[-1]
+
+        loss = self.get_loss(logits, labels)
+
+        if not return_dict:
+            output = (logits,)
+            if use_cache:
+                output += (decoder_outputs.past_key_values,)
+            return (loss, *output) if loss is not None else output
+
+        return GLiClassOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=decoder_outputs.hidden_states if hasattr(decoder_outputs, "hidden_states") else None,
+            attentions=decoder_outputs.attentions if hasattr(decoder_outputs, "attentions") else None,
+            past_key_values=decoder_outputs.past_key_values if use_cache else None,
+        )
+
+
 class GLiClassModel(GLiClassPreTrainedModel):
     def __init__(self, config, from_pretrained=False):
         super().__init__(config)
@@ -963,6 +1227,8 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.model = GLiClassEncoderDecoder(config, from_pretrained)
         elif config.architecture_type == "encoder-decoder-cls":
             self.model = GLiClassEncoderDecoderCLS(config, from_pretrained)
+        elif config.architecture_type == "decoder-kv":
+            self.model = GLiClassDecoderKV(config, from_pretrained)
         self.post_init()
 
     def get_input_embeddings(self):
@@ -1006,6 +1272,8 @@ class GLiClassModel(GLiClassPreTrainedModel):
             encoder_model = self.model.encoder_decoder_model
         elif self.config.architecture_type in {"bi-encoder", "bi-encoder-fused"}:
             encoder_model = self.model.encoder_model
+        elif self.config.architecture_type == "decoder-kv":
+            encoder_model = self.model.decoder_model
         else:
             raise NotImplementedError("Tie weights is not implemented for this architecture type")
 
@@ -1045,6 +1313,8 @@ class GLiClassModel(GLiClassPreTrainedModel):
             model_embeds = self.model.encoder_decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         elif self.config.architecture_type in {"bi-encoder-fused"}:
             model_embeds = self.model.encoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        elif self.config.architecture_type == "decoder-kv":
+            model_embeds = self.model.decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError("Resizing is not implemented for bi-encoder architecture")
         self.config.encoder_config.vocab_size = model_embeds.num_embeddings
@@ -1057,3 +1327,15 @@ class GLiClassModel(GLiClassPreTrainedModel):
             kwargs.pop("adapter_ids", None)
         outputs = self.model(*args, **kwargs)
         return outputs
+
+    def update_decoder_cache(self, **kwargs):
+        """Extend a decoder-KV text cache."""
+        if self.config.architecture_type != "decoder-kv":
+            raise ValueError("Decoder cache updates require architecture_type='decoder-kv'.")
+        return self.model.update_decoder_cache(**kwargs)
+
+    def classify_from_decoder_cache(self, **kwargs) -> GLiClassOutput:
+        """Classify labels against a decoder-KV text cache."""
+        if self.config.architecture_type != "decoder-kv":
+            raise ValueError("Cached classification requires architecture_type='decoder-kv'.")
+        return self.model.classify_from_decoder_cache(**kwargs)
