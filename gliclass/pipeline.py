@@ -7,7 +7,7 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
-from .data_processing import format_decoder_kv_context, format_decoder_kv_labels, format_decoder_kv_sequence
+from .data_processing import format_decoder_kv_labels, format_decoder_kv_context, format_decoder_kv_sequence
 
 
 def flatten_hierarchical_labels(
