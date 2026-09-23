@@ -3,7 +3,18 @@
 import pytest
 import torch
 
-from gliclass.data_processing import pad_2d_tensor
+from gliclass.data_processing import GLiClassDataset, pad_2d_tensor
+
+
+def test_dataset_get_diversity_reads_examples():
+    dataset = object.__new__(GLiClassDataset)
+    dataset._data = [
+        {"_diversity": {"overall_diversity": 0.75}},
+        {},
+        {"_diversity": {"overall_diversity": 0.25}},
+    ]
+
+    assert dataset.get_diversity() == [0.75, 0.5, 0.25]
 
 
 class TestPad2DTensor:
