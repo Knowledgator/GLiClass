@@ -329,12 +329,13 @@ class GLiClassBaseModel(nn.Module):  # ):
                 loss_fct = nn.CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
+                reduction = self.config.focal_loss_reduction or "none"
                 all_losses = focal_loss_with_logits(
                     logits,
                     labels,
                     self.config.focal_loss_alpha,
                     self.config.focal_loss_gamma,
-                    self.config.focal_loss_reduction,
+                    reduction,
                 )
                 if classes_embedding_mask is not None:
                     all_losses = all_losses * classes_embedding_mask.float()
