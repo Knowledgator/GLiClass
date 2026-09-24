@@ -256,7 +256,7 @@ class GLiClassDataset(Dataset):
         print("Total labels: ", len(self.dataset_labels))
 
     def get_diversity(self):
-        return [item.get("_diversity", {}).get("overall_diversity", 0.5) for item in self.data]
+        return [item.get("_diversity", {}).get("overall_diversity", 0.5) for item in self._data]
 
     def collect_dataset_labels(self):
         dataset_labels = set()
