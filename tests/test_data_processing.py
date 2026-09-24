@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from gliclass.data_processing import GLiClassDataset, pad_2d_tensor
+from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset, pad_2d_tensor
 
 
 def test_dataset_get_diversity_reads_examples():
@@ -15,6 +15,30 @@ def test_dataset_get_diversity_reads_examples():
     ]
 
     assert dataset.get_diversity() == [0.75, 0.5, 0.25]
+
+
+def test_collator_stacks_scalar_labels_for_single_label_classification():
+    collator = DataCollatorWithPadding(device="cpu")
+    batch = [
+        {
+            "input_ids": torch.tensor([1, 2]),
+            "attention_mask": torch.tensor([1, 1]),
+            "labels": torch.tensor(0),
+            "labels_text": ["first"],
+        },
+        {
+            "input_ids": torch.tensor([3]),
+            "attention_mask": torch.tensor([1]),
+            "labels": torch.tensor(1),
+            "labels_text": ["second"],
+        },
+    ]
+
+    result = collator(batch)
+
+    assert torch.equal(result["labels"], torch.tensor([0, 1]))
+    assert result["labels"].shape == (2,)
+    assert result["max_num_classes"] == 1
 
 
 class TestPad2DTensor:

@@ -1,8 +1,11 @@
 """Tests for gliclass.loss_functions module."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
+from gliclass.model import GLiClassBaseModel
 from gliclass.loss_functions import sequence_contrastive_loss, focal_loss_with_logits
 
 
@@ -184,3 +187,25 @@ class TestFocalLossWithLogits:
 
         assert not torch.isnan(loss)
         assert loss >= 0
+
+
+def test_base_model_defaults_missing_focal_reduction_to_none_mode():
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            problem_type="multi_label_classification",
+            focal_loss_alpha=0.5,
+            focal_loss_gamma=2,
+            focal_loss_reduction=None,
+            contrastive_loss_coef=0,
+        ),
+        num_labels=2,
+    )
+
+    loss = GLiClassBaseModel.get_loss(
+        model,
+        logits=torch.tensor([[0.0, 1.0]]),
+        labels=torch.tensor([[0.0, 1.0]]),
+    )
+
+    assert loss.dim() == 0
+    assert torch.isfinite(loss)
