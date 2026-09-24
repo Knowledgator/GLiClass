@@ -486,7 +486,9 @@ class DataCollatorWithPadding:
         for key in keys:
             key_data = [item[key] for item in batch]
             if isinstance(key_data[0], torch.Tensor):
-                if key_data[0].dim() == 1:
+                if key_data[0].dim() == 0:
+                    padded_batch[key] = torch.stack(key_data)
+                elif key_data[0].dim() == 1:
                     padded_batch[key] = pad_sequence(key_data, batch_first=True)
                 elif key_data[0].dim() == 2:
                     padded_batch[key] = pad_2d_tensor(key_data)
