@@ -273,6 +273,9 @@ class EWC:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: str | None = field(default=None)
     optim: str = field(default="adamw_torch")
+    # GLiClass models take **kwargs, so the forward signature cannot tell which columns are unused
+    # (plain-dict samples, e.g. multi-modal ones, would otherwise lose every key)
+    remove_unused_columns: bool = field(default=False)
     others_lr: float | None = None
     others_weight_decay: float | None = 0.0
     recurrent_lr: float | None = field(

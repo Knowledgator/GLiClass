@@ -996,7 +996,15 @@ class GLiClassDecoderKV(nn.Module):
 
         config_name = config.encoder_config.__class__.__name__
 
-        if config_name == "Qwen3_5TextConfig":
+        if getattr(config, "multimodal", False):
+            # Base multi-modal model (no LM head): encodes images / audio and merges them into the sequence
+            if config_name == "Qwen3_5Config":
+                from transformers.models.qwen3_5 import Qwen3_5Model as ModelClass
+            elif config_name == "Gemma4Config":
+                from transformers.models.gemma4 import Gemma4Model as ModelClass
+            else:
+                raise ValueError(f"multimodal decoder-kv requires Qwen3.5 or Gemma 4. Got: {config_name}")
+        elif config_name == "Qwen3_5TextConfig":
             from transformers.models.qwen3_5 import Qwen3_5TextModel
 
             ModelClass = Qwen3_5TextModel
@@ -1016,11 +1024,18 @@ class GLiClassDecoderKV(nn.Module):
             self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name)
         else:
             self.decoder_model = ModelClass(config.encoder_config)
+            # multi-modal backbones build their sub-models in the config's dtype (e.g. bf16); match the scorer
+            self.decoder_model.to(torch.get_default_dtype())
 
         if config.vocab_size is not None and hasattr(self.decoder_model, "resize_token_embeddings"):
-            current_vocab = self.decoder_model.config.vocab_size
+            current_vocab = self.decoder_model.config.get_text_config().vocab_size
             if current_vocab != config.vocab_size:
                 self.decoder_model.resize_token_embeddings(config.vocab_size)
+
+        if getattr(config, "multimodal", False) and getattr(config, "freeze_media_encoders", True):
+            from .multimodal import freeze_media_encoders
+
+            freeze_media_encoders(self.decoder_model)
 
         from .scorers import DecoderKVScorer
 
@@ -1037,7 +1052,8 @@ class GLiClassDecoderKV(nn.Module):
         if labels is not None:
             # Sequence truncation may cut label tokens → align labels to logits
             num_labels = logits.shape[-1]
-            if labels.shape[-1] != num_labels:
+            # single-label targets are class indices (batch,); only per-label targets need aligning
+            if labels.dim() > 1 and labels.shape[-1] != num_labels:
                 labels = labels[:, :num_labels]
 
             if self.config.problem_type == "multi_label_classification":
@@ -1136,7 +1152,7 @@ class GLiClassDecoderKV(nn.Module):
             step_entropies: (num_steps,) detached mean label entropy per step, for monitoring
         """
         num_labels = step_logits[-1].shape[-1]
-        if labels.shape[-1] != num_labels:
+        if labels.dim() > 1 and labels.shape[-1] != num_labels:
             labels = labels[:, :num_labels]
         if valid_labels is None:
             valid_labels = torch.ones_like(step_logits[-1], dtype=torch.bool)
@@ -1556,7 +1572,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             model_embeds = self.model.decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError("Resizing is not implemented for bi-encoder architecture")
-        self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+        self.config.encoder_config.get_text_config().vocab_size = model_embeds.num_embeddings
         self.config.vocab_size = model_embeds.num_embeddings
         self.vocab_size = model_embeds.num_embeddings
         return model_embeds

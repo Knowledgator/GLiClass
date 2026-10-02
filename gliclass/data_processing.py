@@ -6,10 +6,15 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+from .multimodal import MEDIA_KEYS, collate_media, is_processor, process_multimodal_with_budget
 
-def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "") -> str:
-    """Format the persistent context portion of a decoder-KV sequence."""
-    return f"{prompt}{examples}{text}"
+
+def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "", media: str = "") -> str:
+    """Format the persistent context portion of a decoder-KV sequence.
+
+    media: image / audio placeholder tokens (see gliclass.multimodal.format_media_prefix), placed before the text.
+    """
+    return f"{prompt}{examples}{media}{text}"
 
 
 def format_decoder_kv_labels(
@@ -34,9 +39,10 @@ def format_decoder_kv_sequence(
     examples: str = "",
     label_token: str = "<<LABEL>>",
     sep_token: str = "<<SEP>>",
+    media: str = "",
 ) -> str:
     """Format a complete decoder-KV sequence for training or classic inference."""
-    return format_decoder_kv_context(text, prompt, examples) + format_decoder_kv_labels(
+    return format_decoder_kv_context(text, prompt, examples, media) + format_decoder_kv_labels(
         labels,
         label_token=label_token,
         sep_token=sep_token,
@@ -341,17 +347,25 @@ class GLiClassDataset(Dataset):
         examples_text = self.format_examples(example)
         text = str(example["text"])
 
-        input_text = format_decoder_kv_sequence(
-            text,
-            example["all_labels"],
-            prompt=prompt,
-            examples=examples_text,
-            label_token=self.label_token,
-            sep_token=self.sep_token,
-        )
+        def build(text, media=""):
+            return format_decoder_kv_sequence(
+                text,
+                example["all_labels"],
+                prompt=prompt,
+                examples=examples_text,
+                label_token=self.label_token,
+                sep_token=self.sep_token,
+                media=media,
+            )
+
         label2idx = {label: idx for idx, label in enumerate(example["all_labels"])}
 
-        tokenized_inputs = self.tokenize(input_text)
+        if is_processor(self.tokenizer):
+            tokenized_inputs = process_multimodal_with_budget(
+                self.tokenizer, build, text, example.get("images") or [], example.get("audio") or [], self.max_length
+            )
+        else:
+            tokenized_inputs = self.tokenize(build(text))
         tokenized_inputs["labels"] = self.prepare_labels(example, label2idx, self.problem_type)
         tokenized_inputs["labels_text"] = example["all_labels"]
         tokenized_inputs["input_texts"] = example["text"]
@@ -480,7 +494,8 @@ class DataCollatorWithPadding:
         return None  # 'fixed': model uses config.max_num_classes
 
     def __call__(self, batch):
-        keys = batch[0].keys()
+        # Media tensors are indexed by image / audio item and only present in samples that have media
+        keys = [key for key in batch[0].keys() if key not in MEDIA_KEYS]
         padded_batch = {key: [] for key in keys}
 
         for key in keys:
@@ -508,5 +523,6 @@ class DataCollatorWithPadding:
             else:
                 raise TypeError(f"Unsupported data type: {type(key_data[0])}")
 
+        padded_batch.update(collate_media(batch))
         padded_batch["max_num_classes"] = self._resolve_max_num_classes(batch)
         return padded_batch

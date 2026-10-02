@@ -77,6 +77,8 @@ class GLiClassModelConfig(PretrainedConfig):
         calibrator_beta_max=3.0,
         calibrator_dropout=0.1,
         calibrator_use_bias=False,
+        multimodal=False,
+        freeze_media_encoders=True,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -109,13 +111,16 @@ class GLiClassModelConfig(PretrainedConfig):
             self.label_model_config = None
         self.label_model_name = label_model_name
 
+        # Multi-modal backbones have a composite config; text attributes live in its text config
+        text_config = self.encoder_config.get_text_config()
+
         if hidden_size is None:
-            self.hidden_size = self.encoder_config.hidden_size
+            self.hidden_size = text_config.hidden_size
         else:
             self.hidden_size = hidden_size
 
         if vocab_size is None:
-            self.vocab_size = self.encoder_config.vocab_size
+            self.vocab_size = text_config.vocab_size
         else:
             self.vocab_size = vocab_size
 
@@ -160,7 +165,7 @@ class GLiClassModelConfig(PretrainedConfig):
         self.layer_wise = layer_wise
         self.encoder_layer_id = encoder_layer_id
         self.embed_class_token = embed_class_token
-        self.pad_token_id = self.encoder_config.pad_token_id
+        self.pad_token_id = text_config.pad_token_id
         self.dropout = dropout
         self.use_segment_embeddings = use_segment_embeddings
 
@@ -197,5 +202,10 @@ class GLiClassModelConfig(PretrainedConfig):
         self.calibrator_beta_max = calibrator_beta_max
         self.calibrator_dropout = calibrator_dropout
         self.calibrator_use_bias = calibrator_use_bias
+
+        # decoder-kv: keep the backbone's vision / audio encoders (Qwen3_5Model, Gemma4Model) so images and
+        # audio can be supplied next to text; freeze_media_encoders keeps those encoders fixed during training.
+        self.multimodal = multimodal
+        self.freeze_media_encoders = freeze_media_encoders
 
         super().__init__(problem_type=problem_type, **kwargs)
