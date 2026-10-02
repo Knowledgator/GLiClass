@@ -8,6 +8,8 @@ calibrated logits and keeps the raw ones in `uncalibrated_logits`; the pipeline 
 Example:
     python calibrate.py --model_path models/checkpoint-1000 --data_path data/val.json
         --save_path models/checkpoint-1000-calibrated
+
+For multi-modal decoder-kv models, data items may carry "images" / "audio" lists as in training.
 """
 
 import os
@@ -18,7 +20,7 @@ import random
 import argparse
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 from torch.utils.data import DataLoader
 
 from gliclass import GLiClassModel
@@ -57,7 +59,9 @@ def main(args):
     device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 
     model = GLiClassModel.from_pretrained(args.model_path, torch_dtype=DTYPES[args.dtype]).to(device)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    # multi-modal decoder-kv: the processor also prepares the images / audio of each data item
+    tokenizer_class = AutoProcessor if getattr(model.config, "multimodal", False) else AutoTokenizer
+    tokenizer = tokenizer_class.from_pretrained(args.model_path)
     model.eval()
     model.requires_grad_(False)
 
