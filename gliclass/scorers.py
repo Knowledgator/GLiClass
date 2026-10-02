@@ -221,6 +221,13 @@ class DecoderKVScorer(nn.Module):
 
         self.epsilon = 1e-8
 
+        # GRU-style recurrent reasoning over scorer_encoder. Gates are step-agnostic (no step
+        # embeddings), so inference can run more steps than were seen during training.
+        self.recurrent = getattr(config, "recurrent_steps", 1) > 1
+        if self.recurrent:
+            self.reset_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
+            self.update_gate = nn.Linear(config.hidden_size * 2, config.hidden_size)
+
     def _extract_representations(self, hidden_states, input_ids, attention_mask):
         """
         Extract text and label representations from hidden states.
@@ -267,14 +274,107 @@ class DecoderKVScorer(nn.Module):
             hidden_states: (batch_size, seq_length, hidden_size) from decoder backbone
             input_ids: (batch_size, seq_length)
             attention_mask: (batch_size, seq_length)
+            **kwargs: recurrence options, see recurrent_forward
 
         Returns:
             logits: (batch_size, num_labels)
         """
-        encoder_outputs = self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True)
+        step_logits, _ = self.recurrent_forward(hidden_states, input_ids, attention_mask, **kwargs)
+        return step_logits[-1]
 
-        contextualized_hidden_states = encoder_outputs.last_hidden_state
+    def _encode(self, hidden_states, attention_mask):
+        return self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True).last_hidden_state
 
+    def _recurrent_step(self, state, inputs, attention_mask):
+        """h_t = (1 - z) * h_{t-1} + z * Enc(r * h_{t-1} + (1 - r) * x), x = decoder hidden states."""
+        reset = torch.sigmoid(self.reset_gate(torch.cat([state, inputs], dim=-1)))
+        candidate = self._encode(reset * state + (1 - reset) * inputs, attention_mask)
+        update = torch.sigmoid(self.update_gate(torch.cat([state, candidate], dim=-1)))
+        return (1 - update) * state + update * candidate
+
+    def _valid_label_mask(self, input_ids, attention_mask, num_labels):
+        label_counts = (input_ids.eq(self.config.class_token_index) & attention_mask.bool()).sum(dim=1)
+        return torch.arange(num_labels, device=input_ids.device).unsqueeze(0) < label_counts.unsqueeze(1)
+
+    def _probabilities(self, logits, valid_labels):
+        if self.config.problem_type == "single_label_classification":
+            return torch.softmax(logits.masked_fill(~valid_labels, float("-inf")), dim=-1).nan_to_num(0.0)
+        return torch.sigmoid(logits)
+
+    def recurrent_forward(
+        self,
+        hidden_states,
+        input_ids,
+        attention_mask,
+        num_steps=1,
+        halt_threshold=None,
+        return_all_steps=False,
+        **kwargs,
+    ):
+        """Run step 1 (one scorer_encoder pass) and up to num_steps - 1 gated recurrent steps.
+
+        With halt_threshold, an example stops once no valid label probability moves by
+        halt_threshold or more between consecutive steps; its state and logits are frozen.
+
+        Returns:
+            step_logits: list of (batch_size, num_labels) logits for every step if
+                return_all_steps, otherwise a single-element list with the final logits
+            steps_taken: (batch_size,) number of steps each example ran
+        """
+        if num_steps > 1 and not self.recurrent:
+            raise ValueError("num_steps > 1 requires a scorer built with config.recurrent_steps > 1.")
+
+        bptt_steps = getattr(self.config, "recurrent_bptt_steps", None)
+
+        state = self._encode(hidden_states, attention_mask)
+        logits = self._score(state, input_ids, attention_mask)
+        step_logits = [logits]
+
+        batch_size, num_labels = logits.shape
+        steps_taken = torch.ones(batch_size, dtype=torch.long, device=logits.device)
+        active = torch.ones(batch_size, dtype=torch.bool, device=logits.device)
+        if halt_threshold:
+            valid_labels = self._valid_label_mask(input_ids, attention_mask, num_labels)
+
+        for step in range(1, num_steps):
+            if bptt_steps and step % bptt_steps == 0:
+                # truncated BPTT: later losses stop shaping earlier iterations
+                state = state.detach()
+
+            new_state = self._recurrent_step(state, hidden_states, attention_mask)
+            new_logits = self._score(new_state, input_ids, attention_mask)
+
+            if halt_threshold:
+                change = (
+                    (self._probabilities(new_logits, valid_labels) - self._probabilities(logits, valid_labels))
+                    .abs()
+                    .masked_fill(~valid_labels, 0.0)
+                    .amax(dim=-1)
+                )
+                new_state = torch.where(active[:, None, None], new_state, state)
+                new_logits = torch.where(active[:, None], new_logits, logits)
+                steps_taken = steps_taken + active.long()
+                active = active & change.ge(halt_threshold)
+            else:
+                steps_taken = steps_taken + 1
+
+            state, logits = new_state, new_logits
+            if return_all_steps:
+                step_logits.append(logits)
+            else:
+                step_logits[-1] = logits
+
+            if halt_threshold and not active.any():
+                break
+
+        if self.recurrent and self.training:
+            # keep the gates in the graph for DDP when the sampled depth is 1
+            unused = sum(param.sum() for param in (*self.reset_gate.parameters(), *self.update_gate.parameters()))
+            step_logits[-1] = step_logits[-1] + 0.0 * unused
+
+        return step_logits, steps_taken
+
+    def _score(self, contextualized_hidden_states, input_ids, attention_mask):
         text_repr, label_repr = self._extract_representations(contextualized_hidden_states, input_ids, attention_mask)
 
         text_repr = self.text_projector(text_repr)

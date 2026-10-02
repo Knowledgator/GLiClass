@@ -60,6 +60,14 @@ class GLiClassModelConfig(PretrainedConfig):
         dropout=0.1,
         use_segment_embeddings=False,
         scorer_encoder_num_layers=2,
+        recurrent_steps=1,
+        recurrent_min_steps=1,
+        recurrent_inference=True,
+        recurrent_inference_max_steps=None,
+        recurrent_halt_threshold=0.01,
+        recurrent_improvement_coef=0.1,
+        recurrent_improvement_margin=0.0,
+        recurrent_bptt_steps=None,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -148,5 +156,19 @@ class GLiClassModelConfig(PretrainedConfig):
         self.use_segment_embeddings = use_segment_embeddings
 
         self.scorer_encoder_num_layers = scorer_encoder_num_layers
+
+        # Recurrent hidden reasoning for the decoder-kv scorer (recurrent_steps=1 disables it).
+        # Training depth is sampled uniformly from [recurrent_min_steps, recurrent_steps].
+        self.recurrent_steps = recurrent_steps
+        self.recurrent_min_steps = recurrent_min_steps
+        # Inference: run up to recurrent_inference_max_steps (default recurrent_steps, may exceed it) and
+        # stop an example once no label probability changes by recurrent_halt_threshold (None/0 = never).
+        self.recurrent_inference = recurrent_inference
+        self.recurrent_inference_max_steps = recurrent_inference_max_steps
+        self.recurrent_halt_threshold = recurrent_halt_threshold
+        # Hinge relu(l_t - (1 - margin) * sg(l_{t-1})) for steps t >= 3, on top of a loss at every step.
+        self.recurrent_improvement_coef = recurrent_improvement_coef
+        self.recurrent_improvement_margin = recurrent_improvement_margin
+        self.recurrent_bptt_steps = recurrent_bptt_steps
 
         super().__init__(problem_type=problem_type, **kwargs)

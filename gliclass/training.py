@@ -319,6 +319,8 @@ class Trainer(transformers.Trainer):
         self.ewc = ewc
         self.prev_dataset = prev_dataset
         self._ewc_initialized = ewc is not None
+        # running sums of per-step losses of recurrent scorers, flushed in log()
+        self._recurrent_loss_sums = {}
 
     def _maybe_initialize_ewc(self):
         """Initialize EWC if needed and not already initialized."""
@@ -369,11 +371,8 @@ class Trainer(transformers.Trainer):
             Loss tensor, or tuple of (loss, outputs) if return_outputs=True
         """
         # Get base loss from parent
-        if return_outputs:
-            loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
-        else:
-            loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
-            outputs = None
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        self._track_recurrent_losses(model, outputs)
 
         # Add EWC penalty if enabled
         if self.ewc is not None and self.args.use_ewc:
@@ -384,6 +383,22 @@ class Trainer(transformers.Trainer):
         if return_outputs:
             return loss, outputs
         return loss
+
+    def _track_recurrent_losses(self, model, outputs):
+        step_losses = outputs.get("recurrent_losses") if isinstance(outputs, dict) else None
+        if step_losses is None or not model.training:
+            return
+        for step, value in enumerate(step_losses.tolist(), start=1):
+            total, count = self._recurrent_loss_sums.get(step, (0.0, 0))
+            self._recurrent_loss_sums[step] = (total + value, count + 1)
+
+    def log(self, logs, *args, **kwargs):
+        """Add mean per-step losses of recurrent scorers to training logs."""
+        if "loss" in logs and self._recurrent_loss_sums:
+            for step, (total, count) in sorted(self._recurrent_loss_sums.items()):
+                logs[f"loss_step_{step}"] = round(total / count, 4)
+            self._recurrent_loss_sums = {}
+        return super().log(logs, *args, **kwargs)
 
     def train(self, *args, **kwargs):
         """Train with EWC initialization."""

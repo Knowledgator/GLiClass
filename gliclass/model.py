@@ -62,6 +62,9 @@ class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: torch.Tensor | None = None
     class_embeddings: torch.Tensor | None = None
     past_key_values: Any | None = None
+    recurrent_logits: Tuple[torch.Tensor, ...] | None = None
+    recurrent_losses: torch.Tensor | None = None
+    recurrent_num_steps: torch.Tensor | None = None
 
 
 class GLiClassPreTrainedModel(PreTrainedModel):
@@ -1042,6 +1045,78 @@ class GLiClassDecoderKV(nn.Module):
                 raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
         return loss
 
+    def _resolve_recurrence(self, use_recurrence=None, max_recurrent_steps=None, halt_threshold=None):
+        """Pick (num_steps, halt_threshold) for this call.
+
+        Training: depth sampled uniformly from [recurrent_min_steps, max], no halting.
+        Inference: up to max steps, halting per example once probabilities stop changing.
+        """
+        if not self.scorer.recurrent:
+            return 1, None
+        if use_recurrence is None:
+            use_recurrence = self.training or self.config.recurrent_inference
+        if not use_recurrence:
+            return 1, None
+
+        if self.training:
+            max_steps = max_recurrent_steps or self.config.recurrent_steps
+            min_steps = min(self.config.recurrent_min_steps or 1, max_steps)
+            return int(torch.randint(min_steps, max_steps + 1, (1,)).item()), None
+
+        max_steps = max_recurrent_steps or self.config.recurrent_inference_max_steps or self.config.recurrent_steps
+        if halt_threshold is None:
+            halt_threshold = self.config.recurrent_halt_threshold
+        return max_steps, halt_threshold
+
+    def _per_sample_loss(self, logits, labels):
+        """Unreduced loss per example, shape (batch,)."""
+        if self.config.problem_type == "multi_label_classification":
+            from .loss_functions import focal_loss_with_logits
+
+            all_losses = focal_loss_with_logits(
+                logits,
+                labels,
+                self.config.focal_loss_alpha,
+                self.config.focal_loss_gamma,
+                "none",
+            )
+            valid = labels.ne(self.config.ignore_index)
+            return all_losses.sum(-1) / valid.sum(-1).clamp_min(1)
+        elif self.config.problem_type == "single_label_classification":
+            return nn.functional.cross_entropy(
+                logits, labels.view(-1), ignore_index=self.config.ignore_index, reduction="none"
+            )
+        raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
+
+    def get_recurrent_loss(self, step_logits, labels):
+        """Loss over all reasoning steps.
+
+        loss = mean_t L_t                                                 (focal loss after every step)
+             + coef * mean_{t>=3} relu(l_t - (1 - margin) * sg(l_{t-1}))  (deeper must beat shallower)
+
+        The improvement term starts at step 3 vs step 2, so step 1 is only ever trained by its own
+        loss. The stop-gradient on l_{t-1} means the hinge can only push the deeper step down; it
+        never rewards making the earlier step worse.
+
+        Returns:
+            loss: scalar
+            step_losses: (num_steps,) detached mean loss per step, for monitoring
+        """
+        num_labels = step_logits[-1].shape[-1]
+        if labels.shape[-1] != num_labels:
+            labels = labels[:, :num_labels]
+
+        per_sample = torch.stack([self._per_sample_loss(logits, labels) for logits in step_logits])  # (T, B)
+        step_losses = per_sample.mean(dim=1)
+        loss = step_losses.mean()
+
+        if len(step_logits) >= 3 and self.config.recurrent_improvement_coef > 0:
+            target = (1.0 - self.config.recurrent_improvement_margin) * per_sample[1:-1].detach()
+            improvement = torch.relu(per_sample[2:] - target).mean()
+            loss = loss + self.config.recurrent_improvement_coef * improvement
+
+        return loss, step_losses.detach()
+
     def _extract_label_section(
         self,
         hidden_states: torch.Tensor,
@@ -1131,6 +1206,9 @@ class GLiClassDecoderKV(nn.Module):
         label_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values,
+        use_recurrence: bool | None = None,
+        max_recurrent_steps: int | None = None,
+        halt_threshold: float | None = None,
     ) -> GLiClassOutput:
         """Classify label tokens against a text cache without persisting labels."""
         decoder_outputs = self.decoder_model(
@@ -1144,12 +1222,15 @@ class GLiClassDecoderKV(nn.Module):
 
         label_hidden = decoder_outputs.last_hidden_state[:, -input_ids.shape[1] :, :]
         scorer_device = next(self.scorer.parameters()).device
-        logits = self.scorer(
+        num_steps, halt_threshold = self._resolve_recurrence(use_recurrence, max_recurrent_steps, halt_threshold)
+        step_logits, steps_taken = self.scorer.recurrent_forward(
             hidden_states=label_hidden.to(scorer_device),
             input_ids=input_ids.to(scorer_device),
             attention_mask=label_mask.to(scorer_device),
+            num_steps=num_steps,
+            halt_threshold=halt_threshold,
         )
-        return GLiClassOutput(logits=logits)
+        return GLiClassOutput(logits=step_logits[-1], recurrent_num_steps=steps_taken)
 
     def forward(
         self,
@@ -1159,6 +1240,10 @@ class GLiClassDecoderKV(nn.Module):
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
         use_cache: bool = False,
+        use_recurrence: bool | None = None,
+        max_recurrent_steps: int | None = None,
+        halt_threshold: float | None = None,
+        output_recurrent_logits: bool = False,
         **kwargs,
     ):
         """Forward pass.
@@ -1170,9 +1255,13 @@ class GLiClassDecoderKV(nn.Module):
             labels: Classification labels
             return_dict: Return dict output
             use_cache: Whether to return updated cache
+            use_recurrence: Enable/disable scorer recurrence for this call (default: config)
+            max_recurrent_steps: Max reasoning steps for this call (training samples depth up to it)
+            halt_threshold: Inference early-stop threshold on label probability change (0 disables)
+            output_recurrent_logits: Return logits of every reasoning step
 
         Returns:
-            GLiClassOutput with logits, loss, and optionally past_key_values
+            GLiClassOutput with logits (of the last step), loss, and optionally past_key_values
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1189,16 +1278,25 @@ class GLiClassDecoderKV(nn.Module):
 
         label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
 
-        logits = self.scorer(
+        num_steps, halt_threshold = self._resolve_recurrence(use_recurrence, max_recurrent_steps, halt_threshold)
+        step_logits, steps_taken = self.scorer.recurrent_forward(
             hidden_states=label_hidden,
             input_ids=label_ids,
             attention_mask=label_mask,
+            num_steps=num_steps,
+            halt_threshold=halt_threshold,
+            return_all_steps=labels is not None or output_recurrent_logits,
         )
+        logits = step_logits[-1]
 
         if labels is not None:
             self.num_labels = logits.shape[-1]
 
-        loss = self.get_loss(logits, labels)
+        recurrent_losses = None
+        if len(step_logits) > 1 and labels is not None:
+            loss, recurrent_losses = self.get_recurrent_loss(step_logits, labels)
+        else:
+            loss = self.get_loss(logits, labels)
 
         if not return_dict:
             output = (logits,)
@@ -1212,6 +1310,9 @@ class GLiClassDecoderKV(nn.Module):
             hidden_states=decoder_outputs.hidden_states if hasattr(decoder_outputs, "hidden_states") else None,
             attentions=decoder_outputs.attentions if hasattr(decoder_outputs, "attentions") else None,
             past_key_values=decoder_outputs.past_key_values if use_cache else None,
+            recurrent_logits=tuple(step_logits) if output_recurrent_logits else None,
+            recurrent_losses=recurrent_losses,
+            recurrent_num_steps=steps_taken if num_steps > 1 else None,
         )
 
 
