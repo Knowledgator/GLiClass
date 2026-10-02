@@ -6,7 +6,7 @@ import json
 
 from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 import transformers
-from transformers import AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig, AutoProcessor
 from torch.utils.data import WeightedRandomSampler
 from packaging import version
 
@@ -16,6 +16,7 @@ import torch
 from gliclass import GLiClassModelConfig, GLiClassModel
 from gliclass.training import TrainingArguments, Trainer
 from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset, AugmentationConfig
+from gliclass.multimodal import get_tokenizer
 
 class CustomTrainer(Trainer):
     """Trainer with weighted random sampling support."""
@@ -89,6 +90,24 @@ def load_dataset(data_path: str) -> list:
     return data
 
 
+def recurrent_kwargs(args):
+    """Recurrent reasoning settings for the decoder-kv scorer; unset flags keep config/checkpoint values."""
+    kwargs = dict(
+        recurrent_steps=args.recurrent_steps,
+        recurrent_min_steps=args.recurrent_min_steps,
+        recurrent_inference_max_steps=args.recurrent_inference_max_steps,
+        recurrent_halt_threshold=args.recurrent_halt_threshold,
+        recurrent_improvement_coef=args.recurrent_improvement_coef,
+        recurrent_improvement_margin=args.recurrent_improvement_margin,
+        recurrent_bptt_steps=args.recurrent_bptt_steps,
+        recurrent_read_text=args.recurrent_read_text,
+        recurrent_confidence_coef=args.recurrent_confidence_coef,
+        recurrent_confidence_mode=args.recurrent_confidence_mode,
+        recurrent_confidence_margin=args.recurrent_confidence_margin,
+    )
+    return {key: value for key, value in kwargs.items() if value is not None}
+
+
 def main(args):
     device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
@@ -98,11 +117,16 @@ def main(args):
             args.model_name, 
             focal_loss_alpha=args.focal_loss_alpha,
             focal_loss_gamma=args.focal_loss_gamma,
-            focal_loss_reduction=args.focal_loss_reduction
+            focal_loss_reduction=args.focal_loss_reduction,
+            **recurrent_kwargs(args),
         )
-        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        # multi-modal decoder-kv: the processor tokenizes text and prepares images / audio
+        tokenizer_class = AutoProcessor if model.config.multimodal else AutoTokenizer
+        tokenizer = tokenizer_class.from_pretrained(args.model_name)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(args.encoder_model_name)
+        tokenizer_class = AutoProcessor if args.multimodal else AutoTokenizer
+        tokenizer = tokenizer_class.from_pretrained(args.encoder_model_name)
+        text_tokenizer = get_tokenizer(tokenizer)
         encoder_config = AutoConfig.from_pretrained(args.encoder_model_name)
 
         label_model_config = None
@@ -114,9 +138,9 @@ def main(args):
             encoder_model=args.encoder_model_name,
             label_model_name=args.label_model_name,
             label_model_config=label_model_config,
-            class_token_index=len(tokenizer),
-            text_token_index=len(tokenizer)+1,
-            example_token_index=len(tokenizer)+2,
+            class_token_index=len(text_tokenizer),
+            text_token_index=len(text_tokenizer)+1,
+            example_token_index=len(text_tokenizer)+2,
             pooling_strategy=args.pooler_type,
             class_token_pooling=args.class_token_pooling,
             scorer_type=args.scorer_type,
@@ -135,14 +159,20 @@ def main(args):
             shuffle_labels=args.shuffle_labels,
             dropout=args.dropout,
             use_segment_embeddings=args.use_segment_embeddings,
+            multimodal=args.multimodal,
+            freeze_media_encoders=not args.train_media_encoders,
+            **recurrent_kwargs(args),
         )
+        if args.architecture_type == 'decoder-kv':
+            # <<SEP>> is added right after <<LABEL>> below
+            glicalss_config.sep_token_index = len(text_tokenizer) + 1
 
         model = GLiClassModel(glicalss_config, from_pretrained=True).to(dtype=torch.float32)
 
-        if args.architecture_type in {'uni-encoder', 'bi-encoder-fused', 'encoder-decoder'}:
+        if args.architecture_type in {'uni-encoder', 'bi-encoder-fused', 'encoder-decoder', 'decoder-kv'}:
             new_words = ["<<LABEL>>", "<<SEP>>", "<<EXAMPLE>>"]
-            tokenizer.add_tokens(new_words, special_tokens=True)
-            model.resize_token_embeddings(len(tokenizer))
+            text_tokenizer.add_tokens(new_words, special_tokens=True)
+            model.resize_token_embeddings(len(text_tokenizer))
 
     model.to(device)
 
@@ -224,8 +254,12 @@ def main(args):
         weight_decay=args.encoder_weight_decay,
         others_lr=args.others_lr,
         others_weight_decay=args.others_weight_decay,
+        recurrent_lr=args.recurrent_lr,
         lr_scheduler_type=args.lr_scheduler_type,
-        warmup_ratio=args.warmup_ratio,
+        optim=args.optim,
+        # transformers v5 dropped warmup_ratio; a float warmup_steps is a ratio there
+        **({"warmup_steps": args.warmup_ratio} if version.parse(transformers.__version__) >= version.parse("5.0.0")
+           else {"warmup_ratio": args.warmup_ratio}),
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
@@ -233,10 +267,11 @@ def main(args):
         save_steps=args.save_steps,
         save_total_limit=args.save_total_limit,
         dataloader_num_workers=args.num_workers,
-        logging_steps=100,
+        logging_steps=args.logging_steps,
         use_cpu=False,
         report_to="none",
         fp16=args.fp16,
+        bf16=args.bf16,
         # EWC parameters
         use_ewc=args.use_ewc,
         ewc_lambda=args.ewc_lambda,
@@ -321,6 +356,33 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.3)
     parser.add_argument('--shuffle_labels', type=bool, default=True)
     parser.add_argument('--use_segment_embeddings', type=bool, default=False)
+    parser.add_argument('--multimodal', action='store_true',
+                        help='decoder-kv: keep the vision / audio encoders of Qwen3.5 / Gemma 4; '
+                             'data items may then carry "images" and "audio" lists')
+    parser.add_argument('--train_media_encoders', action='store_true',
+                        help='Also train the vision / audio encoders (frozen by default)')
+
+    # Recurrent hidden reasoning (decoder-kv scorer)
+    parser.add_argument('--recurrent_steps', type=int, default=None,
+                        help='Max scorer reasoning steps during training (default 1 = disabled)')
+    parser.add_argument('--recurrent_min_steps', type=int, default=None,
+                        help='Min training steps; depth is sampled from [min, max] per batch (default 1)')
+    parser.add_argument('--recurrent_inference_max_steps', type=int, default=None,
+                        help='Max reasoning steps at inference (default: recurrent_steps)')
+    parser.add_argument('--recurrent_halt_threshold', type=float, default=None,
+                        help='Stop inference recurrence once label probabilities change less than this')
+    parser.add_argument('--recurrent_improvement_coef', type=float, default=None)
+    parser.add_argument('--recurrent_improvement_margin', type=float, default=None)
+    parser.add_argument('--recurrent_bptt_steps', type=int, default=None)
+    parser.add_argument('--recurrent_read_text', action='store_true', default=None,
+                        help='Let every recurrent step cross-attend to the text (default: labels only)')
+    parser.add_argument('--recurrent_confidence_coef', type=float, default=None,
+                        help='Weight of the confidence (low-entropy) loss on recurrent steps (default 0 = off)')
+    parser.add_argument('--recurrent_confidence_mode', type=str, default=None, choices=['relative', 'absolute'])
+    parser.add_argument('--recurrent_confidence_margin', type=float, default=None,
+                        help='relative mode: each step must cut entropy by this fraction vs the previous step')
+    parser.add_argument('--recurrent_lr', type=float, default=None,
+                        help='Learning rate for the recurrent reasoning cell (default: others_lr)')
 
     # Training arguments
     parser.add_argument('--num_epochs', type=int, default=3)
@@ -332,11 +394,15 @@ if __name__ == '__main__':
     parser.add_argument('--others_weight_decay', type=float, default=0.01)
     parser.add_argument('--warmup_ratio', type=float, default=0.05)
     parser.add_argument('--lr_scheduler_type', type=str, default='linear')
+    parser.add_argument('--optim', type=str, default='adamw_torch',
+                        help='transformers optimizer name, e.g. adafactor to fit larger backbones in memory')
     parser.add_argument('--max_length', type=int, default=1024)
     parser.add_argument('--save_steps', type=int, default=1000)
     parser.add_argument('--save_total_limit', type=int, default=3)
     parser.add_argument('--num_workers', type=int, default=12)
     parser.add_argument('--fp16', type=bool, default=False)
+    parser.add_argument('--bf16', action='store_true')
+    parser.add_argument('--logging_steps', type=int, default=100)
     
     # Augmentation parameters
     parser.add_argument('--enable_augmentation', type=bool, default=True)
