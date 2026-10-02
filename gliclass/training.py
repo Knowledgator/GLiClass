@@ -275,6 +275,9 @@ class TrainingArguments(transformers.TrainingArguments):
     optim: str = field(default="adamw_torch")
     others_lr: float | None = None
     others_weight_decay: float | None = 0.0
+    recurrent_lr: float | None = field(
+        default=None, metadata={"help": "Learning rate for the decoder-kv scorer's recurrent reasoning cell."}
+    )
 
     use_ewc: bool = field(
         default=False, metadata={"help": "Whether to use Elastic Weight Consolidation (EWC) for continual learning."}
@@ -385,18 +388,21 @@ class Trainer(transformers.Trainer):
         return loss
 
     def _track_recurrent_losses(self, model, outputs):
-        step_losses = outputs.get("recurrent_losses") if isinstance(outputs, dict) else None
-        if step_losses is None or not model.training:
+        if not isinstance(outputs, dict) or not model.training:
             return
-        for step, value in enumerate(step_losses.tolist(), start=1):
-            total, count = self._recurrent_loss_sums.get(step, (0.0, 0))
-            self._recurrent_loss_sums[step] = (total + value, count + 1)
+        for key, prefix in (("recurrent_losses", "loss_step"), ("recurrent_entropies", "entropy_step")):
+            values = outputs.get(key)
+            if values is None:
+                continue
+            for step, value in enumerate(values.tolist(), start=1):
+                total, count = self._recurrent_loss_sums.get((prefix, step), (0.0, 0))
+                self._recurrent_loss_sums[(prefix, step)] = (total + value, count + 1)
 
     def log(self, logs, *args, **kwargs):
-        """Add mean per-step losses of recurrent scorers to training logs."""
+        """Add mean per-step losses and label entropies of recurrent scorers to training logs."""
         if "loss" in logs and self._recurrent_loss_sums:
-            for step, (total, count) in sorted(self._recurrent_loss_sums.items()):
-                logs[f"loss_step_{step}"] = round(total / count, 4)
+            for (prefix, step), (total, count) in sorted(self._recurrent_loss_sums.items()):
+                logs[f"{prefix}_{step}"] = round(total / count, 4)
             self._recurrent_loss_sums = {}
         return super().log(logs, *args, **kwargs)
 
@@ -604,11 +610,26 @@ class Trainer(transformers.Trainer):
                     },
                 ]
 
+            if getattr(self.args, "recurrent_lr", None) is not None:
+                optimizer_grouped_parameters = self._split_recurrent_groups(opt_model, optimizer_grouped_parameters)
+
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
         return self.optimizer
+
+    def _split_recurrent_groups(self, model, groups):
+        """Move reasoning-cell parameters into their own groups with args.recurrent_lr."""
+        recurrent_ids = {id(p) for name, p in model.named_parameters() if "reasoning_cell" in name}
+        split = []
+        for group in groups:
+            kept = [p for p in group["params"] if id(p) not in recurrent_ids]
+            moved = [p for p in group["params"] if id(p) in recurrent_ids]
+            split.append({**group, "params": kept})
+            if moved:
+                split.append({**group, "params": moved, "lr": self.args.recurrent_lr})
+        return split
 
 
 @dataclass

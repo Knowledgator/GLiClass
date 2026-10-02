@@ -66,8 +66,12 @@ class GLiClassModelConfig(PretrainedConfig):
         recurrent_inference_max_steps=None,
         recurrent_halt_threshold=0.01,
         recurrent_improvement_coef=0.1,
-        recurrent_improvement_margin=0.0,
+        recurrent_improvement_margin=0.05,
         recurrent_bptt_steps=None,
+        recurrent_read_text=False,
+        recurrent_confidence_coef=0.0,
+        recurrent_confidence_mode="relative",
+        recurrent_confidence_margin=0.0,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -167,8 +171,17 @@ class GLiClassModelConfig(PretrainedConfig):
         self.recurrent_inference_max_steps = recurrent_inference_max_steps
         self.recurrent_halt_threshold = recurrent_halt_threshold
         # Hinge relu(l_t - (1 - margin) * sg(l_{t-1})) for steps t >= 3, on top of a loss at every step.
+        # margin > 0 makes "no change" cost something, so the recurrence cannot settle into a copy of step 2.
         self.recurrent_improvement_coef = recurrent_improvement_coef
         self.recurrent_improvement_margin = recurrent_improvement_margin
         self.recurrent_bptt_steps = recurrent_bptt_steps
+        # False: recurrent steps see only the label section; True: each step also cross-attends to the text
+        self.recurrent_read_text = recurrent_read_text
+        # Confidence loss on recurrent steps (0 = off): push label probabilities away from 0.5.
+        # "relative": each step's mean label entropy must fall below (1 - margin) * the previous step's;
+        # "absolute": minimize the entropy of every recurrent step.
+        self.recurrent_confidence_coef = recurrent_confidence_coef
+        self.recurrent_confidence_mode = recurrent_confidence_mode
+        self.recurrent_confidence_margin = recurrent_confidence_margin
 
         super().__init__(problem_type=problem_type, **kwargs)

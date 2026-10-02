@@ -64,6 +64,7 @@ class GLiClassOutput(SequenceClassifierOutput):
     past_key_values: Any | None = None
     recurrent_logits: Tuple[torch.Tensor, ...] | None = None
     recurrent_losses: torch.Tensor | None = None
+    recurrent_entropies: torch.Tensor | None = None
     recurrent_num_steps: torch.Tensor | None = None
 
 
@@ -1088,23 +1089,44 @@ class GLiClassDecoderKV(nn.Module):
             )
         raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
 
-    def get_recurrent_loss(self, step_logits, labels):
+    def _per_sample_entropy(self, logits, valid_labels):
+        """Mean uncertainty per example over its real labels, shape (batch,).
+
+        Multi-label: binary entropy of each sigmoid probability (0 when p is 0 or 1, max at 0.5).
+        Single-label: entropy of the softmax over the example's labels.
+        """
+        if self.config.problem_type == "single_label_classification":
+            log_probs = torch.log_softmax(logits.masked_fill(~valid_labels, float("-inf")), dim=-1)
+            return -(log_probs.exp() * log_probs.masked_fill(~valid_labels, 0.0)).sum(-1)
+        probs = torch.sigmoid(logits)
+        entropy = nn.functional.binary_cross_entropy_with_logits(logits, probs, reduction="none")
+        return (entropy * valid_labels).sum(-1) / valid_labels.sum(-1).clamp_min(1)
+
+    def get_recurrent_loss(self, step_logits, labels, valid_labels=None):
         """Loss over all reasoning steps.
 
         loss = mean_t L_t                                                 (focal loss after every step)
              + coef * mean_{t>=3} relu(l_t - (1 - margin) * sg(l_{t-1}))  (deeper must beat shallower)
+             + conf_coef * confidence term on recurrent steps t >= 2      (deeper must be more certain)
 
         The improvement term starts at step 3 vs step 2, so step 1 is only ever trained by its own
         loss. The stop-gradient on l_{t-1} means the hinge can only push the deeper step down; it
         never rewards making the earlier step worse.
 
+        Confidence term (recurrent_confidence_coef > 0), with H_t the mean label entropy of step t:
+            "relative": relu(H_t - (1 - conf_margin) * sg(H_{t-1}))  each recurrence less uncertain than the last
+            "absolute": H_t                                          every recurrence as certain as possible
+
         Returns:
             loss: scalar
             step_losses: (num_steps,) detached mean loss per step, for monitoring
+            step_entropies: (num_steps,) detached mean label entropy per step, for monitoring
         """
         num_labels = step_logits[-1].shape[-1]
         if labels.shape[-1] != num_labels:
             labels = labels[:, :num_labels]
+        if valid_labels is None:
+            valid_labels = torch.ones_like(step_logits[-1], dtype=torch.bool)
 
         per_sample = torch.stack([self._per_sample_loss(logits, labels) for logits in step_logits])  # (T, B)
         step_losses = per_sample.mean(dim=1)
@@ -1115,14 +1137,28 @@ class GLiClassDecoderKV(nn.Module):
             improvement = torch.relu(per_sample[2:] - target).mean()
             loss = loss + self.config.recurrent_improvement_coef * improvement
 
-        return loss, step_losses.detach()
+        entropies = torch.stack([self._per_sample_entropy(logits, valid_labels) for logits in step_logits])  # (T, B)
+        confidence_coef = getattr(self.config, "recurrent_confidence_coef", 0.0)
+        if len(step_logits) >= 2 and confidence_coef > 0:
+            mode = getattr(self.config, "recurrent_confidence_mode", "relative")
+            if mode == "relative":
+                margin = getattr(self.config, "recurrent_confidence_margin", 0.0)
+                confidence = torch.relu(entropies[1:] - (1.0 - margin) * entropies[:-1].detach()).mean()
+            elif mode == "absolute":
+                confidence = entropies[1:].mean()
+            else:
+                raise ValueError(f"Unknown recurrent_confidence_mode: {mode}")
+            loss = loss + confidence_coef * confidence
+
+        return loss, step_losses.detach(), entropies.mean(dim=1).detach()
 
     def _extract_label_section(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_text_section: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """
         Extract label section hidden states from full-sequence decoder output.
 
@@ -1136,12 +1172,15 @@ class GLiClassDecoderKV(nn.Module):
             padded_hidden: (batch, max_label_len, hidden_size)
             padded_ids:    (batch, max_label_len)
             label_mask:    (batch, max_label_len)
+            with return_text_section, also everything before the label section:
+            text_hidden:   (batch, max_text_len, hidden_size)
+            text_mask:     (batch, max_text_len)
         """
         batch_size = hidden_states.shape[0]
         sep_id = self.sep_token_id
         label_id = self.config.class_token_index
 
-        slices_h, slices_ids = [], []
+        slices_h, slices_ids, text_slices = [], [], []
 
         for i in range(batch_size):
             real_len = int(attention_mask[i].sum().item())
@@ -1154,6 +1193,7 @@ class GLiClassDecoderKV(nn.Module):
                 # Fallback: use everything up to real_len
                 slices_h.append(hidden_states[i, :real_len])
                 slices_ids.append(ids_i)
+                text_slices.append(hidden_states[i, :real_len])
                 continue
 
             first_label = label_pos[0].item()
@@ -1163,12 +1203,15 @@ class GLiClassDecoderKV(nn.Module):
             if seps_before.numel() == 0:
                 slices_h.append(hidden_states[i, :real_len])
                 slices_ids.append(ids_i)
+                text_slices.append(hidden_states[i, :real_len])
                 continue
 
             # start right after that SEP → first token of "label1<<LABEL>>...<<SEP>>"
             start = int(seps_before[-1].item()) + 1
             slices_h.append(hidden_states[i, start:real_len])
             slices_ids.append(ids_i[start:real_len])
+            # text section ends with that SEP, so it is never empty
+            text_slices.append(hidden_states[i, :start])
 
         padded_hidden = pad_sequence(slices_h, batch_first=True)
         padded_ids = pad_sequence(slices_ids, batch_first=True)
@@ -1180,7 +1223,14 @@ class GLiClassDecoderKV(nn.Module):
         positions = torch.arange(padded_hidden.shape[1], device=attention_mask.device)
         label_mask = (positions.unsqueeze(0) < section_lengths.unsqueeze(1)).to(attention_mask.dtype)
 
-        return padded_hidden, padded_ids, label_mask
+        if not return_text_section:
+            return padded_hidden, padded_ids, label_mask
+
+        text_hidden = pad_sequence(text_slices, batch_first=True)
+        text_lengths = torch.tensor([section.shape[0] for section in text_slices], device=attention_mask.device)
+        text_positions = torch.arange(text_hidden.shape[1], device=attention_mask.device)
+        text_mask = (text_positions.unsqueeze(0) < text_lengths.unsqueeze(1)).to(attention_mask.dtype)
+        return padded_hidden, padded_ids, label_mask, text_hidden, text_mask
 
     def update_decoder_cache(
         self,
@@ -1209,8 +1259,14 @@ class GLiClassDecoderKV(nn.Module):
         use_recurrence: bool | None = None,
         max_recurrent_steps: int | None = None,
         halt_threshold: float | None = None,
+        text_hidden_states: torch.Tensor | None = None,
+        text_attention_mask: torch.Tensor | None = None,
     ) -> GLiClassOutput:
-        """Classify label tokens against a text cache without persisting labels."""
+        """Classify label tokens against a text cache without persisting labels.
+
+        With config.recurrent_read_text, pass the decoder's last hidden states of the cached text
+        (text_hidden_states / text_attention_mask); the KV cache alone does not contain them.
+        """
         decoder_outputs = self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1229,6 +1285,8 @@ class GLiClassDecoderKV(nn.Module):
             attention_mask=label_mask.to(scorer_device),
             num_steps=num_steps,
             halt_threshold=halt_threshold,
+            text_hidden_states=None if text_hidden_states is None else text_hidden_states.to(scorer_device),
+            text_attention_mask=None if text_attention_mask is None else text_attention_mask.to(scorer_device),
         )
         return GLiClassOutput(logits=step_logits[-1], recurrent_num_steps=steps_taken)
 
@@ -1276,9 +1334,16 @@ class GLiClassDecoderKV(nn.Module):
 
         hidden_states = decoder_outputs.last_hidden_state
 
-        label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
-
         num_steps, halt_threshold = self._resolve_recurrence(use_recurrence, max_recurrent_steps, halt_threshold)
+
+        text_hidden = text_mask = None
+        if self.scorer.read_text and num_steps > 1:
+            label_hidden, label_ids, label_mask, text_hidden, text_mask = self._extract_label_section(
+                hidden_states, input_ids, attention_mask, return_text_section=True
+            )
+        else:
+            label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
+
         step_logits, steps_taken = self.scorer.recurrent_forward(
             hidden_states=label_hidden,
             input_ids=label_ids,
@@ -1286,15 +1351,18 @@ class GLiClassDecoderKV(nn.Module):
             num_steps=num_steps,
             halt_threshold=halt_threshold,
             return_all_steps=labels is not None or output_recurrent_logits,
+            text_hidden_states=text_hidden,
+            text_attention_mask=text_mask,
         )
         logits = step_logits[-1]
 
         if labels is not None:
             self.num_labels = logits.shape[-1]
 
-        recurrent_losses = None
+        recurrent_losses = recurrent_entropies = None
         if len(step_logits) > 1 and labels is not None:
-            loss, recurrent_losses = self.get_recurrent_loss(step_logits, labels)
+            valid_labels = self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1])
+            loss, recurrent_losses, recurrent_entropies = self.get_recurrent_loss(step_logits, labels, valid_labels)
         else:
             loss = self.get_loss(logits, labels)
 
@@ -1312,6 +1380,7 @@ class GLiClassDecoderKV(nn.Module):
             past_key_values=decoder_outputs.past_key_values if use_cache else None,
             recurrent_logits=tuple(step_logits) if output_recurrent_logits else None,
             recurrent_losses=recurrent_losses,
+            recurrent_entropies=recurrent_entropies,
             recurrent_num_steps=steps_taken if num_steps > 1 else None,
         )
 
