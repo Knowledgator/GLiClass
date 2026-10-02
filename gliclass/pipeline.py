@@ -7,8 +7,8 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
+from .multimodal import is_processor, collate_media, get_tokenizer, process_multimodal_with_budget
 from .data_processing import format_decoder_kv_labels, format_decoder_kv_context, format_decoder_kv_sequence
-from .multimodal import collate_media, get_tokenizer, is_processor, process_multimodal_with_budget
 
 
 def flatten_hierarchical_labels(
@@ -874,7 +874,9 @@ class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             text_prompt = self._format_prompt(prompt, i) or ""
             sample = process_multimodal_with_budget(
                 self.tokenizer,
-                lambda text, media: format_decoder_kv_context(text, text_prompt, examples_text, media),
+                lambda text, media, text_prompt=text_prompt, examples_text=examples_text: format_decoder_kv_context(
+                    text, text_prompt, examples_text, media
+                ),
                 text,
                 images[i] if images else [],
                 audio[i] if audio else [],

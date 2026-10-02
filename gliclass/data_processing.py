@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from .multimodal import MEDIA_KEYS, collate_media, is_processor, process_multimodal_with_budget
+from .multimodal import MEDIA_KEYS, is_processor, collate_media, process_multimodal_with_budget
 
 
 def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "", media: str = "") -> str:
@@ -495,7 +495,7 @@ class DataCollatorWithPadding:
 
     def __call__(self, batch):
         # Media tensors are indexed by image / audio item and only present in samples that have media
-        keys = [key for key in batch[0].keys() if key not in MEDIA_KEYS]
+        keys = [key for key in batch[0] if key not in MEDIA_KEYS]
         padded_batch = {key: [] for key in keys}
 
         for key in keys:
