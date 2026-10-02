@@ -72,6 +72,11 @@ class GLiClassModelConfig(PretrainedConfig):
         recurrent_confidence_coef=0.0,
         recurrent_confidence_mode="relative",
         recurrent_confidence_margin=0.0,
+        use_calibrator=False,
+        calibrator_hidden_size=256,
+        calibrator_beta_max=3.0,
+        calibrator_dropout=0.1,
+        calibrator_use_bias=False,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -183,5 +188,14 @@ class GLiClassModelConfig(PretrainedConfig):
         self.recurrent_confidence_coef = recurrent_confidence_coef
         self.recurrent_confidence_mode = recurrent_confidence_mode
         self.recurrent_confidence_margin = recurrent_confidence_margin
+
+        # Post-hoc calibrator (see gliclass/calibration.py), fitted with the backbone frozen.
+        # It predicts an inverse temperature beta in (0, calibrator_beta_max) per (text, label) pair and,
+        # with calibrator_use_bias, an additive logit bias: calibrated logit = beta * logit + bias.
+        self.use_calibrator = use_calibrator
+        self.calibrator_hidden_size = calibrator_hidden_size
+        self.calibrator_beta_max = calibrator_beta_max
+        self.calibrator_dropout = calibrator_dropout
+        self.calibrator_use_bias = calibrator_use_bias
 
         super().__init__(problem_type=problem_type, **kwargs)

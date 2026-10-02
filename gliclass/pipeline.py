@@ -265,18 +265,31 @@ class BaseZeroShotClassificationPipeline(ABC):
         labels: List[str],
         classification_type: str,
         threshold: float,
+        initial_logits: torch.Tensor | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
-        """Convert one row of logits into predictions and a complete score map."""
-        logits = logits[: len(labels)]
-        if classification_type == "single-label":
-            scores = torch.softmax(logits, dim=-1)
-            all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
-            best = int(scores.argmax().item())
-            return [{"label": labels[best], "score": float(scores[best].detach())}], all_scores
+        """Convert one row of logits into predictions and a complete score map.
 
-        scores = torch.sigmoid(logits)
-        all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
-        predictions = [{"label": label, "score": score} for label, score in all_scores.items() if score >= threshold]
+        With initial_logits (uncalibrated logits of a calibrated model), every prediction also carries
+        "initial_score"; "score" and the threshold use the calibrated logits.
+        """
+        activation = (lambda x: torch.softmax(x, dim=-1)) if classification_type == "single-label" else torch.sigmoid
+        scores = activation(logits[: len(labels)].float()).tolist()
+        initial_scores = None
+        if initial_logits is not None:
+            initial_scores = activation(initial_logits[: len(labels)].float()).tolist()
+
+        def prediction(index):
+            item = {"label": labels[index], "score": scores[index]}
+            if initial_scores is not None:
+                item["initial_score"] = initial_scores[index]
+            return item
+
+        all_scores = dict(zip(labels, scores, strict=True))
+        if classification_type == "single-label":
+            best = max(range(len(scores)), key=scores.__getitem__)
+            return [prediction(best)], all_scores
+
+        predictions = [prediction(i) for i, score in enumerate(scores) if score >= threshold]
         return predictions, all_scores
 
     def _process_labels(
@@ -505,6 +518,7 @@ class BaseZeroShotClassificationPipeline(ABC):
                 adapter_ids=batch_adapter_ids,
             )
             logits = model_output.logits
+            initial_logits = getattr(model_output, "uncalibrated_logits", None)
 
             for i in range(len(batch_texts)):
                 global_idx = idx + i
@@ -521,6 +535,7 @@ class BaseZeroShotClassificationPipeline(ABC):
                     curr_labels,
                     item_classification_type,
                     item_threshold,
+                    initial_logits=None if initial_logits is None else initial_logits[i],
                 )
                 results.append(predictions)
                 if return_hierarchical:

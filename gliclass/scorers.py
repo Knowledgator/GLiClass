@@ -360,6 +360,7 @@ class DecoderKVScorer(nn.Module):
         return_all_steps=False,
         text_hidden_states=None,
         text_attention_mask=None,
+        return_representations=False,
         **kwargs,
     ):
         """Run step 1 (one scorer_encoder pass) and up to num_steps - 1 gated recurrent steps.
@@ -373,6 +374,8 @@ class DecoderKVScorer(nn.Module):
             step_logits: list of (batch_size, num_labels) logits for every step if
                 return_all_steps, otherwise a single-element list with the final logits
             steps_taken: (batch_size,) number of steps each example ran
+            representations: only with return_representations, the (text_repr, label_repr) the
+                final logits were scored from
         """
         if num_steps > 1 and not self.recurrent:
             raise ValueError("num_steps > 1 requires a scorer built with config.recurrent_steps > 1.")
@@ -380,7 +383,7 @@ class DecoderKVScorer(nn.Module):
         bptt_steps = getattr(self.config, "recurrent_bptt_steps", None)
 
         state = self._encode(hidden_states, attention_mask)
-        logits = self._score(state, input_ids, attention_mask)
+        logits, text_repr, label_repr = self._score(state, input_ids, attention_mask, return_representations=True)
         step_logits = [logits]
 
         batch_size, num_labels = logits.shape
@@ -404,7 +407,9 @@ class DecoderKVScorer(nn.Module):
                 state = state.detach()
 
             new_state = self.reasoning_cell(state, inputs, attention_mask, self._encode, text_memory, text_mask)
-            new_logits = self._score(new_state, input_ids, attention_mask)
+            new_logits, new_text_repr, new_label_repr = self._score(
+                new_state, input_ids, attention_mask, return_representations=True
+            )
 
             if halt_threshold:
                 change = (
@@ -415,12 +420,15 @@ class DecoderKVScorer(nn.Module):
                 )
                 new_state = torch.where(active[:, None, None], new_state, state)
                 new_logits = torch.where(active[:, None], new_logits, logits)
+                new_text_repr = torch.where(active[:, None], new_text_repr, text_repr)
+                new_label_repr = torch.where(active[:, None, None], new_label_repr, label_repr)
                 steps_taken = steps_taken + active.long()
                 active = active & change.ge(halt_threshold)
             else:
                 steps_taken = steps_taken + 1
 
             state, logits = new_state, new_logits
+            text_repr, label_repr = new_text_repr, new_label_repr
             if return_all_steps:
                 step_logits.append(logits)
             else:
@@ -434,9 +442,11 @@ class DecoderKVScorer(nn.Module):
             unused = sum(param.sum() for param in self.reasoning_cell.parameters())
             step_logits[-1] = step_logits[-1] + 0.0 * unused
 
+        if return_representations:
+            return step_logits, steps_taken, (text_repr, label_repr)
         return step_logits, steps_taken
 
-    def _score(self, contextualized_hidden_states, input_ids, attention_mask):
+    def _score(self, contextualized_hidden_states, input_ids, attention_mask, return_representations=False):
         text_repr, label_repr = self._extract_representations(contextualized_hidden_states, input_ids, attention_mask)
 
         text_repr = self.text_projector(text_repr)
@@ -454,6 +464,8 @@ class DecoderKVScorer(nn.Module):
 
         logits = self.mlp(combined_rep).squeeze(-1)
 
+        if return_representations:
+            return logits, text_repr, label_repr
         return logits
 
 
