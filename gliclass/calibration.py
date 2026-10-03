@@ -355,9 +355,7 @@ def fit_calibrator(
             for start in range(0, len(eval_examples), 256):
                 batch = collate_calibration_examples(eval_examples[start : start + 256])
                 batch = {key: value.to(device) for key, value in batch.items()}
-                beta, bias = calibrator(
-                    batch["text_repr"], batch["label_repr"], batch["logits"], batch["label_mask"]
-                )
+                beta, bias = calibrator(batch["text_repr"], batch["label_repr"], batch["logits"], batch["label_mask"])
                 _, nll = calibration_loss(
                     beta, bias, batch["logits"], batch["targets"], batch["label_mask"], base_beta, base_bias
                 )
