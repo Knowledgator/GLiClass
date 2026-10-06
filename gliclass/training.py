@@ -557,8 +557,17 @@ class Trainer(transformers.Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            # e.g. a partly frozen embedding matrix: decay would also shrink the frozen rows
+            no_decay = getattr(opt_model, "no_weight_decay_param_names", set())
+            decay_parameters = [name for name in decay_parameters if name not in no_decay]
             if self.args.others_lr is not None:
-                encoder_parameters = [name for name, _ in opt_model.named_parameters() if "encoder" in name]
+                # the pretrained backbone gets learning_rate, new heads get others_lr; decoder-kv names its
+                # backbone decoder_model, and its scorer's scorer_encoder is a new head, not the backbone
+                encoder_parameters = [
+                    name
+                    for name, _ in opt_model.named_parameters()
+                    if ("encoder" in name or "decoder_model" in name) and "scorer" not in name
+                ]
                 optimizer_grouped_parameters = [
                     {
                         "params": [

@@ -224,6 +224,8 @@ class DataAugmenter:
 
 
 class GLiClassDataset(Dataset):
+    MAX_MEDIA_RETRIES = 10
+
     def __init__(
         self,
         examples,
@@ -426,8 +428,20 @@ class GLiClassDataset(Dataset):
         return len(self._data)
 
     def __getitem__(self, idx):
-        example = self._data[idx]
+        # A sample whose image / audio file cannot be loaded is replaced by a random other sample
+        for _ in range(self.MAX_MEDIA_RETRIES):
+            example = self._data[idx]
+            if not (example.get("images") or example.get("audio")):
+                return self._prepare(example)
+            try:
+                return self._prepare(example)
+            except Exception as error:
+                media = (example.get("images") or []) + (example.get("audio") or [])
+                print(f"Skipping sample {idx}, could not load its media {media}: {error!r}")
+                idx = random.randrange(len(self._data))
+        raise RuntimeError(f"Could not load media for {self.MAX_MEDIA_RETRIES} samples in a row")
 
+    def _prepare(self, example):
         example = self.augmenter.augment(example)
 
         if self.architecture_type == "uni-encoder":

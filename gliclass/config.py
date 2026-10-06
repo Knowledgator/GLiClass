@@ -60,6 +60,7 @@ class GLiClassModelConfig(PretrainedConfig):
         dropout=0.1,
         use_segment_embeddings=False,
         scorer_encoder_num_layers=2,
+        scorer_full_sequence=False,
         recurrent_steps=1,
         recurrent_min_steps=1,
         recurrent_inference=True,
@@ -116,6 +117,9 @@ class GLiClassModelConfig(PretrainedConfig):
 
         if hidden_size is None:
             self.hidden_size = text_config.hidden_size
+            # EmbeddingGemma 2 projects its last hidden states from hidden_size to embedding_dim
+            if text_config.model_type == "embedding_gemma2_text":
+                self.hidden_size = text_config.embedding_dim
         else:
             self.hidden_size = hidden_size
 
@@ -170,6 +174,9 @@ class GLiClassModelConfig(PretrainedConfig):
         self.use_segment_embeddings = use_segment_embeddings
 
         self.scorer_encoder_num_layers = scorer_encoder_num_layers
+        # decoder-kv: False → the scorer encoder sees only the label section (label1<<LABEL>>...<<SEP>>);
+        # True → it runs over the whole sequence ([prompt][examples]text<<SEP>>labels...<<SEP>>, media included).
+        self.scorer_full_sequence = scorer_full_sequence
 
         # Recurrent hidden reasoning for the decoder-kv scorer (recurrent_steps=1 disables it).
         # Training depth is sampled uniformly from [recurrent_min_steps, recurrent_steps].

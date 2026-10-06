@@ -1,7 +1,25 @@
+import os
+
 import torch
 from torch import nn
 
 from .ops import attn_padded
+from .utils import is_module_available
+
+IS_FLASHDEBERTA = is_module_available("flashdeberta")
+
+if IS_FLASHDEBERTA:
+    from flashdeberta import FlashDisentangledSelfAttention
+    from transformers.models.deberta_v2.modeling_deberta_v2 import DisentangledSelfAttention
+
+    class ScorerFlashSelfAttention(FlashDisentangledSelfAttention):
+        """FlashDeBERTa attention for the scorer encoder; its Triton kernels need CUDA, so other devices
+        (e.g. scoring on CPU) fall back to the eager DeBERTa attention with the same weights."""
+
+        def forward(self, hidden_states, *args, **kwargs):
+            if hidden_states.is_cuda:
+                return super().forward(hidden_states, *args, **kwargs)
+            return DisentangledSelfAttention.forward(self, hidden_states, *args, **kwargs)
 
 
 class ScorerWeightedDot(nn.Module):
@@ -260,6 +278,10 @@ class DecoderKVScorer(nn.Module):
             max_relative_positions=512,
         )
         self.scorer_encoder = DebertaV2Encoder(encoder_config)
+        if os.environ.get("USE_FLASHDEBERTA", "") and IS_FLASHDEBERTA:
+            print("Using FlashDeberta backend for the scorer encoder.")
+            for layer in self.scorer_encoder.layer:
+                layer.attention.self = ScorerFlashSelfAttention(encoder_config)
 
         self.text_projector = nn.Linear(config.hidden_size, config.hidden_size)
         self.label_projector = nn.Linear(config.hidden_size, config.hidden_size)
@@ -277,6 +299,9 @@ class DecoderKVScorer(nn.Module):
         )
 
         self.epsilon = 1e-8
+
+        # False: the encoder sees only the label section; True: the whole sequence (text included)
+        self.full_sequence = getattr(config, "scorer_full_sequence", False)
 
         # Recurrent reasoning over scorer_encoder (see RecurrentReasoningCell). Step 1 is the plain scorer.
         self.recurrent = getattr(config, "recurrent_steps", 1) > 1

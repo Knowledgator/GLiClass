@@ -995,6 +995,8 @@ class GLiClassDecoderKV(nn.Module):
             config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
 
         config_name = config.encoder_config.__class__.__name__
+        # EmbeddingGemma 2 is a bidirectional encoder without a KV cache: the whole sequence is encoded in one pass
+        self.bidirectional = config_name == "EmbeddingGemma2Config"
 
         if getattr(config, "multimodal", False):
             # Base multi-modal model (no LM head): encodes images / audio and merges them into the sequence
@@ -1002,8 +1004,18 @@ class GLiClassDecoderKV(nn.Module):
                 from transformers.models.qwen3_5 import Qwen3_5Model as ModelClass
             elif config_name == "Gemma4Config":
                 from transformers.models.gemma4 import Gemma4Model as ModelClass
+            elif config_name == "EmbeddingGemma2Config":
+                from transformers.models.embedding_gemma2 import EmbeddingGemma2Model as ModelClass
             else:
-                raise ValueError(f"multimodal decoder-kv requires Qwen3.5 or Gemma 4. Got: {config_name}")
+                raise ValueError(
+                    f"multimodal decoder-kv requires Qwen3.5, Gemma 4 or EmbeddingGemma 2. Got: {config_name}"
+                )
+        elif config_name == "EmbeddingGemma2Config":
+            from transformers.models.embedding_gemma2 import EmbeddingGemma2Model as ModelClass
+
+            # text only: skip the vision / audio towers (their weights are ignored on load)
+            config.encoder_config.vision_config = None
+            config.encoder_config.audio_config = None
         elif config_name == "Qwen3_5TextConfig":
             from transformers.models.qwen3_5 import Qwen3_5TextModel
 
@@ -1018,9 +1030,12 @@ class GLiClassDecoderKV(nn.Module):
 
             ModelClass = Qwen3Model
         else:
-            raise ValueError(f"decoder-kv architecture requires Qwen3 or Qwen3.5. Got: {config_name}")
+            raise ValueError(f"decoder-kv architecture requires Qwen3, Qwen3.5 or EmbeddingGemma 2. Got: {config_name}")
 
-        if from_pretrained:
+        if from_pretrained and self.bidirectional:
+            # pass the config so a text-only one (no vision / audio config) skips the media towers
+            self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name, config=config.encoder_config)
+        elif from_pretrained:
             self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name)
         else:
             self.decoder_model = ModelClass(config.encoder_config)
@@ -1032,10 +1047,12 @@ class GLiClassDecoderKV(nn.Module):
             if current_vocab != config.vocab_size:
                 self.decoder_model.resize_token_embeddings(config.vocab_size)
 
-        if getattr(config, "multimodal", False) and getattr(config, "freeze_media_encoders", True):
-            from .multimodal import freeze_media_encoders
+        if getattr(config, "multimodal", False):
+            from .multimodal import freeze_media_encoders, match_media_feature_dtype
 
-            freeze_media_encoders(self.decoder_model)
+            match_media_feature_dtype(self.decoder_model)
+            if getattr(config, "freeze_media_encoders", True):
+                freeze_media_encoders(self.decoder_model)
 
         from .scorers import DecoderKVScorer
 
@@ -1047,7 +1064,7 @@ class GLiClassDecoderKV(nn.Module):
 
         self.sep_token_id = config.sep_token_index
 
-    def get_loss(self, logits, labels):
+    def get_loss(self, logits, labels, valid_labels=None):
         loss = None
         if labels is not None:
             # Sequence truncation may cut label tokens → align labels to logits
@@ -1055,24 +1072,7 @@ class GLiClassDecoderKV(nn.Module):
             # single-label targets are class indices (batch,); only per-label targets need aligning
             if labels.dim() > 1 and labels.shape[-1] != num_labels:
                 labels = labels[:, :num_labels]
-
-            if self.config.problem_type == "multi_label_classification":
-                from .loss_functions import focal_loss_with_logits
-
-                reduction = self.config.focal_loss_reduction or "none"
-                all_losses = focal_loss_with_logits(
-                    logits,
-                    labels,
-                    self.config.focal_loss_alpha,
-                    self.config.focal_loss_gamma,
-                    reduction,
-                )
-                loss = all_losses.mean()
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, num_labels), labels.view(-1))
-            else:
-                raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
+            loss = self._per_sample_loss(logits, labels, valid_labels).mean()
         return loss
 
     def _resolve_recurrence(self, use_recurrence=None, max_recurrent_steps=None, halt_threshold=None):
@@ -1098,8 +1098,13 @@ class GLiClassDecoderKV(nn.Module):
             halt_threshold = self.config.recurrent_halt_threshold
         return max_steps, halt_threshold
 
-    def _per_sample_loss(self, logits, labels):
-        """Unreduced loss per example, shape (batch,)."""
+    def _per_sample_loss(self, logits, labels, valid_labels=None):
+        """Unreduced loss per example, shape (batch,).
+
+        valid_labels (batch, num_labels) marks the example's real labels. Slots past them only exist because
+        the batch is padded to its longest label list, so they are left out; otherwise the loss would depend
+        on which examples share a batch.
+        """
         if self.config.problem_type == "multi_label_classification":
             from .loss_functions import focal_loss_with_logits
 
@@ -1111,8 +1116,12 @@ class GLiClassDecoderKV(nn.Module):
                 "none",
             )
             valid = labels.ne(self.config.ignore_index)
-            return all_losses.sum(-1) / valid.sum(-1).clamp_min(1)
+            if valid_labels is not None:
+                valid = valid & valid_labels
+            return (all_losses * valid).sum(-1) / valid.sum(-1).clamp_min(1)
         elif self.config.problem_type == "single_label_classification":
+            if valid_labels is not None:
+                logits = logits.masked_fill(~valid_labels, torch.finfo(logits.dtype).min)
             return nn.functional.cross_entropy(
                 logits, labels.view(-1), ignore_index=self.config.ignore_index, reduction="none"
             )
@@ -1157,7 +1166,9 @@ class GLiClassDecoderKV(nn.Module):
         if valid_labels is None:
             valid_labels = torch.ones_like(step_logits[-1], dtype=torch.bool)
 
-        per_sample = torch.stack([self._per_sample_loss(logits, labels) for logits in step_logits])  # (T, B)
+        per_sample = torch.stack(
+            [self._per_sample_loss(logits, labels, valid_labels) for logits in step_logits]
+        )  # (T, B)
         step_losses = per_sample.mean(dim=1)
         loss = step_losses.mean()
 
@@ -1261,6 +1272,13 @@ class GLiClassDecoderKV(nn.Module):
         text_mask = (text_positions.unsqueeze(0) < text_lengths.unsqueeze(1)).to(attention_mask.dtype)
         return padded_hidden, padded_ids, label_mask, text_hidden, text_mask
 
+    def _require_kv_cache(self):
+        if self.bidirectional:
+            raise ValueError(
+                f"{type(self.decoder_model).__name__} is a bidirectional encoder without a KV cache; "
+                "use the classic (non-streaming) decoder-kv pipeline."
+            )
+
     def update_decoder_cache(
         self,
         input_ids: torch.Tensor,
@@ -1269,6 +1287,7 @@ class GLiClassDecoderKV(nn.Module):
         past_key_values=None,
     ):
         """Extend a text-only decoder cache without running the scorer."""
+        self._require_kv_cache()
         return self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1298,6 +1317,7 @@ class GLiClassDecoderKV(nn.Module):
         With config.recurrent_read_text, pass the decoder's last hidden states of the cached text
         (text_hidden_states / text_attention_mask); the KV cache alone does not contain them.
         """
+        self._require_kv_cache()
         decoder_outputs = self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1370,12 +1390,20 @@ class GLiClassDecoderKV(nn.Module):
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        if self.bidirectional:
+            if past_key_values is not None or use_cache:
+                self._require_kv_cache()
+            # media positions come from the placeholder token ids; padding mm_token_type_ids are not accepted
+            kwargs.pop("mm_token_type_ids", None)
+            cache_kwargs = {}
+        else:
+            cache_kwargs = {"past_key_values": past_key_values, "use_cache": use_cache}
+
         decoder_outputs = self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             return_dict=True,
+            **cache_kwargs,
             **kwargs,
         )
 
@@ -1408,11 +1436,11 @@ class GLiClassDecoderKV(nn.Module):
             self.num_labels = logits.shape[-1]
 
         recurrent_losses = recurrent_entropies = None
+        valid_labels = self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1])
         if len(step_logits) > 1 and labels is not None:
-            valid_labels = self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1])
             loss, recurrent_losses, recurrent_entropies = self.get_recurrent_loss(step_logits, labels, valid_labels)
         else:
-            loss = self.get_loss(logits, labels)
+            loss = self.get_loss(logits, labels, valid_labels)
 
         if not return_dict:
             output = (logits,)
@@ -1432,7 +1460,7 @@ class GLiClassDecoderKV(nn.Module):
             recurrent_num_steps=steps_taken if num_steps > 1 else None,
             text_embeddings=text_repr if output_text_embeddings else None,
             class_embeddings=label_repr if output_class_embeddings else None,
-            class_mask=self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1]).long(),
+            class_mask=valid_labels.long(),
         )
 
 

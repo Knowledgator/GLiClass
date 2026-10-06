@@ -5,9 +5,11 @@ Media enter a decoder-kv sequence as placeholder tokens in the context part:
     [prompt][examples]<image><image><audio>text<<SEP>>label1<<LABEL>>...<<SEP>>
 
 The HF processor expands every placeholder into the item's soft tokens and returns the media tensors;
-the multi-modal backbone (Qwen3_5Model, Gemma4Model) encodes them and writes the features into those
-positions. Placeholders are matched to media in order, so the i-th image placeholder is the i-th image.
+the multi-modal backbone (Qwen3_5Model, Gemma4Model, EmbeddingGemma2Model) encodes them and writes the features
+into those positions. Placeholders are matched to media in order, so the i-th image placeholder is the i-th image.
 """
+
+import os
 
 import torch
 from transformers.processing_utils import ProcessorMixin
@@ -74,7 +76,12 @@ def load_audio(audio, sampling_rate: int):
     """Load audio given as paths, URLs or 1D arrays (arrays must already be at `sampling_rate`)."""
     from transformers.audio_utils import load_audio as _load_audio
 
-    return [_load_audio(item, sampling_rate=sampling_rate) for item in audio or []]
+    audio = audio or []
+    for item in audio:
+        # transformers returns a missing local path unchanged, which only fails later inside feature extraction
+        if isinstance(item, str) and not item.startswith(("http://", "https://")) and not os.path.isfile(item):
+            raise FileNotFoundError(f"Audio file not found: {item}")
+    return [_load_audio(item, sampling_rate=sampling_rate) for item in audio]
 
 
 def process_multimodal(processor, text: str, images=None, audio=None) -> dict:
@@ -148,3 +155,17 @@ def freeze_media_encoders(model) -> None:
         module = getattr(model, name, None)
         if module is not None:
             module.requires_grad_(False)
+
+
+def match_media_feature_dtype(model) -> None:
+    """Cast projected image / audio features to the text embedding dtype before they are merged.
+
+    Under bf16 autocast the projectors return bf16 while the fp32 text embeddings stay fp32. Gemma 4 casts
+    image features itself but not audio features, so masked_scatter fails on the mixed dtypes.
+    """
+    for name in ("embed_vision", "embed_audio"):
+        module = getattr(model, name, None)
+        if module is not None:
+            module.register_forward_hook(
+                lambda _module, _inputs, output: output.to(model.get_input_embeddings().weight.dtype)
+            )
