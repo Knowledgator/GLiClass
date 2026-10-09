@@ -20,7 +20,7 @@ class GLiClassModelConfig(PretrainedConfig):
     model_type = "GLiClass"
     is_composition = True
 
-    def __init__(
+    def __init__(  # noqa: PLR0917 - HF config, arguments mirror the saved config fields
         self,
         encoder_config=None,
         encoder_model=None,
@@ -60,6 +60,27 @@ class GLiClassModelConfig(PretrainedConfig):
         dropout=0.1,
         use_segment_embeddings=False,
         scorer_encoder_num_layers=2,
+        scorer_full_sequence=False,
+        recurrent_steps=1,
+        recurrent_min_steps=1,
+        recurrent_inference=True,
+        recurrent_inference_max_steps=None,
+        recurrent_halt_threshold=0.01,
+        recurrent_improvement_coef=0.1,
+        recurrent_improvement_margin=0.05,
+        recurrent_bptt_steps=None,
+        recurrent_read_text=False,
+        recurrent_confidence_coef=0.0,
+        recurrent_confidence_mode="relative",
+        recurrent_confidence_margin=0.0,
+        use_calibrator=False,
+        calibrator_hidden_size=256,
+        calibrator_beta_max=3.0,
+        calibrator_dropout=0.1,
+        calibrator_use_bias=False,
+        multimodal=False,
+        freeze_media_encoders=True,
+        use_embedding_projection=None,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -92,13 +113,27 @@ class GLiClassModelConfig(PretrainedConfig):
             self.label_model_config = None
         self.label_model_name = label_model_name
 
+        # Multi-modal backbones have a composite config; text attributes live in its text config
+        text_config = self.encoder_config.get_text_config()
+
+        # EmbeddingGemma 2 ends with embedding_projection (hidden_size -> embedding_dim), a head meant for
+        # mean pooling + L2 normalization that scales token states ~30x; fed to the scorer, it blows up the
+        # gradients. By default the scorer reads the final-norm states instead. Older checkpoints were trained
+        # with the projection: without the flag in their config, it is kept when hidden_size == embedding_dim.
+        is_embedding_gemma = text_config.model_type == "embedding_gemma2_text"
+        if use_embedding_projection is None:
+            use_embedding_projection = is_embedding_gemma and hidden_size == getattr(text_config, "embedding_dim", None)
+        self.use_embedding_projection = use_embedding_projection
+
         if hidden_size is None:
-            self.hidden_size = self.encoder_config.hidden_size
+            self.hidden_size = text_config.hidden_size
+            if is_embedding_gemma and use_embedding_projection:
+                self.hidden_size = text_config.embedding_dim
         else:
             self.hidden_size = hidden_size
 
         if vocab_size is None:
-            self.vocab_size = self.encoder_config.vocab_size
+            self.vocab_size = text_config.vocab_size
         else:
             self.vocab_size = vocab_size
 
@@ -143,10 +178,50 @@ class GLiClassModelConfig(PretrainedConfig):
         self.layer_wise = layer_wise
         self.encoder_layer_id = encoder_layer_id
         self.embed_class_token = embed_class_token
-        self.pad_token_id = self.encoder_config.pad_token_id
+        self.pad_token_id = text_config.pad_token_id
         self.dropout = dropout
         self.use_segment_embeddings = use_segment_embeddings
 
         self.scorer_encoder_num_layers = scorer_encoder_num_layers
+        # decoder-kv: False → the scorer encoder sees only the label section (label1<<LABEL>>...<<SEP>>);
+        # True → it runs over the whole sequence ([prompt][examples]text<<SEP>>labels...<<SEP>>, media included).
+        self.scorer_full_sequence = scorer_full_sequence
+
+        # Recurrent hidden reasoning for the decoder-kv scorer (recurrent_steps=1 disables it).
+        # Training depth is sampled uniformly from [recurrent_min_steps, recurrent_steps].
+        self.recurrent_steps = recurrent_steps
+        self.recurrent_min_steps = recurrent_min_steps
+        # Inference: run up to recurrent_inference_max_steps (default recurrent_steps, may exceed it) and
+        # stop an example once no label probability changes by recurrent_halt_threshold (None/0 = never).
+        self.recurrent_inference = recurrent_inference
+        self.recurrent_inference_max_steps = recurrent_inference_max_steps
+        self.recurrent_halt_threshold = recurrent_halt_threshold
+        # Hinge relu(l_t - (1 - margin) * sg(l_{t-1})) for steps t >= 3, on top of a loss at every step.
+        # margin > 0 makes "no change" cost something, so the recurrence cannot settle into a copy of step 2.
+        self.recurrent_improvement_coef = recurrent_improvement_coef
+        self.recurrent_improvement_margin = recurrent_improvement_margin
+        self.recurrent_bptt_steps = recurrent_bptt_steps
+        # False: recurrent steps see only the label section; True: each step also cross-attends to the text
+        self.recurrent_read_text = recurrent_read_text
+        # Confidence loss on recurrent steps (0 = off): push label probabilities away from 0.5.
+        # "relative": each step's mean label entropy must fall below (1 - margin) * the previous step's;
+        # "absolute": minimize the entropy of every recurrent step.
+        self.recurrent_confidence_coef = recurrent_confidence_coef
+        self.recurrent_confidence_mode = recurrent_confidence_mode
+        self.recurrent_confidence_margin = recurrent_confidence_margin
+
+        # Post-hoc calibrator (see gliclass/calibration.py), fitted with the backbone frozen.
+        # It predicts an inverse temperature beta in (0, calibrator_beta_max) per (text, label) pair and,
+        # with calibrator_use_bias, an additive logit bias: calibrated logit = beta * logit + bias.
+        self.use_calibrator = use_calibrator
+        self.calibrator_hidden_size = calibrator_hidden_size
+        self.calibrator_beta_max = calibrator_beta_max
+        self.calibrator_dropout = calibrator_dropout
+        self.calibrator_use_bias = calibrator_use_bias
+
+        # decoder-kv: keep the backbone's vision / audio encoders (Qwen3_5Model, Gemma4Model) so images and
+        # audio can be supplied next to text; freeze_media_encoders keeps those encoders fixed during training.
+        self.multimodal = multimodal
+        self.freeze_media_encoders = freeze_media_encoders
 
         super().__init__(problem_type=problem_type, **kwargs)

@@ -412,11 +412,13 @@ class StreamingZeroShotClassificationPipeline(DecoderKVZeroShotClassificationPip
         for local_index, batch_index in enumerate(triggered_indices):
             labels = batch["labels"][batch_index]
             logits = model_output.logits[local_index, : len(labels)]
+            initial_logits = getattr(model_output, "uncalibrated_logits", None)
             predictions, all_scores = self._postprocess_logits(
                 logits,
                 labels,
                 batch["classification_types"][batch_index],
                 batch["thresholds"][batch_index],
+                initial_logits=None if initial_logits is None else initial_logits[local_index, : len(labels)],
             )
             if batch["return_hierarchical"][batch_index]:
                 predictions = build_hierarchical_output(

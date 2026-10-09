@@ -24,6 +24,7 @@ from .config import GLiClassModelConfig
 from .layers import FeaturesProjector, BiEncoderProjector, LayerwiseAttention, LstmSeq2SeqEncoder
 from .scorers import SCORER2OBJECT
 from .poolings import POOLING2OBJECT
+from .calibration import build_calibrator
 from .loss_functions import focal_loss_with_logits, sequence_contrastive_loss
 
 IS_LLM2VEC = is_module_available("llm2vec")
@@ -62,6 +63,17 @@ class GLiClassOutput(SequenceClassifierOutput):
     text_embeddings: torch.Tensor | None = None
     class_embeddings: torch.Tensor | None = None
     past_key_values: Any | None = None
+    recurrent_logits: Tuple[torch.Tensor, ...] | None = None
+    recurrent_losses: torch.Tensor | None = None
+    recurrent_entropies: torch.Tensor | None = None
+    recurrent_num_steps: torch.Tensor | None = None
+    # (batch, num_labels), 1 for real labels; set whenever text/class embeddings are requested
+    class_mask: torch.Tensor | None = None
+    # Set when the model has a calibrator: logits are then calibrated,
+    # inverse_temperatures * uncalibrated_logits + calibration_biases
+    uncalibrated_logits: torch.Tensor | None = None
+    inverse_temperatures: torch.Tensor | None = None
+    calibration_biases: torch.Tensor | None = None
 
 
 class GLiClassPreTrainedModel(PreTrainedModel):
@@ -467,7 +479,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             logits = logits * self.logit_scale.to(classes_embedding.device)
 
         loss = self.get_loss(logits, labels, classes_embedding, classes_embedding_mask)
-        return (logits, loss, pooled_output, classes_embedding)
+        return (logits, loss, pooled_output, classes_embedding, classes_embedding_mask)
 
     def forward(
         self,
@@ -526,7 +538,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             hidden_states = outputs.hidden_states
             loss = 0
             for encoder_layer in hidden_states:
-                logits, layer_loss, pooled_output, classes_embedding = self.process_encoder_output(
+                logits, layer_loss, pooled_output, classes_embedding, classes_mask = self.process_encoder_output(
                     input_ids, attention_mask, encoder_layer, labels, max_num_classes
                 )
                 loss += layer_loss
@@ -538,7 +550,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
                     encoder_layer = outputs[0]
             else:
                 encoder_layer = outputs.hidden_states[self.config.encoder_layer_id]
-            logits, loss, pooled_output, classes_embedding = self.process_encoder_output(
+            logits, loss, pooled_output, classes_embedding, classes_mask = self.process_encoder_output(
                 input_ids, attention_mask, encoder_layer, labels, max_num_classes
             )
 
@@ -553,6 +565,7 @@ class GLiClassUniEncoder(GLiClassBaseModel):
             attentions=outputs.attentions,
             text_embeddings=pooled_output if output_text_embeddings else None,
             class_embeddings=classes_embedding if output_class_embeddings else None,
+            class_mask=classes_mask,
         )
 
 
@@ -671,6 +684,7 @@ class GLiClassEncoderDecoder(GLiClassBaseModel):
             attentions=outputs.decoder_attentions,
             text_embeddings=pooled_output if output_text_embeddings else None,
             class_embeddings=classes_embedding if output_class_embeddings else None,
+            class_mask=classes_embedding_mask,
         )
 
 
@@ -764,6 +778,7 @@ class GLiClassEncoderDecoderCLS(GLiClassBaseModel):
             attentions=outputs.decoder_attentions,
             text_embeddings=pooled_output if output_text_embeddings else None,
             class_embeddings=classes_embedding if output_class_embeddings else None,
+            class_mask=classes_embedding_mask,
         )
 
 
@@ -876,6 +891,7 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             logits=logits,
             text_embeddings=text_embeddings if output_text_embeddings else None,
             class_embeddings=class_embeddings if output_class_embeddings else None,
+            class_mask=labels_mask if labels_mask is not None else torch.ones_like(logits, dtype=torch.long),
         )
 
 
@@ -950,6 +966,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
             logits=logits,
             text_embeddings=text_embeddings if output_text_embeddings else None,
             class_embeddings=class_embeddings if output_class_embeddings else None,
+            class_mask=labels_mask if labels_mask is not None else torch.ones_like(logits, dtype=torch.long),
         )
 
 
@@ -978,8 +995,28 @@ class GLiClassDecoderKV(nn.Module):
             config.encoder_config = AutoConfig.from_pretrained(config.encoder_model_name)
 
         config_name = config.encoder_config.__class__.__name__
+        # EmbeddingGemma 2 is a bidirectional encoder without a KV cache: the whole sequence is encoded in one pass
+        self.bidirectional = config_name == "EmbeddingGemma2Config"
 
-        if config_name == "Qwen3_5TextConfig":
+        if getattr(config, "multimodal", False):
+            # Base multi-modal model (no LM head): encodes images / audio and merges them into the sequence
+            if config_name == "Qwen3_5Config":
+                from transformers.models.qwen3_5 import Qwen3_5Model as ModelClass
+            elif config_name == "Gemma4Config":
+                from transformers.models.gemma4 import Gemma4Model as ModelClass
+            elif config_name == "EmbeddingGemma2Config":
+                from transformers.models.embedding_gemma2 import EmbeddingGemma2Model as ModelClass
+            else:
+                raise ValueError(
+                    f"multimodal decoder-kv requires Qwen3.5, Gemma 4 or EmbeddingGemma 2. Got: {config_name}"
+                )
+        elif config_name == "EmbeddingGemma2Config":
+            from transformers.models.embedding_gemma2 import EmbeddingGemma2Model as ModelClass
+
+            # text only: skip the vision / audio towers (their weights are ignored on load)
+            config.encoder_config.vision_config = None
+            config.encoder_config.audio_config = None
+        elif config_name == "Qwen3_5TextConfig":
             from transformers.models.qwen3_5 import Qwen3_5TextModel
 
             ModelClass = Qwen3_5TextModel
@@ -993,17 +1030,34 @@ class GLiClassDecoderKV(nn.Module):
 
             ModelClass = Qwen3Model
         else:
-            raise ValueError(f"decoder-kv architecture requires Qwen3 or Qwen3.5. Got: {config_name}")
+            raise ValueError(f"decoder-kv architecture requires Qwen3, Qwen3.5 or EmbeddingGemma 2. Got: {config_name}")
 
-        if from_pretrained:
+        if from_pretrained and self.bidirectional:
+            # pass the config so a text-only one (no vision / audio config) skips the media towers
+            self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name, config=config.encoder_config)
+        elif from_pretrained:
             self.decoder_model = ModelClass.from_pretrained(config.encoder_model_name)
         else:
             self.decoder_model = ModelClass(config.encoder_config)
+            # multi-modal backbones build their sub-models in the config's dtype (e.g. bf16); match the scorer
+            self.decoder_model.to(torch.get_default_dtype())
+
+        if self.bidirectional and not getattr(config, "use_embedding_projection", True):
+            # scorer reads the final-norm hidden states (see GLiClassModelConfig.use_embedding_projection)
+            text_model = getattr(self.decoder_model, "language_model", self.decoder_model)
+            text_model.embedding_projection = nn.Identity()
 
         if config.vocab_size is not None and hasattr(self.decoder_model, "resize_token_embeddings"):
-            current_vocab = self.decoder_model.config.vocab_size
+            current_vocab = self.decoder_model.config.get_text_config().vocab_size
             if current_vocab != config.vocab_size:
                 self.decoder_model.resize_token_embeddings(config.vocab_size)
+
+        if getattr(config, "multimodal", False):
+            from .multimodal import freeze_media_encoders, match_media_feature_dtype
+
+            match_media_feature_dtype(self.decoder_model)
+            if getattr(config, "freeze_media_encoders", True):
+                freeze_media_encoders(self.decoder_model)
 
         from .scorers import DecoderKVScorer
 
@@ -1015,39 +1069,141 @@ class GLiClassDecoderKV(nn.Module):
 
         self.sep_token_id = config.sep_token_index
 
-    def get_loss(self, logits, labels):
+    def get_loss(self, logits, labels, valid_labels=None):
         loss = None
         if labels is not None:
             # Sequence truncation may cut label tokens → align labels to logits
             num_labels = logits.shape[-1]
-            if labels.shape[-1] != num_labels:
+            # single-label targets are class indices (batch,); only per-label targets need aligning
+            if labels.dim() > 1 and labels.shape[-1] != num_labels:
                 labels = labels[:, :num_labels]
-
-            if self.config.problem_type == "multi_label_classification":
-                from .loss_functions import focal_loss_with_logits
-
-                reduction = self.config.focal_loss_reduction or "none"
-                all_losses = focal_loss_with_logits(
-                    logits,
-                    labels,
-                    self.config.focal_loss_alpha,
-                    self.config.focal_loss_gamma,
-                    reduction,
-                )
-                loss = all_losses.mean()
-            elif self.config.problem_type == "single_label_classification":
-                loss_fct = nn.CrossEntropyLoss()
-                loss = loss_fct(logits.view(-1, num_labels), labels.view(-1))
-            else:
-                raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
+            loss = self._per_sample_loss(logits, labels, valid_labels).mean()
         return loss
+
+    def _resolve_recurrence(self, use_recurrence=None, max_recurrent_steps=None, halt_threshold=None):
+        """Pick (num_steps, halt_threshold) for this call.
+
+        Training: depth sampled uniformly from [recurrent_min_steps, max], no halting.
+        Inference: up to max steps, halting per example once probabilities stop changing.
+        """
+        if not self.scorer.recurrent:
+            return 1, None
+        if use_recurrence is None:
+            use_recurrence = self.training or self.config.recurrent_inference
+        if not use_recurrence:
+            return 1, None
+
+        if self.training:
+            max_steps = max_recurrent_steps or self.config.recurrent_steps
+            min_steps = min(self.config.recurrent_min_steps or 1, max_steps)
+            return int(torch.randint(min_steps, max_steps + 1, (1,)).item()), None
+
+        max_steps = max_recurrent_steps or self.config.recurrent_inference_max_steps or self.config.recurrent_steps
+        if halt_threshold is None:
+            halt_threshold = self.config.recurrent_halt_threshold
+        return max_steps, halt_threshold
+
+    def _per_sample_loss(self, logits, labels, valid_labels=None):
+        """Unreduced loss per example, shape (batch,).
+
+        valid_labels (batch, num_labels) marks the example's real labels. Slots past them only exist because
+        the batch is padded to its longest label list, so they are left out; otherwise the loss would depend
+        on which examples share a batch.
+        """
+        if self.config.problem_type == "multi_label_classification":
+            from .loss_functions import focal_loss_with_logits
+
+            all_losses = focal_loss_with_logits(
+                logits,
+                labels,
+                self.config.focal_loss_alpha,
+                self.config.focal_loss_gamma,
+                "none",
+            )
+            valid = labels.ne(self.config.ignore_index)
+            if valid_labels is not None:
+                valid = valid & valid_labels
+            return (all_losses * valid).sum(-1) / valid.sum(-1).clamp_min(1)
+        elif self.config.problem_type == "single_label_classification":
+            if valid_labels is not None:
+                logits = logits.masked_fill(~valid_labels, torch.finfo(logits.dtype).min)
+            return nn.functional.cross_entropy(
+                logits, labels.view(-1), ignore_index=self.config.ignore_index, reduction="none"
+            )
+        raise NotImplementedError(f"{self.config.problem_type} is not implemented.")
+
+    def _per_sample_entropy(self, logits, valid_labels):
+        """Mean uncertainty per example over its real labels, shape (batch,).
+
+        Multi-label: binary entropy of each sigmoid probability (0 when p is 0 or 1, max at 0.5).
+        Single-label: entropy of the softmax over the example's labels.
+        """
+        if self.config.problem_type == "single_label_classification":
+            log_probs = torch.log_softmax(logits.masked_fill(~valid_labels, float("-inf")), dim=-1)
+            return -(log_probs.exp() * log_probs.masked_fill(~valid_labels, 0.0)).sum(-1)
+        probs = torch.sigmoid(logits)
+        entropy = nn.functional.binary_cross_entropy_with_logits(logits, probs, reduction="none")
+        return (entropy * valid_labels).sum(-1) / valid_labels.sum(-1).clamp_min(1)
+
+    def get_recurrent_loss(self, step_logits, labels, valid_labels=None):
+        """Loss over all reasoning steps.
+
+        loss = mean_t L_t                                                 (focal loss after every step)
+             + coef * mean_{t>=3} relu(l_t - (1 - margin) * sg(l_{t-1}))  (deeper must beat shallower)
+             + conf_coef * confidence term on recurrent steps t >= 2      (deeper must be more certain)
+
+        The improvement term starts at step 3 vs step 2, so step 1 is only ever trained by its own
+        loss. The stop-gradient on l_{t-1} means the hinge can only push the deeper step down; it
+        never rewards making the earlier step worse.
+
+        Confidence term (recurrent_confidence_coef > 0), with H_t the mean label entropy of step t:
+            "relative": relu(H_t - (1 - conf_margin) * sg(H_{t-1}))  each recurrence less uncertain than the last
+            "absolute": H_t                                          every recurrence as certain as possible
+
+        Returns:
+            loss: scalar
+            step_losses: (num_steps,) detached mean loss per step, for monitoring
+            step_entropies: (num_steps,) detached mean label entropy per step, for monitoring
+        """
+        num_labels = step_logits[-1].shape[-1]
+        if labels.dim() > 1 and labels.shape[-1] != num_labels:
+            labels = labels[:, :num_labels]
+        if valid_labels is None:
+            valid_labels = torch.ones_like(step_logits[-1], dtype=torch.bool)
+
+        per_sample = torch.stack(
+            [self._per_sample_loss(logits, labels, valid_labels) for logits in step_logits]
+        )  # (T, B)
+        step_losses = per_sample.mean(dim=1)
+        loss = step_losses.mean()
+
+        if len(step_logits) >= 3 and self.config.recurrent_improvement_coef > 0:
+            target = (1.0 - self.config.recurrent_improvement_margin) * per_sample[1:-1].detach()
+            improvement = torch.relu(per_sample[2:] - target).mean()
+            loss = loss + self.config.recurrent_improvement_coef * improvement
+
+        entropies = torch.stack([self._per_sample_entropy(logits, valid_labels) for logits in step_logits])  # (T, B)
+        confidence_coef = getattr(self.config, "recurrent_confidence_coef", 0.0)
+        if len(step_logits) >= 2 and confidence_coef > 0:
+            mode = getattr(self.config, "recurrent_confidence_mode", "relative")
+            if mode == "relative":
+                margin = getattr(self.config, "recurrent_confidence_margin", 0.0)
+                confidence = torch.relu(entropies[1:] - (1.0 - margin) * entropies[:-1].detach()).mean()
+            elif mode == "absolute":
+                confidence = entropies[1:].mean()
+            else:
+                raise ValueError(f"Unknown recurrent_confidence_mode: {mode}")
+            loss = loss + confidence_coef * confidence
+
+        return loss, step_losses.detach(), entropies.mean(dim=1).detach()
 
     def _extract_label_section(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_text_section: bool = False,
+    ) -> tuple[torch.Tensor, ...]:
         """
         Extract label section hidden states from full-sequence decoder output.
 
@@ -1061,12 +1217,15 @@ class GLiClassDecoderKV(nn.Module):
             padded_hidden: (batch, max_label_len, hidden_size)
             padded_ids:    (batch, max_label_len)
             label_mask:    (batch, max_label_len)
+            with return_text_section, also everything before the label section:
+            text_hidden:   (batch, max_text_len, hidden_size)
+            text_mask:     (batch, max_text_len)
         """
         batch_size = hidden_states.shape[0]
         sep_id = self.sep_token_id
         label_id = self.config.class_token_index
 
-        slices_h, slices_ids = [], []
+        slices_h, slices_ids, text_slices = [], [], []
 
         for i in range(batch_size):
             real_len = int(attention_mask[i].sum().item())
@@ -1079,6 +1238,7 @@ class GLiClassDecoderKV(nn.Module):
                 # Fallback: use everything up to real_len
                 slices_h.append(hidden_states[i, :real_len])
                 slices_ids.append(ids_i)
+                text_slices.append(hidden_states[i, :real_len])
                 continue
 
             first_label = label_pos[0].item()
@@ -1088,12 +1248,15 @@ class GLiClassDecoderKV(nn.Module):
             if seps_before.numel() == 0:
                 slices_h.append(hidden_states[i, :real_len])
                 slices_ids.append(ids_i)
+                text_slices.append(hidden_states[i, :real_len])
                 continue
 
             # start right after that SEP → first token of "label1<<LABEL>>...<<SEP>>"
             start = int(seps_before[-1].item()) + 1
             slices_h.append(hidden_states[i, start:real_len])
             slices_ids.append(ids_i[start:real_len])
+            # text section ends with that SEP, so it is never empty
+            text_slices.append(hidden_states[i, :start])
 
         padded_hidden = pad_sequence(slices_h, batch_first=True)
         padded_ids = pad_sequence(slices_ids, batch_first=True)
@@ -1105,7 +1268,21 @@ class GLiClassDecoderKV(nn.Module):
         positions = torch.arange(padded_hidden.shape[1], device=attention_mask.device)
         label_mask = (positions.unsqueeze(0) < section_lengths.unsqueeze(1)).to(attention_mask.dtype)
 
-        return padded_hidden, padded_ids, label_mask
+        if not return_text_section:
+            return padded_hidden, padded_ids, label_mask
+
+        text_hidden = pad_sequence(text_slices, batch_first=True)
+        text_lengths = torch.tensor([section.shape[0] for section in text_slices], device=attention_mask.device)
+        text_positions = torch.arange(text_hidden.shape[1], device=attention_mask.device)
+        text_mask = (text_positions.unsqueeze(0) < text_lengths.unsqueeze(1)).to(attention_mask.dtype)
+        return padded_hidden, padded_ids, label_mask, text_hidden, text_mask
+
+    def _require_kv_cache(self):
+        if self.bidirectional:
+            raise ValueError(
+                f"{type(self.decoder_model).__name__} is a bidirectional encoder without a KV cache; "
+                "use the classic (non-streaming) decoder-kv pipeline."
+            )
 
     def update_decoder_cache(
         self,
@@ -1115,6 +1292,7 @@ class GLiClassDecoderKV(nn.Module):
         past_key_values=None,
     ):
         """Extend a text-only decoder cache without running the scorer."""
+        self._require_kv_cache()
         return self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1131,8 +1309,20 @@ class GLiClassDecoderKV(nn.Module):
         label_mask: torch.Tensor,
         position_ids: torch.Tensor,
         past_key_values,
+        use_recurrence: bool | None = None,
+        max_recurrent_steps: int | None = None,
+        halt_threshold: float | None = None,
+        text_hidden_states: torch.Tensor | None = None,
+        text_attention_mask: torch.Tensor | None = None,
+        output_text_embeddings: bool | None = None,
+        output_class_embeddings: bool | None = None,
     ) -> GLiClassOutput:
-        """Classify label tokens against a text cache without persisting labels."""
+        """Classify label tokens against a text cache without persisting labels.
+
+        With config.recurrent_read_text, pass the decoder's last hidden states of the cached text
+        (text_hidden_states / text_attention_mask); the KV cache alone does not contain them.
+        """
+        self._require_kv_cache()
         decoder_outputs = self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -1144,12 +1334,27 @@ class GLiClassDecoderKV(nn.Module):
 
         label_hidden = decoder_outputs.last_hidden_state[:, -input_ids.shape[1] :, :]
         scorer_device = next(self.scorer.parameters()).device
-        logits = self.scorer(
+        num_steps, halt_threshold = self._resolve_recurrence(use_recurrence, max_recurrent_steps, halt_threshold)
+        label_ids = input_ids.to(scorer_device)
+        label_mask = label_mask.to(scorer_device)
+        step_logits, steps_taken, (text_repr, label_repr) = self.scorer.recurrent_forward(
             hidden_states=label_hidden.to(scorer_device),
-            input_ids=input_ids.to(scorer_device),
-            attention_mask=label_mask.to(scorer_device),
+            input_ids=label_ids,
+            attention_mask=label_mask,
+            num_steps=num_steps,
+            halt_threshold=halt_threshold,
+            text_hidden_states=None if text_hidden_states is None else text_hidden_states.to(scorer_device),
+            text_attention_mask=None if text_attention_mask is None else text_attention_mask.to(scorer_device),
+            return_representations=True,
         )
-        return GLiClassOutput(logits=logits)
+        logits = step_logits[-1]
+        return GLiClassOutput(
+            logits=logits,
+            recurrent_num_steps=steps_taken,
+            text_embeddings=text_repr if output_text_embeddings else None,
+            class_embeddings=label_repr if output_class_embeddings else None,
+            class_mask=self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1]).long(),
+        )
 
     def forward(
         self,
@@ -1159,6 +1364,13 @@ class GLiClassDecoderKV(nn.Module):
         labels: torch.Tensor | None = None,
         return_dict: bool | None = None,
         use_cache: bool = False,
+        use_recurrence: bool | None = None,
+        max_recurrent_steps: int | None = None,
+        halt_threshold: float | None = None,
+        output_recurrent_logits: bool = False,
+        output_text_embeddings: bool | None = None,
+        output_class_embeddings: bool | None = None,
+        max_num_classes: int | None = None,
         **kwargs,
     ):
         """Forward pass.
@@ -1170,35 +1382,70 @@ class GLiClassDecoderKV(nn.Module):
             labels: Classification labels
             return_dict: Return dict output
             use_cache: Whether to return updated cache
+            use_recurrence: Enable/disable scorer recurrence for this call (default: config)
+            max_recurrent_steps: Max reasoning steps for this call (training samples depth up to it)
+            halt_threshold: Inference early-stop threshold on label probability change (0 disables)
+            output_recurrent_logits: Return logits of every reasoning step
+            output_text_embeddings / output_class_embeddings: Return the scorer's text / label
+                representations of the final step
+            max_num_classes: Unused, accepted for pipeline compatibility
 
         Returns:
-            GLiClassOutput with logits, loss, and optionally past_key_values
+            GLiClassOutput with logits (of the last step), loss, and optionally past_key_values
         """
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if self.bidirectional:
+            if past_key_values is not None or use_cache:
+                self._require_kv_cache()
+            # media positions come from the placeholder token ids; padding mm_token_type_ids are not accepted
+            kwargs.pop("mm_token_type_ids", None)
+            cache_kwargs = {}
+        else:
+            cache_kwargs = {"past_key_values": past_key_values, "use_cache": use_cache}
 
         decoder_outputs = self.decoder_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
             return_dict=True,
+            **cache_kwargs,
             **kwargs,
         )
 
         hidden_states = decoder_outputs.last_hidden_state
 
-        label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
+        num_steps, halt_threshold = self._resolve_recurrence(use_recurrence, max_recurrent_steps, halt_threshold)
 
-        logits = self.scorer(
+        text_hidden = text_mask = None
+        if self.scorer.read_text and num_steps > 1:
+            label_hidden, label_ids, label_mask, text_hidden, text_mask = self._extract_label_section(
+                hidden_states, input_ids, attention_mask, return_text_section=True
+            )
+        else:
+            label_hidden, label_ids, label_mask = self._extract_label_section(hidden_states, input_ids, attention_mask)
+
+        step_logits, steps_taken, (text_repr, label_repr) = self.scorer.recurrent_forward(
             hidden_states=label_hidden,
             input_ids=label_ids,
             attention_mask=label_mask,
+            num_steps=num_steps,
+            halt_threshold=halt_threshold,
+            return_all_steps=labels is not None or output_recurrent_logits,
+            text_hidden_states=text_hidden,
+            text_attention_mask=text_mask,
+            return_representations=True,
         )
+        logits = step_logits[-1]
 
         if labels is not None:
             self.num_labels = logits.shape[-1]
 
-        loss = self.get_loss(logits, labels)
+        recurrent_losses = recurrent_entropies = None
+        valid_labels = self.scorer._valid_label_mask(label_ids, label_mask, logits.shape[-1])
+        if len(step_logits) > 1 and labels is not None:
+            loss, recurrent_losses, recurrent_entropies = self.get_recurrent_loss(step_logits, labels, valid_labels)
+        else:
+            loss = self.get_loss(logits, labels, valid_labels)
 
         if not return_dict:
             output = (logits,)
@@ -1212,6 +1459,13 @@ class GLiClassDecoderKV(nn.Module):
             hidden_states=decoder_outputs.hidden_states if hasattr(decoder_outputs, "hidden_states") else None,
             attentions=decoder_outputs.attentions if hasattr(decoder_outputs, "attentions") else None,
             past_key_values=decoder_outputs.past_key_values if use_cache else None,
+            recurrent_logits=tuple(step_logits) if output_recurrent_logits else None,
+            recurrent_losses=recurrent_losses,
+            recurrent_entropies=recurrent_entropies,
+            recurrent_num_steps=steps_taken if num_steps > 1 else None,
+            text_embeddings=text_repr if output_text_embeddings else None,
+            class_embeddings=label_repr if output_class_embeddings else None,
+            class_mask=valid_labels.long(),
         )
 
 
@@ -1230,7 +1484,40 @@ class GLiClassModel(GLiClassPreTrainedModel):
             self.model = GLiClassEncoderDecoderCLS(config, from_pretrained)
         elif config.architecture_type == "decoder-kv":
             self.model = GLiClassDecoderKV(config, from_pretrained)
+        self.calibrator = build_calibrator(config) if getattr(config, "use_calibrator", False) else None
         self.post_init()
+
+    def add_calibrator(self, hidden_size=None, beta_max=None, dropout=None, use_bias=None):
+        """Attach a fresh calibrator (beta == 1, bias == 0, i.e. identity) and record it in the config."""
+        if hidden_size is not None:
+            self.config.calibrator_hidden_size = hidden_size
+        if beta_max is not None:
+            self.config.calibrator_beta_max = beta_max
+        if dropout is not None:
+            self.config.calibrator_dropout = dropout
+        if use_bias is not None:
+            self.config.calibrator_use_bias = use_bias
+        self.config.use_calibrator = True
+        reference = next(self.model.parameters())
+        self.calibrator = build_calibrator(self.config).to(device=reference.device)
+        return self.calibrator
+
+    def remove_calibrator(self):
+        self.config.use_calibrator = False
+        self.calibrator = None
+
+    def _calibrate(self, outputs, keep_text_embeddings, keep_class_embeddings):
+        logits = outputs.logits
+        beta, bias = self.calibrator(outputs.text_embeddings, outputs.class_embeddings, logits, outputs.class_mask)
+        outputs.uncalibrated_logits = logits
+        outputs.inverse_temperatures = beta
+        outputs.calibration_biases = bias
+        outputs.logits = (beta * logits.float() + bias).to(logits.dtype)
+        if not keep_text_embeddings:
+            outputs.text_embeddings = None
+        if not keep_class_embeddings:
+            outputs.class_embeddings = None
+        return outputs
 
     def get_input_embeddings(self):
         if self.config.architecture_type in {"uni-encoder"}:
@@ -1318,7 +1605,7 @@ class GLiClassModel(GLiClassPreTrainedModel):
             model_embeds = self.model.decoder_model.resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
         else:
             raise NotImplementedError("Resizing is not implemented for bi-encoder architecture")
-        self.config.encoder_config.vocab_size = model_embeds.num_embeddings
+        self.config.encoder_config.get_text_config().vocab_size = model_embeds.num_embeddings
         self.config.vocab_size = model_embeds.num_embeddings
         self.vocab_size = model_embeds.num_embeddings
         return model_embeds
@@ -1326,8 +1613,14 @@ class GLiClassModel(GLiClassPreTrainedModel):
     def forward(self, *args, **kwargs):
         if kwargs.get("adapter_ids") is None:
             kwargs.pop("adapter_ids", None)
+        if self.calibrator is None:
+            return self.model(*args, **kwargs)
+
+        keep_text = bool(kwargs.get("output_text_embeddings"))
+        keep_class = bool(kwargs.get("output_class_embeddings"))
+        kwargs.update(output_text_embeddings=True, output_class_embeddings=True, return_dict=True)
         outputs = self.model(*args, **kwargs)
-        return outputs
+        return self._calibrate(outputs, keep_text, keep_class)
 
     def update_decoder_cache(self, **kwargs):
         """Extend a decoder-KV text cache."""
@@ -1339,4 +1632,11 @@ class GLiClassModel(GLiClassPreTrainedModel):
         """Classify labels against a decoder-KV text cache."""
         if self.config.architecture_type != "decoder-kv":
             raise ValueError("Cached classification requires architecture_type='decoder-kv'.")
-        return self.model.classify_from_decoder_cache(**kwargs)
+        if self.calibrator is None:
+            return self.model.classify_from_decoder_cache(**kwargs)
+
+        keep_text = bool(kwargs.get("output_text_embeddings"))
+        keep_class = bool(kwargs.get("output_class_embeddings"))
+        kwargs.update(output_text_embeddings=True, output_class_embeddings=True)
+        outputs = self.model.classify_from_decoder_cache(**kwargs)
+        return self._calibrate(outputs, keep_text, keep_class)

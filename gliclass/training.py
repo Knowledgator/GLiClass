@@ -273,8 +273,14 @@ class EWC:
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: str | None = field(default=None)
     optim: str = field(default="adamw_torch")
+    # GLiClass models take **kwargs, so the forward signature cannot tell which columns are unused
+    # (plain-dict samples, e.g. multi-modal ones, would otherwise lose every key)
+    remove_unused_columns: bool = field(default=False)
     others_lr: float | None = None
     others_weight_decay: float | None = 0.0
+    recurrent_lr: float | None = field(
+        default=None, metadata={"help": "Learning rate for the decoder-kv scorer's recurrent reasoning cell."}
+    )
 
     use_ewc: bool = field(
         default=False, metadata={"help": "Whether to use Elastic Weight Consolidation (EWC) for continual learning."}
@@ -319,6 +325,8 @@ class Trainer(transformers.Trainer):
         self.ewc = ewc
         self.prev_dataset = prev_dataset
         self._ewc_initialized = ewc is not None
+        # running sums of per-step losses of recurrent scorers, flushed in log()
+        self._recurrent_loss_sums = {}
 
     def _maybe_initialize_ewc(self):
         """Initialize EWC if needed and not already initialized."""
@@ -369,11 +377,8 @@ class Trainer(transformers.Trainer):
             Loss tensor, or tuple of (loss, outputs) if return_outputs=True
         """
         # Get base loss from parent
-        if return_outputs:
-            loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
-        else:
-            loss = super().compute_loss(model, inputs, return_outputs=False, **kwargs)
-            outputs = None
+        loss, outputs = super().compute_loss(model, inputs, return_outputs=True, **kwargs)
+        self._track_recurrent_losses(model, outputs)
 
         # Add EWC penalty if enabled
         if self.ewc is not None and self.args.use_ewc:
@@ -385,11 +390,53 @@ class Trainer(transformers.Trainer):
             return loss, outputs
         return loss
 
+    def _track_recurrent_losses(self, model, outputs):
+        if not isinstance(outputs, dict) or not model.training:
+            return
+        for key, prefix in (("recurrent_losses", "loss_step"), ("recurrent_entropies", "entropy_step")):
+            values = outputs.get(key)
+            if values is None:
+                continue
+            for step, value in enumerate(values.tolist(), start=1):
+                total, count = self._recurrent_loss_sums.get((prefix, step), (0.0, 0))
+                self._recurrent_loss_sums[(prefix, step)] = (total + value, count + 1)
+
+    def log(self, logs, *args, **kwargs):
+        """Add mean per-step losses and label entropies of recurrent scorers to training logs."""
+        if "loss" in logs and self._recurrent_loss_sums:
+            for (prefix, step), (total, count) in sorted(self._recurrent_loss_sums.items()):
+                logs[f"{prefix}_{step}"] = round(total / count, 4)
+            self._recurrent_loss_sums = {}
+        return super().log(logs, *args, **kwargs)
+
     def train(self, *args, **kwargs):
         """Train with EWC initialization."""
         # Initialize EWC before training starts
         self._maybe_initialize_ewc()
         return super().train(*args, **kwargs)
+
+    def _get_train_sampler(self, train_dataset=None):
+        """batch_rebalance: use the dataset's cheap length estimates instead of preprocessing every sample."""
+        train_dataset = train_dataset if train_dataset is not None else self.train_dataset
+        if (
+            getattr(self.args, "train_sampling_strategy", None) != "batch_rebalance"
+            or not hasattr(train_dataset, "estimate_lengths")
+        ):
+            return super()._get_train_sampler(train_dataset)
+        from transformers.trainer_pt_utils import BatchRebalanceSampler
+
+        lengths = train_dataset.estimate_lengths()
+        world_size = max(1, self.args.world_size)
+        grad_accum = self.args.gradient_accumulation_steps
+        return BatchRebalanceSampler(
+            lengths=lengths,
+            effective_batch_size=self.args.train_batch_size * grad_accum * world_size,
+            dp_size=world_size,
+            grad_accum=grad_accum,
+            rank=self.args.process_index if world_size > 1 else 0,
+            seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+            drop_last=self.args.dataloader_drop_last,
+        )
 
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         """
@@ -421,7 +468,6 @@ class Trainer(transformers.Trainer):
                 loss = self.compute_loss(model, inputs)
 
             del inputs
-            torch.cuda.empty_cache()
 
             kwargs = {}
 
@@ -533,8 +579,17 @@ class Trainer(transformers.Trainer):
         if self.optimizer is None:
             decay_parameters = get_parameter_names(opt_model, ALL_LAYERNORM_LAYERS)
             decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            # e.g. a partly frozen embedding matrix: decay would also shrink the frozen rows
+            no_decay = getattr(opt_model, "no_weight_decay_param_names", set())
+            decay_parameters = [name for name in decay_parameters if name not in no_decay]
             if self.args.others_lr is not None:
-                encoder_parameters = [name for name, _ in opt_model.named_parameters() if "encoder" in name]
+                # the pretrained backbone gets learning_rate, new heads get others_lr; decoder-kv names its
+                # backbone decoder_model, and its scorer's scorer_encoder is a new head, not the backbone
+                encoder_parameters = [
+                    name
+                    for name, _ in opt_model.named_parameters()
+                    if ("encoder" in name or "decoder_model" in name) and "scorer" not in name
+                ]
                 optimizer_grouped_parameters = [
                     {
                         "params": [
@@ -589,11 +644,47 @@ class Trainer(transformers.Trainer):
                     },
                 ]
 
+            if getattr(self.args, "recurrent_lr", None) is not None:
+                optimizer_grouped_parameters = self._split_recurrent_groups(opt_model, optimizer_grouped_parameters)
+
+            optimizer_grouped_parameters = [group for group in optimizer_grouped_parameters if group["params"]]
+
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            if self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.hf_ds_config.is_offload():
+                # ZeRO offload keeps optimizer states on CPU, which needs DeepSpeed's CPU implementation of Adam
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                optimizer_cls = DeepSpeedCPUAdam
+                optimizer_kwargs = {
+                    "lr": self.args.learning_rate,
+                    "betas": (self.args.adam_beta1, self.args.adam_beta2),
+                    "eps": self.args.adam_epsilon,
+                    "adamw_mode": True,
+                }
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
+            if "bitsandbytes" in str(optimizer_cls) and optimizer_kwargs.get("optim_bits") == 8:
+                # mirror transformers.Trainer.create_optimizer: keep embedding optimizer states in 32-bit for stability
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+
         return self.optimizer
+
+    def _split_recurrent_groups(self, model, groups):
+        """Move reasoning-cell parameters into their own groups with args.recurrent_lr."""
+        recurrent_ids = {id(p) for name, p in model.named_parameters() if "reasoning_cell" in name}
+        split = []
+        for group in groups:
+            kept = [p for p in group["params"] if id(p) not in recurrent_ids]
+            moved = [p for p in group["params"] if id(p) in recurrent_ids]
+            split.append({**group, "params": kept})
+            if moved:
+                split.append({**group, "params": moved, "lr": self.args.recurrent_lr})
+        return split
 
 
 @dataclass

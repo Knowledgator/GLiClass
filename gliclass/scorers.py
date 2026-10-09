@@ -1,7 +1,25 @@
+import os
+
 import torch
 from torch import nn
 
 from .ops import attn_padded
+from .utils import is_module_available
+
+IS_FLASHDEBERTA = is_module_available("flashdeberta")
+
+if IS_FLASHDEBERTA:
+    from flashdeberta import FlashDisentangledSelfAttention
+    from transformers.models.deberta_v2.modeling_deberta_v2 import DisentangledSelfAttention
+
+    class ScorerFlashSelfAttention(FlashDisentangledSelfAttention):
+        """FlashDeBERTa attention for the scorer encoder; its Triton kernels need CUDA, so other devices
+        (e.g. scoring on CPU) fall back to the eager DeBERTa attention with the same weights."""
+
+        def forward(self, hidden_states, *args, **kwargs):
+            if hidden_states.is_cuda:
+                return super().forward(hidden_states, *args, **kwargs)
+            return DisentangledSelfAttention.forward(self, hidden_states, *args, **kwargs)
 
 
 class ScorerWeightedDot(nn.Module):
@@ -169,6 +187,63 @@ class CrossAttnScorer(nn.Module):
         return self.score_mlp(torch.cat([context, label_rep], dim=-1)).squeeze(-1)
 
 
+class RecurrentReasoningCell(nn.Module):
+    """GRU-style reasoning step around the scorer's (shared) DeBERTa encoder.
+
+        x    = LN(decoder label-section states)               scale-matched to the encoder state
+        read = CrossAttn(q=h, kv=LN(text states))             only with read_text
+        r    = sigmoid(W_r [h; x])
+        h~   = Enc(r * h + (1 - r) * x + read)
+        z    = sigmoid(W_z [h; h~])
+        h'   = (1 - z) * h + z * h~
+
+    No parameter depends on the step index, so any number of steps can be run.
+    """
+
+    def __init__(self, hidden_size, read_text=False):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.reset_gate = nn.Linear(hidden_size * 2, hidden_size)
+        self.update_gate = nn.Linear(hidden_size * 2, hidden_size)
+
+        self.read_text = read_text
+        if read_text:
+            self.num_heads = max(1, hidden_size // 64)
+            self.head_dim = hidden_size // self.num_heads
+            self.read_q = nn.Linear(hidden_size, hidden_size)
+            self.read_k = nn.Linear(hidden_size, hidden_size)
+            self.read_v = nn.Linear(hidden_size, hidden_size)
+            self.read_out = nn.Linear(hidden_size, hidden_size)
+
+    def normalize(self, hidden_states):
+        return nn.functional.layer_norm(hidden_states, (self.hidden_size,))
+
+    def prepare_text(self, text_states):
+        """Project normalized text states to keys/values once per forward pass."""
+        batch_size, text_length, _ = text_states.shape
+        text_states = self.normalize(text_states)
+        keys = self.read_k(text_states).view(batch_size, text_length, self.num_heads, self.head_dim)
+        values = self.read_v(text_states).view(batch_size, text_length, self.num_heads, self.head_dim)
+        return keys, values
+
+    def read(self, state, text_memory, text_mask):
+        batch_size, length, _ = state.shape
+        keys, values = text_memory
+        queries = self.read_q(self.normalize(state)).view(batch_size, length, self.num_heads, self.head_dim)
+        context = attn_padded(queries, keys, values, key_padding_mask=text_mask)
+        return self.read_out(context.reshape(batch_size, length, self.hidden_size))
+
+    def forward(self, state, inputs, attention_mask, encode, text_memory=None, text_mask=None):
+        """One step; `inputs` must already be normalized with self.normalize."""
+        reset = torch.sigmoid(self.reset_gate(torch.cat([state, inputs], dim=-1)))
+        candidate_input = reset * state + (1 - reset) * inputs
+        if self.read_text:
+            candidate_input = candidate_input + self.read(state, text_memory, text_mask)
+        candidate = encode(candidate_input, attention_mask)
+        update = torch.sigmoid(self.update_gate(torch.cat([state, candidate], dim=-1)))
+        return (1 - update) * state + update * candidate
+
+
 class DecoderKVScorer(nn.Module):
     """
     Scorer for decoder-kv architecture with built-in bidirectional encoder and representation extraction.
@@ -203,6 +278,10 @@ class DecoderKVScorer(nn.Module):
             max_relative_positions=512,
         )
         self.scorer_encoder = DebertaV2Encoder(encoder_config)
+        if os.environ.get("USE_FLASHDEBERTA", "") and IS_FLASHDEBERTA:
+            print("Using FlashDeberta backend for the scorer encoder.")
+            for layer in self.scorer_encoder.layer:
+                layer.attention.self = ScorerFlashSelfAttention(encoder_config)
 
         self.text_projector = nn.Linear(config.hidden_size, config.hidden_size)
         self.label_projector = nn.Linear(config.hidden_size, config.hidden_size)
@@ -220,6 +299,15 @@ class DecoderKVScorer(nn.Module):
         )
 
         self.epsilon = 1e-8
+
+        # False: the encoder sees only the label section; True: the whole sequence (text included)
+        self.full_sequence = getattr(config, "scorer_full_sequence", False)
+
+        # Recurrent reasoning over scorer_encoder (see RecurrentReasoningCell). Step 1 is the plain scorer.
+        self.recurrent = getattr(config, "recurrent_steps", 1) > 1
+        self.read_text = self.recurrent and getattr(config, "recurrent_read_text", False)
+        if self.recurrent:
+            self.reasoning_cell = RecurrentReasoningCell(config.hidden_size, read_text=self.read_text)
 
     def _extract_representations(self, hidden_states, input_ids, attention_mask):
         """
@@ -267,14 +355,123 @@ class DecoderKVScorer(nn.Module):
             hidden_states: (batch_size, seq_length, hidden_size) from decoder backbone
             input_ids: (batch_size, seq_length)
             attention_mask: (batch_size, seq_length)
+            **kwargs: recurrence options, see recurrent_forward
 
         Returns:
             logits: (batch_size, num_labels)
         """
-        encoder_outputs = self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True)
+        step_logits, _ = self.recurrent_forward(hidden_states, input_ids, attention_mask, **kwargs)
+        return step_logits[-1]
 
-        contextualized_hidden_states = encoder_outputs.last_hidden_state
+    def _encode(self, hidden_states, attention_mask):
+        return self.scorer_encoder(hidden_states, attention_mask=attention_mask, return_dict=True).last_hidden_state
 
+    def _valid_label_mask(self, input_ids, attention_mask, num_labels):
+        label_counts = (input_ids.eq(self.config.class_token_index) & attention_mask.bool()).sum(dim=1)
+        return torch.arange(num_labels, device=input_ids.device).unsqueeze(0) < label_counts.unsqueeze(1)
+
+    def _probabilities(self, logits, valid_labels):
+        if self.config.problem_type == "single_label_classification":
+            return torch.softmax(logits.masked_fill(~valid_labels, float("-inf")), dim=-1).nan_to_num(0.0)
+        return torch.sigmoid(logits)
+
+    def recurrent_forward(
+        self,
+        hidden_states,
+        input_ids,
+        attention_mask,
+        num_steps=1,
+        halt_threshold=None,
+        return_all_steps=False,
+        text_hidden_states=None,
+        text_attention_mask=None,
+        return_representations=False,
+        **kwargs,
+    ):
+        """Run step 1 (one scorer_encoder pass) and up to num_steps - 1 gated recurrent steps.
+
+        With halt_threshold, an example stops once no valid label probability moves by
+        halt_threshold or more between consecutive steps; its state and logits are frozen.
+        With config.recurrent_read_text, every recurrent step also attends to text_hidden_states
+        (decoder states of the text before the label section).
+
+        Returns:
+            step_logits: list of (batch_size, num_labels) logits for every step if
+                return_all_steps, otherwise a single-element list with the final logits
+            steps_taken: (batch_size,) number of steps each example ran
+            representations: only with return_representations, the (text_repr, label_repr) the
+                final logits were scored from
+        """
+        if num_steps > 1 and not self.recurrent:
+            raise ValueError("num_steps > 1 requires a scorer built with config.recurrent_steps > 1.")
+
+        bptt_steps = getattr(self.config, "recurrent_bptt_steps", None)
+
+        state = self._encode(hidden_states, attention_mask)
+        logits, text_repr, label_repr = self._score(state, input_ids, attention_mask, return_representations=True)
+        step_logits = [logits]
+
+        batch_size, num_labels = logits.shape
+        steps_taken = torch.ones(batch_size, dtype=torch.long, device=logits.device)
+        active = torch.ones(batch_size, dtype=torch.bool, device=logits.device)
+        if halt_threshold:
+            valid_labels = self._valid_label_mask(input_ids, attention_mask, num_labels)
+
+        if num_steps > 1:
+            inputs = self.reasoning_cell.normalize(hidden_states)
+            text_memory = text_mask = None
+            if self.read_text:
+                if text_hidden_states is None or text_attention_mask is None:
+                    raise ValueError("config.recurrent_read_text requires text_hidden_states and text_attention_mask.")
+                text_memory = self.reasoning_cell.prepare_text(text_hidden_states)
+                text_mask = text_attention_mask.bool()
+
+        for step in range(1, num_steps):
+            if bptt_steps and step % bptt_steps == 0:
+                # truncated BPTT: later losses stop shaping earlier iterations
+                state = state.detach()
+
+            new_state = self.reasoning_cell(state, inputs, attention_mask, self._encode, text_memory, text_mask)
+            new_logits, new_text_repr, new_label_repr = self._score(
+                new_state, input_ids, attention_mask, return_representations=True
+            )
+
+            if halt_threshold:
+                change = (
+                    (self._probabilities(new_logits, valid_labels) - self._probabilities(logits, valid_labels))
+                    .abs()
+                    .masked_fill(~valid_labels, 0.0)
+                    .amax(dim=-1)
+                )
+                new_state = torch.where(active[:, None, None], new_state, state)
+                new_logits = torch.where(active[:, None], new_logits, logits)
+                new_text_repr = torch.where(active[:, None], new_text_repr, text_repr)
+                new_label_repr = torch.where(active[:, None, None], new_label_repr, label_repr)
+                steps_taken = steps_taken + active.long()
+                active = active & change.ge(halt_threshold)
+            else:
+                steps_taken = steps_taken + 1
+
+            state, logits = new_state, new_logits
+            text_repr, label_repr = new_text_repr, new_label_repr
+            if return_all_steps:
+                step_logits.append(logits)
+            else:
+                step_logits[-1] = logits
+
+            if halt_threshold and not active.any():
+                break
+
+        if self.recurrent and self.training:
+            # keep the reasoning cell in the graph for DDP when the sampled depth is 1
+            unused = sum(param.sum() for param in self.reasoning_cell.parameters())
+            step_logits[-1] = step_logits[-1] + 0.0 * unused
+
+        if return_representations:
+            return step_logits, steps_taken, (text_repr, label_repr)
+        return step_logits, steps_taken
+
+    def _score(self, contextualized_hidden_states, input_ids, attention_mask, return_representations=False):
         text_repr, label_repr = self._extract_representations(contextualized_hidden_states, input_ids, attention_mask)
 
         text_repr = self.text_projector(text_repr)
@@ -292,6 +489,8 @@ class DecoderKVScorer(nn.Module):
 
         logits = self.mlp(combined_rep).squeeze(-1)
 
+        if return_representations:
+            return logits, text_repr, label_repr
         return logits
 
 

@@ -7,6 +7,7 @@ from transformers import AutoTokenizer
 
 from .model import GLiClassModel, GLiClassBiEncoder
 from .utils import retrieval_augmented_text
+from .multimodal import is_processor, collate_media, get_tokenizer, process_multimodal_with_budget
 from .data_processing import format_decoder_kv_labels, format_decoder_kv_context, format_decoder_kv_sequence
 
 
@@ -186,7 +187,12 @@ class BaseZeroShotClassificationPipeline(ABC):
     ):
         self.model = model
         if isinstance(tokenizer, str):
-            self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
+            if getattr(model.config, "multimodal", False):
+                from transformers import AutoProcessor
+
+                self.tokenizer = AutoProcessor.from_pretrained(tokenizer)
+            else:
+                self.tokenizer = AutoTokenizer.from_pretrained(tokenizer)
         else:
             self.tokenizer = tokenizer
         self.max_classes = max_classes
@@ -250,6 +256,15 @@ class BaseZeroShotClassificationPipeline(ABC):
         normalized = self._normalize_classification_type(classification_type)
         return [normalized] * num_texts
 
+    @staticmethod
+    def _normalize_media(media, num_texts: int) -> List[List]:
+        """Per-text lists of media items; a single text may pass its items as a flat list."""
+        if num_texts == 1 and not any(isinstance(item, (list, tuple)) or item is None for item in media):
+            media = [media]
+        if len(media) != num_texts:
+            raise ValueError("images / audio must provide one list of items per text.")
+        return [[] if item is None else list(item) if isinstance(item, (list, tuple)) else [item] for item in media]
+
     def _normalize_adapter_ids(self, adapter_ids: str | List[str] | None, num_texts: int) -> List[str] | None:
         if adapter_ids is None:
             return None
@@ -265,18 +280,31 @@ class BaseZeroShotClassificationPipeline(ABC):
         labels: List[str],
         classification_type: str,
         threshold: float,
+        initial_logits: torch.Tensor | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, float]]:
-        """Convert one row of logits into predictions and a complete score map."""
-        logits = logits[: len(labels)]
-        if classification_type == "single-label":
-            scores = torch.softmax(logits, dim=-1)
-            all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
-            best = int(scores.argmax().item())
-            return [{"label": labels[best], "score": float(scores[best].detach())}], all_scores
+        """Convert one row of logits into predictions and a complete score map.
 
-        scores = torch.sigmoid(logits)
-        all_scores = {label: float(score.detach()) for label, score in zip(labels, scores, strict=True)}
-        predictions = [{"label": label, "score": score} for label, score in all_scores.items() if score >= threshold]
+        With initial_logits (uncalibrated logits of a calibrated model), every prediction also carries
+        "initial_score"; "score" and the threshold use the calibrated logits.
+        """
+        activation = (lambda x: torch.softmax(x, dim=-1)) if classification_type == "single-label" else torch.sigmoid
+        scores = activation(logits[: len(labels)].float()).tolist()
+        initial_scores = None
+        if initial_logits is not None:
+            initial_scores = activation(initial_logits[: len(labels)].float()).tolist()
+
+        def prediction(index):
+            item = {"label": labels[index], "score": scores[index]}
+            if initial_scores is not None:
+                item["initial_score"] = initial_scores[index]
+            return item
+
+        all_scores = dict(zip(labels, scores, strict=True))
+        if classification_type == "single-label":
+            best = max(range(len(scores)), key=scores.__getitem__)
+            return [prediction(best)], all_scores
+
+        predictions = [prediction(i) for i, score in enumerate(scores) if score >= threshold]
         return predictions, all_scores
 
     def _process_labels(
@@ -436,6 +464,8 @@ class BaseZeroShotClassificationPipeline(ABC):
         prompt: str | List[str] | None = None,
         return_hierarchical: bool = False,
         adapter_ids: str | List[str] | None = None,
+        images: List | None = None,
+        audio: List | None = None,
     ):
         """
         Perform zero-shot classification.
@@ -453,6 +483,8 @@ class BaseZeroShotClassificationPipeline(ABC):
             prompt: Task description - string (same for all) or list (per-text)
             return_hierarchical: If True, return hierarchical structure with all scores
             adapter_ids: Optional LoRA adapter id for all texts or one adapter id per text.
+            images: Multi-modal decoder-kv only: per text, a list of images (paths, URLs or PIL images).
+            audio: Multi-modal decoder-kv only: per text, a list of audio clips (paths, URLs or arrays).
 
         Returns:
             List of classification results or hierarchical dict structure.
@@ -460,6 +492,11 @@ class BaseZeroShotClassificationPipeline(ABC):
         original_labels = labels
 
         texts = self._normalize_texts(texts)
+        media = {
+            key: self._normalize_media(value, len(texts))
+            for key, value in (("images", images), ("audio", audio))
+            if value is not None
+        }
         thresholds = self._normalize_thresholds(threshold, len(texts))
         classification_types = self._normalize_classification_types(classification_type, len(texts))
         adapter_ids = self._normalize_adapter_ids(adapter_ids, len(texts))
@@ -495,8 +532,10 @@ class BaseZeroShotClassificationPipeline(ABC):
             batch_prompt = self._get_batch_prompt(prompt, idx, len(batch_texts))
             batch_adapter_ids = adapter_ids[idx : idx + len(batch_texts)] if adapter_ids is not None else None
 
+            batch_media = {key: value[idx : idx + len(batch_texts)] for key, value in media.items()}
+
             tokenized_inputs = self.prepare_inputs(
-                batch_texts, batch_labels, same_labels, examples=batch_examples, prompt=batch_prompt
+                batch_texts, batch_labels, same_labels, examples=batch_examples, prompt=batch_prompt, **batch_media
             )
             max_num_classes = self._resolve_max_num_classes(batch_labels, same_labels)
             model_output = self.model(
@@ -505,6 +544,7 @@ class BaseZeroShotClassificationPipeline(ABC):
                 adapter_ids=batch_adapter_ids,
             )
             logits = model_output.logits
+            initial_logits = getattr(model_output, "uncalibrated_logits", None)
 
             for i in range(len(batch_texts)):
                 global_idx = idx + i
@@ -521,6 +561,7 @@ class BaseZeroShotClassificationPipeline(ABC):
                     curr_labels,
                     item_classification_type,
                     item_threshold,
+                    initial_logits=None if initial_logits is None else initial_logits[i],
                 )
                 results.append(predictions)
                 if return_hierarchical:
@@ -797,15 +838,21 @@ class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             )
         return contexts, label_sequences
 
-    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None):
+    def prepare_inputs(self, texts, labels, same_labels=False, examples=None, prompt=None, images=None, audio=None):
+        tokenizer = get_tokenizer(self.tokenizer)
         contexts, label_sequences = self._build_context_and_labels(texts, labels, same_labels, examples, prompt)
 
-        label_token_ids = self.tokenizer(label_sequences, add_special_tokens=False)["input_ids"]
+        label_token_ids = tokenizer(label_sequences, add_special_tokens=False)["input_ids"]
+
+        if images is not None or audio is not None:
+            return self._prepare_multimodal_inputs(
+                texts, labels, same_labels, examples, prompt, label_token_ids, images, audio
+            )
 
         input_ids_list = []
         for context, label_ids in zip(contexts, label_token_ids, strict=True):
             context_budget = max(1, self.max_length - len(label_ids))
-            context_ids = self.tokenizer(
+            context_ids = tokenizer(
                 context,
                 truncation=True,
                 max_length=context_budget,
@@ -813,27 +860,57 @@ class DecoderKVZeroShotClassificationPipeline(BaseZeroShotClassificationPipeline
             )["input_ids"]
             input_ids_list.append(context_ids + label_ids)
 
-        max_len = max(len(ids) for ids in input_ids_list)
-        pad_token_id = self.tokenizer.pad_token_id
+        return self._pad_inputs({"input_ids": input_ids_list})
+
+    def _prepare_multimodal_inputs(self, texts, labels, same_labels, examples, prompt, label_token_ids, images, audio):
+        """Process [prompt][examples]<media>text with the processor and append the label section ids."""
+        if not is_processor(self.tokenizer):
+            raise ValueError("images / audio require building the pipeline with the model's processor (AutoProcessor).")
+
+        sequences = {"input_ids": [], "mm_token_type_ids": []}
+        samples = []
+        for i, (text, label_ids) in enumerate(zip(texts, label_token_ids, strict=True)):
+            examples_text = self._format_examples_for_input(self._get_text_examples(examples, i))
+            text_prompt = self._format_prompt(prompt, i) or ""
+            sample = process_multimodal_with_budget(
+                self.tokenizer,
+                lambda text, media, text_prompt=text_prompt, examples_text=examples_text: format_decoder_kv_context(
+                    text, text_prompt, examples_text, media
+                ),
+                text,
+                images[i] if images else [],
+                audio[i] if audio else [],
+                self.max_length,
+                reserved=len(label_ids),
+            )
+            context_ids = sample["input_ids"].tolist()
+            mm_token_type_ids = sample.get("mm_token_type_ids")
+            mm_token_type_ids = [0] * len(context_ids) if mm_token_type_ids is None else mm_token_type_ids.tolist()
+            sequences["input_ids"].append(context_ids + label_ids)
+            sequences["mm_token_type_ids"].append(mm_token_type_ids + [0] * len(label_ids))
+            samples.append(sample)
+
+        inputs = self._pad_inputs(sequences)
+        inputs.update({key: value.to(self.device) for key, value in collate_media(samples).items()})
+        return inputs
+
+    def _pad_inputs(self, sequences: dict) -> dict:
+        """Right-pad id sequences (the model locates the label section from the attention mask's length)."""
+        tokenizer = get_tokenizer(self.tokenizer)
+        pad_token_id = tokenizer.pad_token_id
         if pad_token_id is None:
-            pad_token_id = self.tokenizer.eos_token_id or 0
-        padding_side = getattr(self.tokenizer, "padding_side", "right")
+            pad_token_id = tokenizer.eos_token_id or 0
 
-        padded_input_ids = []
-        attention_masks = []
-        for ids in input_ids_list:
-            pad_len = max_len - len(ids)
-            if padding_side == "left":
-                padded_input_ids.append([pad_token_id] * pad_len + ids)
-                attention_masks.append([0] * pad_len + [1] * len(ids))
-            else:
-                padded_input_ids.append(ids + [pad_token_id] * pad_len)
-                attention_masks.append([1] * len(ids) + [0] * pad_len)
-
-        return {
-            "input_ids": torch.tensor(padded_input_ids, device=self.device),
-            "attention_mask": torch.tensor(attention_masks, device=self.device),
+        input_ids_list = sequences["input_ids"]
+        max_len = max(len(ids) for ids in input_ids_list)
+        inputs = {
+            "input_ids": [ids + [pad_token_id] * (max_len - len(ids)) for ids in input_ids_list],
+            "attention_mask": [[1] * len(ids) + [0] * (max_len - len(ids)) for ids in input_ids_list],
         }
+        for key, values in sequences.items():
+            if key != "input_ids":
+                inputs[key] = [ids + [0] * (max_len - len(ids)) for ids in values]
+        return {key: torch.tensor(value, device=self.device) for key, value in inputs.items()}
 
 
 class ZeroShotClassificationPipeline:
@@ -992,6 +1069,8 @@ class ZeroShotClassificationPipeline:
         prompt: str | List[str] | None = None,
         return_hierarchical: bool = False,
         adapter_ids: str | List[str] | None = None,
+        images: List | None = None,
+        audio: List | None = None,
     ):
         """
         Perform zero-shot classification.
@@ -1012,10 +1091,13 @@ class ZeroShotClassificationPipeline:
             prompt: Task description - string or list of strings (per-text)
             return_hierarchical: If True, return structure matching input labels
             adapter_ids: Optional LoRA adapter id for all texts or one adapter id per text.
+            images: Multi-modal decoder-kv only: per text, a list of images (paths, URLs or PIL images).
+            audio: Multi-modal decoder-kv only: per text, a list of audio clips (paths, URLs or arrays).
 
         Returns:
             List of predictions (flat) or hierarchical dicts with all scores
         """
+        media = {key: value for key, value in (("images", images), ("audio", audio)) if value is not None}
         return self.pipe(
             texts,
             labels,
@@ -1027,6 +1109,7 @@ class ZeroShotClassificationPipeline:
             prompt=prompt,
             return_hierarchical=return_hierarchical,
             adapter_ids=adapter_ids,
+            **media,
         )
 
 
