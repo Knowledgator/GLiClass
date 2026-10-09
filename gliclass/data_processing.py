@@ -6,7 +6,7 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
-from .multimodal import MEDIA_KEYS, is_processor, collate_media, process_multimodal_with_budget
+from .multimodal import MEDIA_KEYS, is_processor, collate_media, get_tokenizer, process_multimodal_with_budget
 
 
 def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "", media: str = "") -> str:
@@ -265,6 +265,59 @@ class GLiClassDataset(Dataset):
 
     def get_diversity(self):
         return [item.get("_diversity", {}).get("overall_diversity", 0.5) for item in self._data]
+
+    def estimate_lengths(self, batch_size=1000):
+        """Approximate token length of every sample (text + labels + media tokens), capped at max_length.
+
+        Used for length-grouped batching; much cheaper than preprocessing every sample (no image decoding).
+        """
+        if getattr(self, "_estimated_lengths", None) is not None:
+            return self._estimated_lengths
+        tokenizer = get_tokenizer(self.tokenizer)
+        lengths = []
+        for start in range(0, len(self._data), batch_size):
+            chunk = self._data[start : start + batch_size]
+            # longer texts are truncated to max_length anyway; bound the tokenizer work
+            texts = [
+                " ".join(
+                    [
+                        str(example.get("prompt", "")),
+                        str(example["text"])[: self.max_length * 16],
+                        *map(str, example.get("all_labels", [])),
+                    ]
+                )
+                for example in chunk
+            ]
+            ids = tokenizer(texts, add_special_tokens=False)["input_ids"]
+            for example, text_ids in zip(chunk, ids):
+                length = len(text_ids) + 2 * len(example.get("all_labels", [])) + 4
+                length += sum(self._estimate_image_tokens(image) for image in example.get("images") or [])
+                length += self.ESTIMATED_AUDIO_TOKENS * len(example.get("audio") or [])
+                lengths.append(min(length, self.max_length))
+        self._estimated_lengths = lengths
+        return lengths
+
+    ESTIMATED_AUDIO_TOKENS = 256
+
+    def _estimate_image_tokens(self, image, default=256):
+        """Image tokens from the image size; reads only the file header. Exact for Qwen-VL image processors."""
+        image_processor = getattr(self.tokenizer, "image_processor", None)
+        if image_processor is None or not hasattr(image_processor, "get_number_of_image_patches"):
+            return default
+        try:
+            if isinstance(image, str):
+                from PIL import Image
+
+                with Image.open(image) as opened:
+                    size = opened.size
+            elif hasattr(image, "size"):
+                size = image.size
+            else:
+                return default
+            patches = image_processor.get_number_of_image_patches(size[1], size[0], {})
+        except Exception:
+            return default
+        return patches // getattr(image_processor, "merge_size", 1) ** 2
 
     def collect_dataset_labels(self):
         dataset_labels = set()

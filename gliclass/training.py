@@ -415,6 +415,29 @@ class Trainer(transformers.Trainer):
         self._maybe_initialize_ewc()
         return super().train(*args, **kwargs)
 
+    def _get_train_sampler(self, train_dataset=None):
+        """batch_rebalance: use the dataset's cheap length estimates instead of preprocessing every sample."""
+        train_dataset = train_dataset if train_dataset is not None else self.train_dataset
+        if (
+            getattr(self.args, "train_sampling_strategy", None) != "batch_rebalance"
+            or not hasattr(train_dataset, "estimate_lengths")
+        ):
+            return super()._get_train_sampler(train_dataset)
+        from transformers.trainer_pt_utils import BatchRebalanceSampler
+
+        lengths = train_dataset.estimate_lengths()
+        world_size = max(1, self.args.world_size)
+        grad_accum = self.args.gradient_accumulation_steps
+        return BatchRebalanceSampler(
+            lengths=lengths,
+            effective_batch_size=self.args.train_batch_size * grad_accum * world_size,
+            dp_size=world_size,
+            grad_accum=grad_accum,
+            rank=self.args.process_index if world_size > 1 else 0,
+            seed=self.args.data_seed if self.args.data_seed is not None else self.args.seed,
+            drop_last=self.args.dataloader_drop_last,
+        )
+
     def training_step(self, model, inputs, *args, **kwargs) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -445,7 +468,6 @@ class Trainer(transformers.Trainer):
                 loss = self.compute_loss(model, inputs)
 
             del inputs
-            torch.cuda.empty_cache()
 
             kwargs = {}
 
@@ -640,6 +662,15 @@ class Trainer(transformers.Trainer):
                 }
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+            if "bitsandbytes" in str(optimizer_cls) and optimizer_kwargs.get("optim_bits") == 8:
+                # mirror transformers.Trainer.create_optimizer: keep embedding optimizer states in 32-bit for stability
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
 
         return self.optimizer
 
