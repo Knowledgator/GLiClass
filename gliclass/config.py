@@ -80,6 +80,7 @@ class GLiClassModelConfig(PretrainedConfig):
         calibrator_use_bias=False,
         multimodal=False,
         freeze_media_encoders=True,
+        use_embedding_projection=None,
         **kwargs,
     ):
         if isinstance(encoder_config, dict):
@@ -115,10 +116,18 @@ class GLiClassModelConfig(PretrainedConfig):
         # Multi-modal backbones have a composite config; text attributes live in its text config
         text_config = self.encoder_config.get_text_config()
 
+        # EmbeddingGemma 2 ends with embedding_projection (hidden_size -> embedding_dim), a head meant for
+        # mean pooling + L2 normalization that scales token states ~30x; fed to the scorer, it blows up the
+        # gradients. By default the scorer reads the final-norm states instead. Older checkpoints were trained
+        # with the projection: without the flag in their config, it is kept when hidden_size == embedding_dim.
+        is_embedding_gemma = text_config.model_type == "embedding_gemma2_text"
+        if use_embedding_projection is None:
+            use_embedding_projection = is_embedding_gemma and hidden_size == getattr(text_config, "embedding_dim", None)
+        self.use_embedding_projection = use_embedding_projection
+
         if hidden_size is None:
             self.hidden_size = text_config.hidden_size
-            # EmbeddingGemma 2 projects its last hidden states from hidden_size to embedding_dim
-            if text_config.model_type == "embedding_gemma2_text":
+            if is_embedding_gemma and use_embedding_projection:
                 self.hidden_size = text_config.embedding_dim
         else:
             self.hidden_size = hidden_size

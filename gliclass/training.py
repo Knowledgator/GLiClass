@@ -625,7 +625,19 @@ class Trainer(transformers.Trainer):
             if getattr(self.args, "recurrent_lr", None) is not None:
                 optimizer_grouped_parameters = self._split_recurrent_groups(opt_model, optimizer_grouped_parameters)
 
+            optimizer_grouped_parameters = [group for group in optimizer_grouped_parameters if group["params"]]
+
             optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            if self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.hf_ds_config.is_offload():
+                # ZeRO offload keeps optimizer states on CPU, which needs DeepSpeed's CPU implementation of Adam
+                from deepspeed.ops.adam import DeepSpeedCPUAdam
+                optimizer_cls = DeepSpeedCPUAdam
+                optimizer_kwargs = {
+                    "lr": self.args.learning_rate,
+                    "betas": (self.args.adam_beta1, self.args.adam_beta2),
+                    "eps": self.args.adam_epsilon,
+                    "adamw_mode": True,
+                }
 
             self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 

@@ -1042,6 +1042,11 @@ class GLiClassDecoderKV(nn.Module):
             # multi-modal backbones build their sub-models in the config's dtype (e.g. bf16); match the scorer
             self.decoder_model.to(torch.get_default_dtype())
 
+        if self.bidirectional and not getattr(config, "use_embedding_projection", True):
+            # scorer reads the final-norm hidden states (see GLiClassModelConfig.use_embedding_projection)
+            text_model = getattr(self.decoder_model, "language_model", self.decoder_model)
+            text_model.embedding_projection = nn.Identity()
+
         if config.vocab_size is not None and hasattr(self.decoder_model, "resize_token_embeddings"):
             current_vocab = self.decoder_model.config.get_text_config().vocab_size
             if current_vocab != config.vocab_size:
