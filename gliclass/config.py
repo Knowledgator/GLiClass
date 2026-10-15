@@ -20,7 +20,7 @@ class GLiClassModelConfig(PretrainedConfig):
     model_type = "GLiClass"
     is_composition = True
 
-    def __init__(  # noqa: PLR0917 - HF config, arguments mirror the saved config fields
+    def __init__(
         self,
         encoder_config=None,
         encoder_model=None,

@@ -418,9 +418,8 @@ class Trainer(transformers.Trainer):
     def _get_train_sampler(self, train_dataset=None):
         """batch_rebalance: use the dataset's cheap length estimates instead of preprocessing every sample."""
         train_dataset = train_dataset if train_dataset is not None else self.train_dataset
-        if (
-            getattr(self.args, "train_sampling_strategy", None) != "batch_rebalance"
-            or not hasattr(train_dataset, "estimate_lengths")
+        if getattr(self.args, "train_sampling_strategy", None) != "batch_rebalance" or not hasattr(
+            train_dataset, "estimate_lengths"
         ):
             return super()._get_train_sampler(train_dataset)
         try:
@@ -659,6 +658,7 @@ class Trainer(transformers.Trainer):
             if self.is_deepspeed_enabled and self.accelerator.state.deepspeed_plugin.hf_ds_config.is_offload():
                 # ZeRO offload keeps optimizer states on CPU, which needs DeepSpeed's CPU implementation of Adam
                 from deepspeed.ops.adam import DeepSpeedCPUAdam
+
                 optimizer_cls = DeepSpeedCPUAdam
                 optimizer_kwargs = {
                     "lr": self.args.learning_rate,

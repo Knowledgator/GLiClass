@@ -14,7 +14,8 @@ if IS_FLASHDEBERTA:
 
     class ScorerFlashSelfAttention(FlashDisentangledSelfAttention):
         """FlashDeBERTa attention for the scorer encoder; its Triton kernels need CUDA, so other devices
-        (e.g. scoring on CPU) fall back to the eager DeBERTa attention with the same weights."""
+        (e.g. scoring on CPU) fall back to the eager DeBERTa attention with the same weights.
+        """
 
         def forward(self, hidden_states, *args, **kwargs):
             if hidden_states.is_cuda:
