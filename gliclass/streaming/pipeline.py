@@ -59,6 +59,10 @@ class StreamingZeroShotClassificationPipeline(DecoderKVZeroShotClassificationPip
         self.offload_to_cpu = offload_to_cpu
         self.use_pinned_memory = use_pinned_memory and offload_to_cpu and self.device.type == "cuda"
         self.score_on_cpu = score_on_cpu
+        # Hybrid backbones (e.g. Qwen3.5) mix attention with linear-attention layers that keep recurrent states
+        decoder = getattr(getattr(self.model, "model", None), "decoder_model", None)
+        text_config = decoder.config.get_text_config() if decoder is not None else None
+        self._linear_attention = "linear_attention" in (getattr(text_config, "layer_types", None) or [])
         self._caches: dict[str, CacheState] = {}
         self._session_strategies: dict[str, ClassificationStrategy] = {}
 
@@ -273,11 +277,37 @@ class StreamingZeroShotClassificationPipeline(DecoderKVZeroShotClassificationPip
         if not active:
             return tokens_added
 
-        indices = [item[0] for item in active]
-        active_ids = [item[1] for item in active]
         tokenized = [self.tokenizer(item[2], return_tensors="pt", add_special_tokens=False) for item in active]
         new_ids = [item["input_ids"].to(self.device) for item in tokenized]
         new_masks = [item["attention_mask"].to(self.device) for item in tokenized]
+
+        if self._linear_attention:
+            # Padding tokens would leak into linear-attention states: update sessions in groups of equal length.
+            groups: dict[int, list[int]] = {}
+            for position, ids in enumerate(new_ids):
+                groups.setdefault(ids.shape[-1], []).append(position)
+            group_positions = list(groups.values())
+        else:
+            group_positions = [list(range(len(active)))]
+
+        for positions in group_positions:
+            self._update_group(
+                [active[p][0] for p in positions],
+                [active[p][1] for p in positions],
+                [new_ids[p] for p in positions],
+                [new_masks[p] for p in positions],
+                tokens_added,
+            )
+        return tokens_added
+
+    def _update_group(
+        self,
+        indices: list[int],
+        active_ids: list[str],
+        new_ids: list[torch.Tensor],
+        new_masks: list[torch.Tensor],
+        tokens_added: list[int],
+    ) -> None:
         caches = [self._caches[session_id] for session_id in active_ids]
 
         if any(cache.cached_length > 0 for cache in caches):
@@ -302,7 +332,6 @@ class StreamingZeroShotClassificationPipeline(DecoderKVZeroShotClassificationPip
         for index, session_id, cache, new_length in zip(indices, active_ids, updated, new_lengths, strict=True):
             self._caches[session_id] = cache
             tokens_added[index] = new_length
-        return tokens_added
 
     def _update_from_scratch(
         self,

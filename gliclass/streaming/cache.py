@@ -90,15 +90,78 @@ def truncate_cache(cache_state: CacheState, max_length: int) -> CacheState:
     )
 
 
+# ---------------------------------------------------------------------------
+# Hybrid caches (e.g. Qwen3.5): linear-attention layers keep fixed-size conv / recurrent states
+# instead of per-token keys and values. Those states cannot be sliced or cropped along the sequence,
+# only selected along the batch dimension, and every token they see (padding included) changes them.
+# ---------------------------------------------------------------------------
+
+
+def _is_linear_layer(layer) -> bool:
+    return hasattr(layer, "recurrent_states")
+
+
+def _layer_ready(layer) -> bool:
+    if _is_linear_layer(layer):
+        return any(layer.is_conv_states_initialized.values()) or any(layer.is_recurrent_states_initialized.values())
+    return layer.is_initialized
+
+
+def has_linear_layers(past_kv) -> bool:
+    return past_kv is not None and any(_is_linear_layer(layer) for layer in getattr(past_kv, "layers", []))
+
+
+def _new_cache_like(past_kv):
+    """Empty DynamicCache with the same layer types as past_kv (plain DynamicCache for attention-only models)."""
+    from transformers.cache_utils import Cache, DynamicCache
+
+    if not has_linear_layers(past_kv):
+        return DynamicCache()
+    cache = DynamicCache.__new__(DynamicCache)
+    Cache.__init__(cache, layers=[type(layer)() for layer in past_kv.layers])
+    return cache
+
+
+def _set_linear_states(layer, conv_states: dict, recurrent_states: dict) -> None:
+    """Fill a fresh linear-attention cache layer with already-computed states."""
+    for state_idx, conv in conv_states.items():
+        if conv is None:
+            continue
+        layer.conv_states[state_idx] = conv
+        layer.conv_kernel_size[state_idx] = conv.shape[-1]
+        layer.is_conv_states_initialized[state_idx] = True
+        layer.has_previous_state[state_idx] = True
+        layer.device, layer.dtype = conv.device, conv.dtype
+    for state_idx, recurrent in recurrent_states.items():
+        if recurrent is None:
+            continue
+        layer.recurrent_states[state_idx] = recurrent
+        layer.is_recurrent_states_initialized[state_idx] = True
+        layer.has_previous_state[state_idx] = True
+
+
+def _copy_linear_layer(src, dst, select) -> None:
+    """Copy src's states into dst, mapping every state tensor through select (clone / batch slice)."""
+    _set_linear_states(
+        dst,
+        {i: select(s) for i, s in src.conv_states.items() if src.is_conv_states_initialized[i]},
+        {i: select(s) for i, s in src.recurrent_states.items() if src.is_recurrent_states_initialized[i]},
+    )
+
+
 def _deep_copy_past_kv(past_kv):
     if past_kv is None:
         return None
     from transformers.cache_utils import DynamicCache
 
     if isinstance(past_kv, DynamicCache):
-        new = DynamicCache()
+        new = _new_cache_like(past_kv)
         for i, layer in enumerate(past_kv.layers):
-            if layer.is_initialized:
+            if not _layer_ready(layer):
+                continue
+            if _is_linear_layer(layer):
+                _copy_linear_layer(layer, new.layers[i], lambda t: t.clone())
+            else:
                 new.update(layer.keys.clone(), layer.values.clone(), i)
         return new
     if hasattr(past_kv, "clone"):
@@ -109,15 +172,23 @@ def _deep_copy_past_kv(past_kv):
 
 
 def _crop_past_kv(past_kv, max_length: int):
-    """Crop past_key_values to last max_length tokens. Returns None if not supported."""
+    """Crop past_key_values to last max_length tokens. Returns None if not supported.
+
+    Linear-attention states summarize the whole history and cannot be cropped: they are kept as they are,
+    so on hybrid models the window applies to the attention layers only.
+    """
     if past_kv is None:
         return None
     from transformers.cache_utils import DynamicCache
 
     if isinstance(past_kv, DynamicCache):
-        new = DynamicCache()
+        new = _new_cache_like(past_kv)
         for i, layer in enumerate(past_kv.layers):
-            if layer.is_initialized:
+            if not _layer_ready(layer):
+                continue
+            if _is_linear_layer(layer):
+                _copy_linear_layer(layer, new.layers[i], lambda t: t.clone())
+            else:
                 new.update(layer.keys[:, :, -max_length:, :].clone(), layer.values[:, :, -max_length:, :].clone(), i)
         return new
     return None
@@ -309,22 +380,52 @@ class BatchedKVHelper:
 
     @staticmethod
     def _stack_past_kv(caches: list[CacheState], max_cached: int, device: torch.device):
-        """Prepend-pad each session's KV to max_cached and stack along batch dim."""
-        from transformers.cache_utils import DynamicCache
+        """Prepend-pad each session's KV to max_cached and stack along batch dim.
 
+        Linear-attention states have no sequence dimension: they are stacked as they are, and a session
+        without a cache gets zero states, which is what a fresh prefill starts from.
+        """
         non_empty = [c for c in caches if c.past_key_values is not None]
-        num_layers = len(non_empty[0].past_key_values.layers)
+        reference = non_empty[0].past_key_values
+        num_layers = len(reference.layers)
 
-        # Get reference shape from first non-empty layer
-        ref_layer = non_empty[0].past_key_values.layers[0]
-        ref_k = ref_layer.keys  # [1, heads, seq, head_dim]
-
-        stacked = DynamicCache()
+        stacked = _new_cache_like(reference)
         for layer_idx in range(num_layers):
+            ready = [
+                c.past_key_values.layers[layer_idx]
+                for c in non_empty
+                if _layer_ready(c.past_key_values.layers[layer_idx])
+            ]
+            if not ready:
+                continue
+            ref_layer = ready[0]
+
+            if _is_linear_layer(ref_layer):
+                conv, recurrent = {}, {}
+                for state_idx, ref_state in ref_layer.conv_states.items():
+                    if ref_layer.is_conv_states_initialized[state_idx]:
+                        conv[state_idx] = BatchedKVHelper._stack_states(
+                            caches, layer_idx, "conv_states", "is_conv_states_initialized", state_idx, ref_state, device
+                        )
+                for state_idx, ref_state in ref_layer.recurrent_states.items():
+                    if ref_layer.is_recurrent_states_initialized[state_idx]:
+                        recurrent[state_idx] = BatchedKVHelper._stack_states(
+                            caches,
+                            layer_idx,
+                            "recurrent_states",
+                            "is_recurrent_states_initialized",
+                            state_idx,
+                            ref_state,
+                            device,
+                        )
+                _set_linear_states(stacked.layers[layer_idx], conv, recurrent)
+                continue
+
+            ref_k = ref_layer.keys  # [1, heads, seq, head_dim]
             keys, values = [], []
             for c in caches:
                 kv = c.past_key_values
-                if kv is None or not kv.layers[layer_idx].is_initialized:
+                if kv is None or not _layer_ready(kv.layers[layer_idx]):
                     k = torch.zeros(1, ref_k.shape[1], max_cached, ref_k.shape[3], device=device, dtype=ref_k.dtype)
                     v = torch.zeros_like(k)
                 else:
@@ -346,16 +447,33 @@ class BatchedKVHelper:
         return stacked
 
     @staticmethod
+    def _stack_states(caches, layer_idx, attr, flag, state_idx, ref_state, device):
+        """Concatenate one linear-attention state over sessions (zeros for sessions without it)."""
+        states = []
+        for c in caches:
+            layer = c.past_key_values.layers[layer_idx] if c.past_key_values is not None else None
+            if layer is not None and getattr(layer, flag)[state_idx]:
+                states.append(getattr(layer, attr)[state_idx].to(device))
+            else:
+                states.append(torch.zeros_like(ref_state, device=device))
+        return torch.cat(states, dim=0)
+
+    @staticmethod
     def _slice_past_kv(past_kv, batch_idx: int, start: int, end: int):
-        """Extract single-session KV from a batched past_key_values."""
+        """Extract single-session KV from a batched past_key_values.
+
+        Linear-attention states are only correct for rows without padding after the real tokens;
+        the pipeline batches hybrid-cache updates by equal chunk length to guarantee that.
+        """
         if past_kv is None:
             return None
 
-        from transformers.cache_utils import DynamicCache
-
-        sliced = DynamicCache()
+        sliced = _new_cache_like(past_kv)
         for i, layer in enumerate(past_kv.layers):
-            if not layer.is_initialized:
+            if not _layer_ready(layer):
+                continue
+            if _is_linear_layer(layer):
+                _copy_linear_layer(layer, sliced.layers[i], lambda t: t[batch_idx : batch_idx + 1].clone())
                 continue
             sliced.update(
                 layer.keys[batch_idx : batch_idx + 1, :, start:end, :].clone(),
