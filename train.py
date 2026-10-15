@@ -378,17 +378,21 @@ def main(args):
         label_to_description = {}
 
     train_dataset = GLiClassDataset(train_data, tokenizer, augment_config, 
-                                    label_to_description, args.max_length, 
-                                    args.problem_type, args.architecture_type, 
-                                    args.prompt_first, labels_tokenizer=labels_tokenizer)
+                                    label_to_description, max_length=args.max_length, 
+                                    problem_type=args.problem_type,
+                                    architecture_type=args.architecture_type, 
+                                    prompt_first=args.prompt_first,
+                                    labels_tokenizer=labels_tokenizer)
     
     # Disable augmentation for test dataset
     test_augment_config = AugmentationConfig(enabled=False)
     test_dataset = GLiClassDataset(test_data, tokenizer, test_augment_config, 
                                         label_to_description,
-                                        args.max_length, args.problem_type, 
-                                        args.architecture_type, args.prompt_first,
-                                        labels_tokenizer = labels_tokenizer)
+                                        max_length=args.max_length,
+                                        problem_type=args.problem_type, 
+                                        architecture_type=args.architecture_type,
+                                        prompt_first=args.prompt_first,
+                                        labels_tokenizer=labels_tokenizer)
 
     # Load previous dataset for EWC if provided
     prev_dataset = None
@@ -407,9 +411,11 @@ def main(args):
         
         prev_dataset = GLiClassDataset(prev_data, tokenizer, test_augment_config, 
                                         label_to_description,
-                                        args.max_length, args.problem_type, 
-                                        args.architecture_type, args.prompt_first,
-                                        labels_tokenizer = labels_tokenizer)
+                                        max_length=args.max_length,
+                                        problem_type=args.problem_type, 
+                                        architecture_type=args.architecture_type,
+                                        prompt_first=args.prompt_first,
+                                        labels_tokenizer=labels_tokenizer)
 
     data_collator = DataCollatorWithPadding(device=device)
 

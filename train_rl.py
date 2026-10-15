@@ -14,7 +14,7 @@ import torch
 
 from gliclass import GLiClassModelConfig, GLiClassModel, ZeroShotClassificationPipeline
 from gliclass.training import TrainingArguments, Trainer, RLTrainerConfig, RLTrainer
-from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset
+from gliclass.data_processing import DataCollatorWithPadding, GLiClassDataset, AugmentationConfig
 from gliclass.utils import default_f1_reward
 
 def accuracy_reward(probs, actions, targets, valid_mask):
@@ -151,12 +151,19 @@ def main(args):
 
     print('Dataset is splitted...')
 
-    train_dataset = GLiClassDataset(train_data, tokenizer, args.max_length, 
-                                    args.problem_type, args.architecture_type, 
-                                    args.prompt_first, labels_tokenizer=labels_tokenizer)
-    test_dataset = GLiClassDataset(test_data, tokenizer, args.max_length, args.problem_type, 
-                                        args.architecture_type, args.prompt_first,
-                                        labels_tokenizer = labels_tokenizer)
+    augment_config = AugmentationConfig(enabled=False)
+    train_dataset = GLiClassDataset(train_data, tokenizer, augment_config,
+                                    max_length=args.max_length,
+                                    problem_type=args.problem_type,
+                                    architecture_type=args.architecture_type,
+                                    prompt_first=args.prompt_first,
+                                    labels_tokenizer=labels_tokenizer)
+    test_dataset = GLiClassDataset(test_data, tokenizer, augment_config,
+                                   max_length=args.max_length,
+                                   problem_type=args.problem_type,
+                                   architecture_type=args.architecture_type,
+                                   prompt_first=args.prompt_first,
+                                   labels_tokenizer=labels_tokenizer)
 
     data_collator = DataCollatorWithPadding(device=device)
 
