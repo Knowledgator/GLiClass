@@ -423,7 +423,13 @@ class Trainer(transformers.Trainer):
             or not hasattr(train_dataset, "estimate_lengths")
         ):
             return super()._get_train_sampler(train_dataset)
-        from transformers.trainer_pt_utils import BatchRebalanceSampler
+        try:
+            from transformers.trainer_pt_utils import BatchRebalanceSampler
+        except ImportError as e:
+            raise ImportError(
+                "train_sampling_strategy='batch_rebalance' requires transformers>=5.17.0 "
+                f"(installed: {transformers.__version__}). Upgrade with `uv pip install -U 'transformers>=5.17.0'`."
+            ) from e
 
         lengths = train_dataset.estimate_lengths()
         world_size = max(1, self.args.world_size)

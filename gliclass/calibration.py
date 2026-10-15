@@ -12,6 +12,10 @@ pair goes to 0.5. Scaling alone can only shrink towards 0.5, so it cannot fix a 
 over- or under-predicts positives; the bias shifts the base rate (global Platt scaling sigmoid(a * z + c) is
 then the baseline), at the cost of possibly flipping decisions and pulling distrusted pairs to sigmoid(b)
 instead of 0.5.
+
+Single-label texts (CalibrationExample.single_label) are scored with softmax over their labels, as the pipeline does
+for classification_type="single-label": their loss is the cross-entropy of softmax(beta * z + b) instead of the
+per-pair binary NLL, and they are evaluated on top-1 confidence vs accuracy. A shared bias does not change a softmax.
 """
 
 import math
@@ -145,6 +149,8 @@ class CalibrationExample:
     label_repr: torch.Tensor  # (num_labels, dim)
     logits: torch.Tensor  # (num_labels,)
     targets: torch.Tensor  # (num_labels,) in [0, 1]
+    weights: torch.Tensor | None = None  # (num_labels,) per-pair loss weights, None -> all 1
+    single_label: bool = False  # calibrate softmax over the labels instead of per-label sigmoids
 
 
 def _targets_from_labels(labels, num_labels, problem_type):
@@ -198,30 +204,42 @@ def collect_calibration_examples(model, dataloader, device, show_progress=True):
                     label_repr=label_repr[i, :num_labels][valid],
                     logits=logits[i, :num_labels][valid],
                     targets=targets[i][valid],
+                    single_label=model.config.problem_type == "single_label_classification",
                 )
             )
     return examples
 
 
+def _collate_logits(examples):
+    """Padded logits, targets, label mask, weights and the single-label flag of every text."""
+    return {
+        "logits": pad_sequence([ex.logits for ex in examples], batch_first=True),
+        "targets": pad_sequence([ex.targets for ex in examples], batch_first=True),
+        "label_mask": pad_sequence([torch.ones_like(ex.logits, dtype=torch.bool) for ex in examples], batch_first=True),
+        "weights": pad_sequence(
+            [ex.weights if ex.weights is not None else torch.ones_like(ex.logits) for ex in examples], batch_first=True
+        ),
+        "single_label": torch.tensor([ex.single_label for ex in examples], dtype=torch.bool),
+    }
+
+
 def collate_calibration_examples(examples):
-    label_repr = pad_sequence([ex.label_repr for ex in examples], batch_first=True)
-    logits = pad_sequence([ex.logits for ex in examples], batch_first=True)
-    targets = pad_sequence([ex.targets for ex in examples], batch_first=True)
-    label_mask = pad_sequence([torch.ones_like(ex.logits, dtype=torch.bool) for ex in examples], batch_first=True)
     return {
         "text_repr": torch.stack([ex.text_repr for ex in examples]),
-        "label_repr": label_repr,
-        "logits": logits,
-        "targets": targets,
-        "label_mask": label_mask,
+        "label_repr": pad_sequence([ex.label_repr for ex in examples], batch_first=True),
+        **_collate_logits(examples),
     }
 
 
 def _masked_text_mean(values, label_mask):
-    """Average over labels inside each text, then over texts: every text weighs the same."""
+    """Average over the labels of each text: (batch,)."""
     maskf = label_mask.float()
-    per_text = (values * maskf).sum(dim=-1) / maskf.sum(dim=-1).clamp_min(1.0)
-    return per_text.mean()
+    return (values * maskf).sum(dim=-1) / maskf.sum(dim=-1).clamp_min(1.0)
+
+
+def _softmax_log_probs(logits, label_mask):
+    """Log-softmax over the real labels of each text, 0 on padding."""
+    return torch.log_softmax(logits.masked_fill(~label_mask, float("-inf")), dim=-1).masked_fill(~label_mask, 0.0)
 
 
 def calibration_loss(
@@ -234,25 +252,39 @@ def calibration_loss(
     base_bias=0.0,
     prior_weight=0.01,
     bias_prior_weight=0.01,
+    weights=None,
+    single_label=None,
 ):
-    """Binary NLL of sigmoid(beta * z + b)
-    + prior_weight * (log beta - log base_beta)^2 + bias_prior_weight * (b - base_bias)^2.
+    """NLL + prior_weight * (log beta - log base_beta)^2 + bias_prior_weight * (b - base_bias)^2, averaged over
+    the labels of each text, then over texts. The NLL is the binary NLL of sigmoid(beta * z + b) per pair, or, for
+    texts flagged in single_label, the cross-entropy of softmax(beta * z + b) over the text's labels. Each pair's
+    terms are scaled by its weight (if given); a single-label text's cross-entropy by the mean weight of its labels.
+
+    Returns (loss, nll), both scalars.
     """
-    nll = F.binary_cross_entropy_with_logits(beta * logits + bias, targets, reduction="none")
+    label_mask = label_mask.bool()
+    calibrated = beta * logits + bias
+    if weights is None:
+        weights = torch.ones_like(logits)
+    nll = _masked_text_mean(
+        F.binary_cross_entropy_with_logits(calibrated, targets, reduction="none") * weights, label_mask
+    )
+    if single_label is not None and single_label.any():
+        cross_entropy = -(_softmax_log_probs(calibrated, label_mask) * targets).sum(dim=-1)
+        nll = torch.where(single_label, cross_entropy * _masked_text_mean(weights, label_mask), nll)
     prior = prior_weight * (beta.clamp_min(1e-6).log() - math.log(base_beta)) ** 2
     prior = prior + bias_prior_weight * (bias - base_bias) ** 2
-    nll = _masked_text_mean(nll, label_mask)
-    prior = _masked_text_mean(prior, label_mask)
-    return nll + prior, nll
+    prior = _masked_text_mean(prior * weights, label_mask)
+    return (nll + prior).mean(), nll.mean()
 
 
 def fit_global_scaling(examples, fit_bias=False, max_iter=100):
-    """The single (beta_0, b_0) minimizing the binary NLL of sigmoid(beta_0 * z + b_0).
+    """The single (beta_0, b_0) minimizing the NLL of calibration_loss (sigmoid(beta_0 * z + b_0), or softmax for
+    single-label texts, weighted and averaged per text in the same way).
 
     fit_bias=False is temperature scaling (b_0 = 0), fit_bias=True is Platt scaling with a positive slope.
     """
-    logits = torch.cat([ex.logits for ex in examples])
-    targets = torch.cat([ex.targets for ex in examples])
+    batch = _collate_logits(examples)
     log_beta = torch.zeros((), requires_grad=True)
     bias = torch.zeros((), requires_grad=fit_bias)
     params = [log_beta, bias] if fit_bias else [log_beta]
@@ -260,7 +292,18 @@ def fit_global_scaling(examples, fit_bias=False, max_iter=100):
 
     def closure():
         optimizer.zero_grad()
-        loss = F.binary_cross_entropy_with_logits(log_beta.exp() * logits + bias, targets)
+        _, loss = calibration_loss(
+            log_beta.exp(),
+            bias,
+            batch["logits"],
+            batch["targets"],
+            batch["label_mask"],
+            base_beta=1.0,
+            prior_weight=0.0,
+            bias_prior_weight=0.0,
+            weights=batch["weights"],
+            single_label=batch["single_label"],
+        )
         loss.backward()
         return loss
 
@@ -268,48 +311,92 @@ def fit_global_scaling(examples, fit_bias=False, max_iter=100):
     return float(log_beta.detach().exp()), float(bias.detach())
 
 
-def calibration_metrics(probs, targets, num_bins=15):
-    """NLL, Brier, ECE and accuracy at 0.5 over flattened pairs."""
-    probs = probs.clamp(1e-7, 1 - 1e-7)
-    nll = F.binary_cross_entropy(probs, targets).item()
-    brier = ((probs - targets) ** 2).mean().item()
-    accuracy = ((probs >= 0.5).float() == (targets >= 0.5).float()).float().mean().item()
-
-    confidence = torch.maximum(probs, 1 - probs)
-    correct = ((probs >= 0.5) == (targets >= 0.5)).float()
-    bins = torch.clamp(((confidence - 0.5) * 2 * num_bins).long(), max=num_bins - 1)
+def expected_calibration_error(confidence, correct, low=0.5, num_bins=15):
+    """ECE with num_bins equal-width confidence bins over [low, 1]."""
+    bins = torch.clamp(((confidence - low) / (1 - low) * num_bins).long(), min=0, max=num_bins - 1)
     ece = 0.0
     for b in range(num_bins):
         in_bin = bins == b
         if in_bin.any():
             ece += in_bin.float().mean().item() * abs(confidence[in_bin].mean().item() - correct[in_bin].mean().item())
-    return {"nll": nll, "brier": brier, "ece": ece, "accuracy": accuracy}
+    return ece
+
+
+def calibration_metrics(probs, targets, num_bins=15):
+    """NLL, Brier, ECE and accuracy at 0.5 over flattened pairs."""
+    probs = probs.clamp(1e-7, 1 - 1e-7)
+    nll = F.binary_cross_entropy(probs, targets).item()
+    brier = ((probs - targets) ** 2).mean().item()
+    correct = ((probs >= 0.5) == (targets >= 0.5)).float()
+    ece = expected_calibration_error(torch.maximum(probs, 1 - probs), correct, 0.5, num_bins)
+    return {"nll": nll, "brier": brier, "ece": ece, "accuracy": correct.mean().item()}
+
+
+def _softmax_text_stats(logits, targets, label_mask):
+    """Per-text cross-entropy, multi-class Brier, top-1 confidence and top-1 correctness of softmax(logits)."""
+    log_probs = _softmax_log_probs(logits, label_mask)
+    probs = log_probs.exp() * label_mask
+    confidence, top = probs.max(dim=-1)
+    return {
+        "nll": -(log_probs * targets).sum(dim=-1),
+        "brier": ((probs - targets) ** 2).sum(dim=-1),
+        "confidence": confidence,
+        "correct": (targets.gather(-1, top.unsqueeze(-1)).squeeze(-1) >= 0.5).float(),
+    }
+
+
+def softmax_calibration_metrics(stats, num_bins=15):
+    """NLL, Brier, top-1 ECE and top-1 accuracy over single-label texts, from concatenated _softmax_text_stats."""
+    return {
+        "nll": stats["nll"].mean().item(),
+        "brier": stats["brier"].mean().item(),
+        "ece": expected_calibration_error(stats["confidence"], stats["correct"], 0.0, num_bins),
+        "accuracy": stats["correct"].mean().item(),
+    }
 
 
 @torch.no_grad()
 def evaluate_calibrator(calibrator, examples, device, base_beta=None, base_bias=0.0, batch_size=256):
-    """Metrics for the raw model, the global scaling fit (if base_beta) and the calibrator."""
+    """Metrics for the raw model, the global scaling fit (if base_beta) and the calibrator.
+
+    Multi-label texts are scored per pair with sigmoid ("uncalibrated", "global_scaling", "calibrated" at the top
+    level); single-label texts with softmax over their labels, under "single_label" with the same keys.
+    """
     calibrator.eval()
-    raw, scaled, calibrated, targets, betas, biases = [], [], [], [], [], []
+    variants = ["uncalibrated", "calibrated"] + (["global_scaling"] if base_beta is not None else [])
+    pair_probs = {name: [] for name in variants}
+    text_stats = {name: [] for name in variants}
+    pair_targets, betas, biases = [], [], []
     for start in range(0, len(examples), batch_size):
         batch = collate_calibration_examples(examples[start : start + batch_size])
         batch = {key: value.to(device) for key, value in batch.items()}
         beta, bias = calibrator(batch["text_repr"], batch["label_repr"], batch["logits"], batch["label_mask"])
-        mask = batch["label_mask"]
-        logits = batch["logits"][mask]
-        raw.append(torch.sigmoid(logits).cpu())
+        mask, single = batch["label_mask"], batch["single_label"]
+        logits = {"uncalibrated": batch["logits"], "calibrated": beta * batch["logits"] + bias}
         if base_beta is not None:
-            scaled.append(torch.sigmoid(base_beta * logits + base_bias).cpu())
-        calibrated.append(torch.sigmoid(beta[mask] * logits + bias[mask]).cpu())
-        targets.append(batch["targets"][mask].cpu())
+            logits["global_scaling"] = base_beta * batch["logits"] + base_bias
+
+        pair_mask = mask & ~single.unsqueeze(-1)
+        pair_targets.append(batch["targets"][pair_mask].cpu())
+        for name, values in logits.items():
+            pair_probs[name].append(torch.sigmoid(values[pair_mask]).cpu())
+            if single.any():
+                stats = _softmax_text_stats(values[single], batch["targets"][single], mask[single])
+                text_stats[name].append({key: value.cpu() for key, value in stats.items()})
         betas.append(beta[mask].cpu())
         biases.append(bias[mask].cpu())
 
-    targets = torch.cat(targets)
-    results = {"uncalibrated": calibration_metrics(torch.cat(raw), targets)}
-    if base_beta is not None:
-        results["global_scaling"] = calibration_metrics(torch.cat(scaled), targets)
-    results["calibrated"] = calibration_metrics(torch.cat(calibrated), targets)
+    results = {}
+    pair_targets = torch.cat(pair_targets)
+    if len(pair_targets):
+        results["num_multi_label_pairs"] = len(pair_targets)
+        for name in variants:
+            results[name] = calibration_metrics(torch.cat(pair_probs[name]), pair_targets)
+    if text_stats["calibrated"]:
+        results["single_label"] = {"num_texts": sum(len(stats["nll"]) for stats in text_stats["calibrated"])}
+        for name in variants:
+            stats = {key: torch.cat([s[key] for s in text_stats[name]]) for key in text_stats[name][0]}
+            results["single_label"][name] = softmax_calibration_metrics(stats)
     for name, values in (("beta", torch.cat(betas)), ("bias", torch.cat(biases))):
         results[name] = {"mean": values.mean().item(), "min": values.min().item(), "max": values.max().item()}
     return results
@@ -357,7 +444,14 @@ def fit_calibrator(
                 batch = {key: value.to(device) for key, value in batch.items()}
                 beta, bias = calibrator(batch["text_repr"], batch["label_repr"], batch["logits"], batch["label_mask"])
                 _, nll = calibration_loss(
-                    beta, bias, batch["logits"], batch["targets"], batch["label_mask"], base_beta, base_bias
+                    beta,
+                    bias,
+                    batch["logits"],
+                    batch["targets"],
+                    batch["label_mask"],
+                    base_beta,
+                    base_bias,
+                    single_label=batch["single_label"],
                 )
                 total += nll.item() * batch["logits"].shape[0]
                 count += batch["logits"].shape[0]
@@ -387,6 +481,8 @@ def fit_calibrator(
                 base_bias,
                 prior_weight,
                 bias_prior_weight,
+                weights=batch["weights"],
+                single_label=batch["single_label"],
             )
             optimizer.zero_grad()
             loss.backward()
