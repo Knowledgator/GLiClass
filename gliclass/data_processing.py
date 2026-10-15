@@ -6,10 +6,15 @@ import torch
 from torch.utils.data import Dataset
 from torch.nn.utils.rnn import pad_sequence
 
+from .multimodal import MEDIA_KEYS, is_processor, collate_media, get_tokenizer, process_multimodal_with_budget
 
-def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "") -> str:
-    """Format the persistent context portion of a decoder-KV sequence."""
-    return f"{prompt}{examples}{text}"
+
+def format_decoder_kv_context(text: str, prompt: str = "", examples: str = "", media: str = "") -> str:
+    """Format the persistent context portion of a decoder-KV sequence.
+
+    media: image / audio placeholder tokens (see gliclass.multimodal.format_media_prefix), placed before the text.
+    """
+    return f"{prompt}{examples}{media}{text}"
 
 
 def format_decoder_kv_labels(
@@ -34,9 +39,10 @@ def format_decoder_kv_sequence(
     examples: str = "",
     label_token: str = "<<LABEL>>",
     sep_token: str = "<<SEP>>",
+    media: str = "",
 ) -> str:
     """Format a complete decoder-KV sequence for training or classic inference."""
-    return format_decoder_kv_context(text, prompt, examples) + format_decoder_kv_labels(
+    return format_decoder_kv_context(text, prompt, examples, media) + format_decoder_kv_labels(
         labels,
         label_token=label_token,
         sep_token=sep_token,
@@ -218,6 +224,8 @@ class DataAugmenter:
 
 
 class GLiClassDataset(Dataset):
+    MAX_MEDIA_RETRIES = 10
+
     def __init__(
         self,
         examples,
@@ -257,6 +265,59 @@ class GLiClassDataset(Dataset):
 
     def get_diversity(self):
         return [item.get("_diversity", {}).get("overall_diversity", 0.5) for item in self._data]
+
+    def estimate_lengths(self, batch_size=1000):
+        """Approximate token length of every sample (text + labels + media tokens), capped at max_length.
+
+        Used for length-grouped batching; much cheaper than preprocessing every sample (no image decoding).
+        """
+        if getattr(self, "_estimated_lengths", None) is not None:
+            return self._estimated_lengths
+        tokenizer = get_tokenizer(self.tokenizer)
+        lengths = []
+        for start in range(0, len(self._data), batch_size):
+            chunk = self._data[start : start + batch_size]
+            # longer texts are truncated to max_length anyway; bound the tokenizer work
+            texts = [
+                " ".join(
+                    [
+                        str(example.get("prompt", "")),
+                        str(example["text"])[: self.max_length * 16],
+                        *map(str, example.get("all_labels", [])),
+                    ]
+                )
+                for example in chunk
+            ]
+            ids = tokenizer(texts, add_special_tokens=False)["input_ids"]
+            for example, text_ids in zip(chunk, ids):
+                length = len(text_ids) + 2 * len(example.get("all_labels", [])) + 4
+                length += sum(self._estimate_image_tokens(image) for image in example.get("images") or [])
+                length += self.ESTIMATED_AUDIO_TOKENS * len(example.get("audio") or [])
+                lengths.append(min(length, self.max_length))
+        self._estimated_lengths = lengths
+        return lengths
+
+    ESTIMATED_AUDIO_TOKENS = 256
+
+    def _estimate_image_tokens(self, image, default=256):
+        """Image tokens from the image size; reads only the file header. Exact for Qwen-VL image processors."""
+        image_processor = getattr(self.tokenizer, "image_processor", None)
+        if image_processor is None or not hasattr(image_processor, "get_number_of_image_patches"):
+            return default
+        try:
+            if isinstance(image, str):
+                from PIL import Image
+
+                with Image.open(image) as opened:
+                    size = opened.size
+            elif hasattr(image, "size"):
+                size = image.size
+            else:
+                return default
+            patches = image_processor.get_number_of_image_patches(size[1], size[0], {})
+        except Exception:
+            return default
+        return patches // getattr(image_processor, "merge_size", 1) ** 2
 
     def collect_dataset_labels(self):
         dataset_labels = set()
@@ -341,17 +402,25 @@ class GLiClassDataset(Dataset):
         examples_text = self.format_examples(example)
         text = str(example["text"])
 
-        input_text = format_decoder_kv_sequence(
-            text,
-            example["all_labels"],
-            prompt=prompt,
-            examples=examples_text,
-            label_token=self.label_token,
-            sep_token=self.sep_token,
-        )
+        def build(text, media=""):
+            return format_decoder_kv_sequence(
+                text,
+                example["all_labels"],
+                prompt=prompt,
+                examples=examples_text,
+                label_token=self.label_token,
+                sep_token=self.sep_token,
+                media=media,
+            )
+
         label2idx = {label: idx for idx, label in enumerate(example["all_labels"])}
 
-        tokenized_inputs = self.tokenize(input_text)
+        if is_processor(self.tokenizer):
+            tokenized_inputs = process_multimodal_with_budget(
+                self.tokenizer, build, text, example.get("images") or [], example.get("audio") or [], self.max_length
+            )
+        else:
+            tokenized_inputs = self.tokenize(build(text))
         tokenized_inputs["labels"] = self.prepare_labels(example, label2idx, self.problem_type)
         tokenized_inputs["labels_text"] = example["all_labels"]
         tokenized_inputs["input_texts"] = example["text"]
@@ -412,8 +481,20 @@ class GLiClassDataset(Dataset):
         return len(self._data)
 
     def __getitem__(self, idx):
-        example = self._data[idx]
+        # A sample whose image / audio file cannot be loaded is replaced by a random other sample
+        for _ in range(self.MAX_MEDIA_RETRIES):
+            example = self._data[idx]
+            if not (example.get("images") or example.get("audio")):
+                return self._prepare(example)
+            try:
+                return self._prepare(example)
+            except Exception as error:
+                media = (example.get("images") or []) + (example.get("audio") or [])
+                print(f"Skipping sample {idx}, could not load its media {media}: {error!r}")
+                idx = random.randrange(len(self._data))
+        raise RuntimeError(f"Could not load media for {self.MAX_MEDIA_RETRIES} samples in a row")
 
+    def _prepare(self, example):
         example = self.augmenter.augment(example)
 
         if self.architecture_type == "uni-encoder":
@@ -480,7 +561,8 @@ class DataCollatorWithPadding:
         return None  # 'fixed': model uses config.max_num_classes
 
     def __call__(self, batch):
-        keys = batch[0].keys()
+        # Media tensors are indexed by image / audio item and only present in samples that have media
+        keys = [key for key in batch[0] if key not in MEDIA_KEYS]
         padded_batch = {key: [] for key in keys}
 
         for key in keys:
@@ -508,5 +590,6 @@ class DataCollatorWithPadding:
             else:
                 raise TypeError(f"Unsupported data type: {type(key_data[0])}")
 
+        padded_batch.update(collate_media(batch))
         padded_batch["max_num_classes"] = self._resolve_max_num_classes(batch)
         return padded_batch
