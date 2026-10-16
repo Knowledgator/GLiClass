@@ -341,17 +341,25 @@ class GLiClassBaseModel(nn.Module):  # ):
                 loss_fct = nn.CrossEntropyLoss()
                 loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
             elif self.config.problem_type == "multi_label_classification":
-                reduction = self.config.focal_loss_reduction or "none"
+                ignore_index = getattr(self.config, "ignore_index", -100)
                 all_losses = focal_loss_with_logits(
                     logits,
                     labels,
                     self.config.focal_loss_alpha,
                     self.config.focal_loss_gamma,
-                    reduction,
+                    "none",
+                    ignore_index=ignore_index,
                 )
+                # padded label slots must not count towards the normalizer, otherwise the loss shrinks
+                # with the amount of padding in the batch
+                valid = labels.ne(ignore_index)
                 if classes_embedding_mask is not None:
-                    all_losses = all_losses * classes_embedding_mask.float()
-                loss = all_losses.mean()
+                    valid = valid & classes_embedding_mask.bool()
+                masked_sum = (all_losses * valid).sum()
+                if self.config.focal_loss_reduction == "sum":
+                    loss = masked_sum
+                else:
+                    loss = masked_sum / valid.sum().clamp_min(1)
 
             if self.config.contrastive_loss_coef > 0 and classes_embedding is not None:
                 contrastive_loss = sequence_contrastive_loss(classes_embedding, classes_embedding_mask)
