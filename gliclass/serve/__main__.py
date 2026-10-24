@@ -53,7 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--quantization",
         type=str,
         default=None,
-        help="Model quantization mode, if supported by the GLiClass model",
+        choices=["fp8"],
+        help="Quantization to apply: 'fp8' (FP8 linear layers, plus FP8 attention with FlashDeBERTa; "
+        "needs compute capability 8.9+ and torchao, best with --enable-compilation). "
+        "For precision changes (fp16/bf16) use --dtype instead.",
+    )
+    model_group.add_argument(
+        "--enable-flashdeberta",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use FlashDeBERTa kernels for DeBERTa-v2/v3 encoders",
     )
 
     limits_group = parser.add_argument_group("Model Limits")
@@ -149,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-compilation",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Enable torch.compile",
+        help="Enable torch.compile (also runs warmup for the precompiled batch sizes)",
     )
     perf_group.add_argument(
         "--precompile-on-startup",
@@ -308,6 +317,7 @@ def config_from_args(args: argparse.Namespace) -> GLiClassServeConfig:
         "ray_address": args.ray_address,
         "tokenizer_threads": args.tokenizer_threads,
         "enable_compilation": args.enable_compilation,
+        "enable_flashdeberta": args.enable_flashdeberta,
         "precompile_on_startup": args.precompile_on_startup,
         "calibrate_on_startup": args.calibrate_on_startup,
         "use_memory_aware_batching": args.use_memory_aware_batching,
@@ -357,6 +367,7 @@ def main():
     logger.info("  GPUs per replica: %s", config.num_gpus_per_replica)
     logger.info("  CPUs per replica: %s", config.num_cpus_per_replica)
     logger.info("  Compile: %s", config.enable_compilation)
+    logger.info("  FlashDeBERTa: %s", config.enable_flashdeberta)
     logger.info("  Precompile on startup: %s", config.precompile_on_startup)
     logger.info("  Calibrate on startup: %s", config.calibrate_on_startup)
     logger.info("  Memory-aware batching: %s", config.use_memory_aware_batching)

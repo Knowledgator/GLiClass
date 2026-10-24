@@ -17,6 +17,8 @@ class GLiClassServeConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
 
+    # "fp8": FP8 linear layers in the encoder, plus FP8 Q·Kᵀ attention with FlashDeBERTa
+    # (compute capability 8.9+, torchao; best with enable_compilation).
     quantization: str | None = None
 
     max_model_len: int = 2048
@@ -40,6 +42,8 @@ class GLiClassServeConfig:
     tokenizer_threads: int = 4
 
     enable_compilation: bool = False
+    # Use FlashDeBERTa kernels for DeBERTa-v2/v3 encoders (needs the flashdeberta package).
+    enable_flashdeberta: bool = False
     calibrate_on_startup: bool = False
     precompile_on_startup: bool = False
     use_memory_aware_batching: bool = False
@@ -81,6 +85,8 @@ class GLiClassServeConfig:
         env = {}
         if self.tokenizer_threads > 0:
             env["TOKENIZERS_PARALLELISM"] = "true"
+        if self.enable_flashdeberta:
+            env["USE_FLASHDEBERTA"] = "1"
         return env
 
     @classmethod
