@@ -81,3 +81,28 @@ def test_bi_encoder_passes_adapter_slots_to_its_text_encoder():
 
     assert calls[0]["weight_indices"] is slots
     assert "weight_indices" not in calls[1] and "adapter_ids" not in calls[1]
+
+
+def test_check_row_flattens_hierarchical_labels_and_rejects_bad_input():
+    import pytest
+
+    from gliclass.serve.server import check_row
+
+    assert check_row("t", {"a": ["x", "y"], "b": "z"}, 0.5, True, None, None, None) == ["a.x", "a.y", "b.z"]
+    assert check_row("t", ["x"], None, False, [{"text": "e", "labels": ["x"]}], "p", "lora") == ["x"]
+    bad_rows = [
+        (1, ["x"], None, True, None, None, None),
+        ("t", [1], None, True, None, None, None),
+        ("t", {"a": [1]}, None, True, None, None, None),
+        ("t", ["x"], "high", True, None, None, None),
+        ("t", ["x"], True, True, None, None, None),
+        ("t", ["x"], float("nan"), True, None, None, None),
+        ("t", ["x"], None, "yes", None, None, None),
+        ("t", ["x"], None, True, [{"text": "e", "labels": [1]}], None, None),
+        ("t", ["x"], None, True, [["nested"]], None, None),
+        ("t", ["x"], None, True, None, ["p"], None),
+        ("t", ["x"], None, True, None, None, 3),
+    ]
+    for row in bad_rows:
+        with pytest.raises(ValueError):
+            check_row(*row)

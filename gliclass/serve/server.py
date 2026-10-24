@@ -2,6 +2,8 @@
 
 import os
 import re
+import json
+import math
 import asyncio
 import logging
 from typing import Any
@@ -10,8 +12,9 @@ import torch
 from transformers import AutoTokenizer
 
 from gliclass.model import GLiClassModel
-from gliclass.pipeline import ZeroShotClassificationPipeline
+from gliclass.pipeline import ZeroShotClassificationPipeline, flatten_hierarchical_labels
 
+from .stats import BatchStats
 from .config import GLiClassServeConfig
 from .memory import GLiClassMemoryEstimator
 
@@ -112,7 +115,16 @@ class GLiClassServer:
         if config.calibrate_on_startup and torch.cuda.is_available():
             self._calibrate_memory()
 
+        self.batch_stats.reset()  # count request traffic only, not warmup and calibration
         logger.info("GLiClass server initialized successfully")
+
+    @property
+    def batch_stats(self) -> BatchStats:
+        """Forward passes by batch size since start-up (or the last reset)."""
+        stats = self.__dict__.get("_batch_stats")
+        if stats is None:
+            stats = self.__dict__["_batch_stats"] = BatchStats()
+        return stats
 
     def _initialize_polylora(self) -> None:
         try:
@@ -371,6 +383,7 @@ class GLiClassServer:
         else:
             classification_type = "multi-label" if multi_label else "single-label"
 
+        self.batch_stats.record(len(texts))
         return self.pipeline(
             texts,
             labels,
@@ -444,6 +457,76 @@ class GLiClassServer:
         )
 
         return results
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_label_tree(node: Any) -> bool:
+    if isinstance(node, dict):
+        return all(isinstance(key, str) and _is_label_tree(value) for key, value in node.items())
+    return isinstance(node, str) or _is_string_list(node)
+
+
+def _check_labels(labels: Any, separator: str) -> list[str]:
+    """Labels of one text as a flat list; hierarchical dicts become dotted labels."""
+    if isinstance(labels, dict):
+        if not _is_label_tree(labels):
+            raise ValueError("hierarchical labels must nest dicts whose leaves are strings or lists of strings")
+        labels = flatten_hierarchical_labels(labels, separator=separator)
+    if not _is_string_list(labels):
+        raise ValueError("'labels' must be a list of strings or a hierarchical dict of them")
+    return labels
+
+
+def _check_examples(examples: Any) -> None:
+    if examples is None:
+        return
+    if not isinstance(examples, list) or not all(isinstance(example, dict) for example in examples):
+        raise ValueError("'examples' must be a list of {'text', 'labels'} objects")
+    for example in examples:
+        labels = example.get("labels", example.get("true_labels", []))
+        if not isinstance(example.get("text", ""), str) or not (isinstance(labels, str) or _is_string_list(labels)):
+            raise ValueError("each example needs a string 'text' and a list of string 'labels'")
+
+
+def check_row(
+    text: Any,
+    labels: Any,
+    threshold: Any,
+    multi_label: Any,
+    examples: Any,
+    prompt: Any,
+    adapter_id: Any,
+    separator: str = ".",
+) -> list[str]:
+    """Validate one text's request before it joins a batch; return its flat labels.
+
+    Anything that would fail inside the batch must be rejected here: a failing batch fails
+    every request batched with it.
+    """
+    if not isinstance(text, str):
+        raise ValueError("'text' must be a string")
+    if threshold is not None and not _is_number(threshold):
+        raise ValueError("'threshold' must be a number")
+    if not isinstance(multi_label, bool):
+        raise ValueError("'multi_label' must be a boolean")
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError("'prompt' must be a string, or one string per text")
+    if adapter_id is not None and not isinstance(adapter_id, str):
+        raise ValueError("'adapter_id' must be a string")
+    _check_examples(examples)
+    return _check_labels(labels, separator)
+
+
+def _per_text(value: Any, num_texts: int, is_item) -> bool:
+    """Whether ``value`` holds one item per text (a list of items) rather than one shared item."""
+    return isinstance(value, list) and bool(value) and all(is_item(item) for item in value) and len(value) == num_texts
 
 
 def _build_deployment(config: GLiClassServeConfig):
@@ -530,10 +613,20 @@ def _build_deployment(config: GLiClassServeConfig):
             adapter_id: str | None = None,
         ) -> list[dict[str, Any]]:
             """Single prediction endpoint - one text per request."""
+            # Reject bad input and unknown adapters here: inside the batch, the error would
+            # fail every request batched with this one.
+            labels = check_row(
+                text,
+                labels,
+                threshold,
+                multi_label,
+                examples,
+                prompt,
+                adapter_id,
+                separator=getattr(self.server.pipeline, "label_separator", "."),
+            )
             if threshold is None:
                 threshold = self.server.config.default_threshold
-            # Reject unknown adapters here: inside the batch, the error would fail every
-            # request batched with this one.
             self.server.ensure_adapter_loaded(adapter_id)
 
             # Call batched method - Ray will accumulate these
@@ -548,7 +641,14 @@ def _build_deployment(config: GLiClassServeConfig):
             )
             return results
 
-        async def __call__(self, request) -> list[dict[str, Any]]:
+        def batch_stats(self, reset: bool = False) -> dict[str, Any]:
+            """Forward passes by batch size; ``reset`` starts a new count."""
+            stats = self.server.batch_stats.to_dict()
+            if reset:
+                self.server.batch_stats.reset()
+            return stats
+
+        async def __call__(self, request) -> list[dict[str, Any]]:  # noqa: PLR0911
             """HTTP endpoint: classify ``text`` or every text in ``texts``."""
             path = request.url.path.rstrip("/")
             if path.endswith("/adapter-cache"):
@@ -558,7 +658,12 @@ def _build_deployment(config: GLiClassServeConfig):
                 except ValueError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
 
-            payload = await request.json()
+            try:
+                payload = json.loads(await request.body())
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return JSONResponse({"error": f"request body is not valid JSON: {exc}"}, status_code=400)
+            if not isinstance(payload, dict):
+                return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
             if "labels" not in payload:
                 return JSONResponse({"error": "missing 'labels'"}, status_code=400)
             # {"text": "..."} returns that text's predictions; {"texts": [...]} returns one
@@ -567,10 +672,14 @@ def _build_deployment(config: GLiClassServeConfig):
             single = isinstance(texts, str) and "texts" not in payload
             if isinstance(texts, str):
                 texts = [texts]
+            if not isinstance(texts, list) or not texts:
+                return JSONResponse({"error": "'texts' must be a non-empty list of strings"}, status_code=400)
             labels = payload["labels"]
-            per_text_labels = bool(labels) and isinstance(labels[0], list)
+            per_text_labels = isinstance(labels, list) and bool(labels) and isinstance(labels[0], (list, dict))
             prompt = payload.get("prompt")
             per_text_prompt = isinstance(prompt, list)
+            examples = payload.get("examples")
+            per_text_examples = _per_text(examples, len(texts), lambda item: item is None or isinstance(item, list))
             if (per_text_labels and len(labels) != len(texts)) or (per_text_prompt and len(prompt) != len(texts)):
                 return JSONResponse({"error": "per-text labels/prompt must match the texts"}, status_code=400)
             try:
@@ -581,7 +690,7 @@ def _build_deployment(config: GLiClassServeConfig):
                             labels=labels[index] if per_text_labels else labels,
                             threshold=payload.get("threshold"),
                             multi_label=payload.get("multi_label", True),
-                            examples=payload.get("examples"),
+                            examples=examples[index] if per_text_examples else examples,
                             prompt=prompt[index] if per_text_prompt else prompt,
                             adapter_id=payload.get("adapter_id"),
                         )
