@@ -6,6 +6,7 @@ import json
 import math
 import asyncio
 import logging
+import functools
 from typing import Any
 
 import torch
@@ -14,11 +15,17 @@ from transformers import AutoTokenizer
 from gliclass.model import GLiClassModel
 from gliclass.pipeline import ZeroShotClassificationPipeline, flatten_hierarchical_labels
 
+from .api import APIError, ProcessEngine, capabilities_from_config
 from .stats import BatchStats
 from .config import GLiClassServeConfig
 from .memory import GLiClassMemoryEstimator
+from .api.errors import is_error_payload
 
 logger = logging.getLogger("ray.serve")
+
+# Process rows run as multi-label rows with this threshold, so every label comes back with
+# its independent score; each task applies its own selection afterwards.
+PROCESS_ALL_SCORES = -1.0
 
 
 class GLiClassServer:
@@ -458,6 +465,97 @@ class GLiClassServer:
 
         return results
 
+    # -- process API -------------------------------------------------------------
+
+    def _examples_supported(self) -> bool:
+        """Whether the tokenizer knows the few-shot example token the checkpoint was trained with."""
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        try:
+            return self.pipeline.pipe.example_token in tokenizer.get_vocab()
+        except Exception:
+            return False
+
+    def _label_capacity(self) -> int | None:
+        """Most labels the model can score at once, when it allocates a fixed number of label slots."""
+        alloc = self.config.max_labels_alloc
+        if isinstance(alloc, int) or (isinstance(alloc, str) and alloc.isdigit()):
+            return int(alloc)
+        if alloc == "fixed":
+            return int(getattr(self.model.config, "max_num_classes", 0)) or None
+        return None
+
+    @property
+    def process_engine(self) -> ProcessEngine:
+        """Request planner and result assembler of ``/v1/process``."""
+        engine = self.__dict__.get("_process_engine")
+        if engine is None:
+            tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+
+            @functools.lru_cache(maxsize=4096)
+            def count_tokens(text: str) -> int:
+                return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+            engine = self.__dict__["_process_engine"] = ProcessEngine(
+                capabilities_from_config(
+                    self.config,
+                    examples_supported=self._examples_supported(),
+                    max_num_classes=self._label_capacity(),
+                ),
+                max_tokens=self.config.max_model_len,
+                count_tokens=count_tokens,
+                resolve_adapter=self.ensure_adapter_loaded,
+            )
+        return engine
+
+    def run_rows(self, rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Score process rows in-process, in chunks of ``max_batch_size``: every label of every row."""
+        outputs: list[list[dict[str, Any]]] = []
+        chunk = max(1, self.config.max_batch_size)
+        for start in range(0, len(rows), chunk):
+            part = rows[start : start + chunk]
+            examples = [row["examples"] for row in part]
+            outputs.extend(
+                self._run_batch_internal(
+                    [row["text"] for row in part],
+                    [row["labels"] for row in part],
+                    threshold=PROCESS_ALL_SCORES,
+                    multi_label=True,
+                    examples=examples if any(examples) else None,
+                    prompt=[row["prompt"] for row in part],
+                    adapter_ids=[row["adapter_id"] for row in part],
+                )
+            )
+        return outputs
+
+    def process(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/process`` in-process. Raises ``APIError`` for a rejected request."""
+        return self.process_engine.process(body, self.run_rows)
+
+    def process_batch(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/process/batch`` in-process. Raises ``APIError`` for a bad envelope."""
+        return self.process_engine.process_batch(body, self.run_rows)
+
+    def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+        info = self.process_engine.capabilities
+        if model_id is not None and model_id not in info.model_ids():
+            raise APIError("MODEL_NOT_FOUND", f"Model {model_id!r} is not served here", "/model")
+        return info.to_dict()
+
+    def models(self) -> dict[str, Any]:
+        info = self.process_engine.capabilities
+        return {"data": [{"id": info.model, "aliases": list(info.aliases)}]}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "model": self.process_engine.capabilities.model,
+            "device": self.config.device,
+            "cuda_available": torch.cuda.is_available(),
+            "polylora": self.config.enable_polylora,
+            "max_batch_size": self.batch_size_fn(),
+            "task_types": list(self.process_engine.capabilities.task_types),
+        }
+
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
@@ -527,6 +625,22 @@ def check_row(
 def _per_text(value: Any, num_texts: int, is_item) -> bool:
     """Whether ``value`` holds one item per text (a list of items) rather than one shared item."""
     return isinstance(value, list) and bool(value) and all(is_item(item) for item in value) and len(value) == num_texts
+
+
+async def _read_json_body(request, max_bytes: int) -> Any:
+    """Parse a JSON request body, refusing bodies over ``max_bytes`` (``PAYLOAD_TOO_LARGE``)."""
+    content_length = request.headers.get("content-length")
+    if max_bytes > 0 and content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise APIError("PAYLOAD_TOO_LARGE", f"Request body exceeds {max_bytes} bytes")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if 0 < max_bytes < len(body):
+            raise APIError("PAYLOAD_TOO_LARGE", f"Request body exceeds {max_bytes} bytes")
+    try:
+        return json.loads(bytes(body))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise APIError("INVALID_REQUEST", f"Request body is not valid JSON: {exc}", "") from exc
 
 
 def _build_deployment(config: GLiClassServeConfig):
@@ -648,9 +762,87 @@ def _build_deployment(config: GLiClassServeConfig):
                 self.server.batch_stats.reset()
             return stats
 
+        # -- process API -----------------------------------------------------------
+
+        async def _run_process_row(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+            """One process row through the dynamic batcher, shared with ``predict``: every label's score."""
+            return await self._infer_batch(
+                row["text"],
+                row["labels"],
+                PROCESS_ALL_SCORES,
+                True,
+                row["examples"],
+                row["prompt"],
+                row["adapter_id"],
+            )
+
+        async def process(self, body: Any) -> dict[str, Any]:
+            """``/v1/process``: the response, or an ``{"error": ...}`` object."""
+            engine = self.server.process_engine
+            outcome = (await engine.process_many_async([body], self._run_process_row))[0]
+            return outcome.to_dict() if isinstance(outcome, APIError) else outcome
+
+        async def process_batch(self, body: Any) -> dict[str, Any]:
+            """``/v1/process/batch``: the response, or an ``{"error": ...}`` object."""
+            try:
+                return await self.server.process_engine.process_batch_async(body, self._run_process_row)
+            except APIError as exc:
+                return exc.to_dict()
+
+        def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+            try:
+                return self.server.capabilities(model_id)
+            except APIError as exc:
+                return exc.to_dict()
+
+        def models(self) -> dict[str, Any]:
+            return self.server.models()
+
+        def health(self) -> dict[str, Any]:
+            return self.server.health()
+
+        async def _handle_v1(self, request, path: str):  # noqa: PLR0911
+            """Routes of the process API (``{route_prefix}/v1/...``)."""
+
+            def respond(payload: dict[str, Any]) -> JSONResponse:
+                status = APIError.from_dict(payload).status if is_error_payload(payload) else 200
+                return JSONResponse(payload, status_code=status)
+
+            route = path[path.find("/v1/") :]
+            method = request.method
+            if route in ("/v1/process", "/v1/process/batch"):
+                if method != "POST":
+                    return respond(APIError("INVALID_REQUEST", f"Use POST for {route}").to_dict())
+                try:
+                    body = await _read_json_body(request, self.server.config.max_request_bytes)
+                except APIError as exc:
+                    return respond(exc.to_dict())
+                if route == "/v1/process":
+                    return respond(await self.process(body))
+                return respond(await self.process_batch(body))
+            capabilities_match = re.fullmatch(r"/v1/models/(.+)/capabilities", route)
+            if route not in ("/v1/health", "/v1/ready", "/v1/models", "/v1/adapter-cache") and not capabilities_match:
+                return JSONResponse(
+                    {"error": {"code": "INVALID_REQUEST", "message": f"Unknown route {route}"}}, status_code=404
+                )
+            if method != "GET":
+                return respond(APIError("INVALID_REQUEST", f"Use GET for {route}").to_dict())
+            if route in ("/v1/health", "/v1/ready"):
+                return respond(self.health())
+            if route == "/v1/models":
+                return respond(self.models())
+            if route == "/v1/adapter-cache":
+                try:
+                    return respond(self.server.adapter_cache_status(request.query_params.get("adapter_id")))
+                except ValueError as exc:
+                    return respond(APIError("INVALID_REQUEST", str(exc), "/adapter_id").to_dict())
+            return respond(self.capabilities(capabilities_match.group(1)))
+
         async def __call__(self, request) -> list[dict[str, Any]]:  # noqa: PLR0911
-            """HTTP endpoint: classify ``text`` or every text in ``texts``."""
+            """HTTP endpoint: classify ``text`` or every text in ``texts``; ``/v1/...`` is the process API."""
             path = request.url.path.rstrip("/")
+            if "/v1/" in path:
+                return await self._handle_v1(request, path)
             if path.endswith("/adapter-cache"):
                 adapter_id = request.query_params.get("adapter_id")
                 try:
@@ -862,6 +1054,94 @@ class GLiClassFactory:
         ]
         results = list(await asyncio.gather(*refs))
         return results[0] if single else results
+
+    # -- process API -------------------------------------------------------------
+
+    @property
+    def model_id(self) -> str:
+        return self.config.model_id or self.config.model
+
+    def _process_body(self, input, tasks, defaults, options, model, body) -> dict[str, Any]:
+        if body is not None:
+            return body
+        request: dict[str, Any] = {"model": model or self.model_id, "input": input, "tasks": tasks}
+        if defaults is not None:
+            request["defaults"] = defaults
+        if options is not None:
+            request["options"] = options
+        return request
+
+    def _batch_body(self, items, defaults, options, model) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": model or self.model_id, "items": items}
+        if defaults is not None:
+            body["defaults"] = defaults
+        if options is not None:
+            body["options"] = options
+        return body
+
+    @staticmethod
+    def _unwrap(payload: dict[str, Any]) -> dict[str, Any]:
+        if is_error_payload(payload):
+            raise APIError.from_dict(payload)
+        return payload
+
+    def process(
+        self,
+        input: Any = None,
+        tasks: dict[str, Any] | None = None,
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run one ``/v1/process`` request; raises ``APIError`` when it is rejected.
+
+        Pass ``input`` and ``tasks`` (``model`` defaults to the served model), or a
+        complete request as ``body``. ``defaults`` holds settings shared by the tasks.
+        """
+        request = self._process_body(input, tasks, defaults, options, model, body)
+        return self._unwrap(self._handle.process.remote(request).result())
+
+    def process_batch(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a ``/v1/process/batch`` request; item errors are returned per item."""
+        request = self._batch_body(items, defaults, options, model)
+        return self._unwrap(self._handle.process_batch.remote(request).result())
+
+    async def process_async(
+        self,
+        input: Any = None,
+        tasks: dict[str, Any] | None = None,
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Async ``process``. Concurrent calls share model batches."""
+        request = self._process_body(input, tasks, defaults, options, model, body)
+        return self._unwrap(await self._handle.process.remote(request))
+
+    async def process_batch_async(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        request = self._batch_body(items, defaults, options, model)
+        return self._unwrap(await self._handle.process_batch.remote(request))
+
+    def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+        return self._unwrap(self._handle.capabilities.remote(model_id).result())
 
     def shutdown(self) -> None:
         """Tear down Ray Serve deployment and Ray runtime.

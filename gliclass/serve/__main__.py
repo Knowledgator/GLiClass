@@ -223,6 +223,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Probe batch size for memory calibration",
     )
 
+    process_group = parser.add_argument_group("Process API (/v1/process)")
+    process_group.add_argument("--model-id", type=str, default=None, help="Public model id (default: --model)")
+    process_group.add_argument(
+        "--model-aliases", type=_parse_str_list, default=None, help="Comma-separated extra accepted model ids"
+    )
+    process_group.add_argument(
+        "--label-template",
+        type=str,
+        default=None,
+        help="Label text shown to the model; may use {id}, {title}, {description} (default: {title})",
+    )
+    process_group.add_argument("--max-tasks", type=int, default=None, help="Maximum tasks per request (default: 32)")
+    process_group.add_argument(
+        "--max-batch-items", type=int, default=None, help="Maximum items per batch request (default: 256)"
+    )
+    process_group.add_argument(
+        "--max-input-chars", type=int, default=None, help="Maximum rendered input characters (default: 1000000)"
+    )
+    process_group.add_argument(
+        "--max-request-bytes", type=int, default=None, help="Maximum request body bytes (default: 10000000)"
+    )
+    process_group.add_argument(
+        "--max-scale-steps", type=int, default=None, help="Maximum steps of a score task's scale (default: 21)"
+    )
+
     polylora_group = parser.add_argument_group("PolyLoRA Configuration")
     polylora_group.add_argument(
         "--enable-polylora",
@@ -338,6 +363,14 @@ def config_from_args(args: argparse.Namespace) -> GLiClassServeConfig:
         "polylora_base_adapter_id": args.polylora_base_adapter_id,
         "polylora_use_triton_kernels": args.polylora_use_triton_kernels,
         "polylora_adapter_id_pattern": args.polylora_adapter_id_pattern,
+        "model_id": args.model_id,
+        "model_aliases": args.model_aliases,
+        "label_template": args.label_template,
+        "max_tasks": args.max_tasks,
+        "max_batch_items": args.max_batch_items,
+        "max_input_chars": args.max_input_chars,
+        "max_request_bytes": args.max_request_bytes,
+        "max_scale_steps": args.max_scale_steps,
     }
     config.update(**cli_overrides)
     config.__post_init__()

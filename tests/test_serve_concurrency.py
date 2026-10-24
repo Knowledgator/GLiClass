@@ -269,3 +269,230 @@ def test_concurrency_batches_requests(server_url):
 
     assert statuses == [200] * len(work)
     assert concurrent < sequential, (concurrent, sequential)
+
+
+# -- process API (/v1/process) ----------------------------------------------------------------
+
+
+def _v1(url, suffix):
+    return url + "/v1" + suffix
+
+
+def _get(url):
+    try:
+        with urllib.request.urlopen(url, timeout=60) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def _process_tasks(index):
+    return {
+        "topic": {"type": "classify", "labels": LABELS},
+        "topics": {"type": "classify", "labels": LABELS, "multi_label": True, "threshold": 0.3 + 0.1 * (index % 3)},
+        "is_sport": {"type": "boolean", "instruction": "is about sports"},
+        "money": {"type": "boolean", "labels": {"true": {"title": "mentions money"}}, "threshold": 0.6},
+        "tone": {"type": "score", "labels": ["calm", "neutral", "excited"], "order": ["calm", "neutral", "excited"]},
+        "rating": {"type": "score", "scale": {"min": 1, "max": 5}},
+    }
+
+
+def _process_workload():
+    work = []
+    for index, text in enumerate(TEXTS):
+        work.append(("process", {"model": MODEL, "input": text, "tasks": _process_tasks(index)}))
+        work.append(
+            (
+                "process",
+                {
+                    "model": MODEL,
+                    "input": {"headline": text, "section": "news"},
+                    "defaults": {"instruction": "Classify the news item:", "threshold": 0.4},
+                    "tasks": {
+                        "topics": {"type": "classify", "labels": LABELS, "multi_label": True},
+                        "own": {"type": "classify", "labels": LABELS, "multi_label": True, "threshold": 0.6},
+                        "plain": {"type": "classify", "labels": LABELS, "instruction": None},
+                    },
+                },
+            )
+        )
+    multi = {"t": {"type": "classify", "labels": LABELS, "multi_label": True}}
+    batch = {
+        "model": MODEL,
+        "defaults": {"threshold": 0.3},
+        "items": [
+            {"id": "a", "input": TEXTS[0], "tasks": multi},
+            {"id": "b", "input": TEXTS[1], "tasks": multi, "defaults": {"threshold": 0.6}},
+            {"id": "c", "input": TEXTS[2], "tasks": {"t": {"type": "span", "labels": ["x"]}}},
+        ],
+    }
+    work.append(("batch", batch))
+    invalid = [
+        {"model": MODEL, "input": "x", "tasks": {"t": {"type": "span", "labels": ["a"]}}},
+        {"model": MODEL, "input": "x", "tasks": {"t": {"type": "classify", "labels": ["a"], "adapter_id": "missing"}}},
+        {"model": MODEL, "input": "x", "tasks": {"t": {"type": "boolean"}}},
+        {"model": MODEL, "input": "x", "tasks": {"t": {"type": "classify", "labels": ["a"]}}, "defaults": {"x": 1}},
+        {"model": "nope", "input": "x", "tasks": {"t": {"type": "classify", "labels": ["a"]}}},
+    ]
+    work += [("process", body) for body in invalid]
+    work.append(("process-raw", b"{not json"))
+    return work
+
+
+def _send_process(url, item):
+    kind, body = item
+    if kind == "process":
+        return _post(_v1(url, "/process"), body)
+    if kind == "batch":
+        return _post(_v1(url, "/process/batch"), body)
+    return _post(_v1(url, "/process"), raw=body)
+
+
+def _close(a, b):
+    return abs(a - b) <= SCORE_TOL
+
+
+def _task_results_equal(got, ref):
+    """Same values with scores within tolerance; values may differ only on near-ties or near the cutoff."""
+    if got["type"] != ref["type"] or got.get("threshold") != ref.get("threshold"):
+        return False
+    if "scores" in ref:
+        if got["scores"].keys() != ref["scores"].keys():
+            return False
+        if not all(_close(got["scores"][k], ref["scores"][k]) for k in ref["scores"]):
+            return False
+    if got["value"] == ref["value"]:
+        return True
+    scores = ref.get("scores", {})
+    ranked = sorted(scores.values(), reverse=True)
+    near_tie = len(ranked) > 1 and _close(ranked[0], ranked[1])
+    threshold = ref.get("threshold")
+    near_cutoff = threshold is not None and any(_close(score, threshold) for score in scores.values())
+    near_half = ref["type"] == "boolean" and _close(ref["truth_score"], 0.5)
+    return near_tie or near_cutoff or near_half or (ref["type"] == "score" and "scale" in ref)
+
+
+def _process_responses_equal(item, got, ref):
+    (got_status, got_body), (ref_status, ref_body) = got, ref
+    if got_status != ref_status:
+        return False
+    if ref_status != 200:
+        return got_body == ref_body
+    if item[0] == "batch":
+        return all(
+            g.get("id") == r.get("id")
+            and (
+                g == r
+                if "error" in r
+                else all(_task_results_equal(g["results"][n], r["results"][n]) for n in r["results"])
+            )
+            for g, r in zip(got_body["items"], ref_body["items"], strict=True)
+        )
+    return got_body["results"].keys() == ref_body["results"].keys() and all(
+        _task_results_equal(got_body["results"][name], ref_body["results"][name]) for name in ref_body["results"]
+    )
+
+
+def test_process_results_are_shaped_by_task_type(server_url):
+    status, body = _post(_v1(server_url, "/process"), {"model": MODEL, "input": TEXTS[1], "tasks": _process_tasks(0)})
+    assert status == 200
+    results = body["results"]
+    assert results["topic"]["value"] in LABELS and results["topic"]["threshold"] is None
+    assert set(results["topic"]["scores"]) == set(LABELS)
+    assert isinstance(results["topics"]["value"], list)
+    assert isinstance(results["is_sport"]["value"], bool) and 0 <= results["is_sport"]["truth_score"] <= 1
+    assert results["tone"]["value"] in ("calm", "neutral", "excited")
+    assert results["rating"]["value"] in (1, 2, 3, 4, 5) and results["rating"]["scale"] == {"min": 1, "max": 5}
+
+
+def test_process_and_legacy_traffic_together_match_requests_sent_alone(server_url):
+    process_work = _process_workload()
+    legacy_work = _valid_workload()
+    process_alone = [_send_process(server_url, item) for item in process_work]
+    legacy_alone = [_send(server_url, item) for item in legacy_work]
+
+    jobs = [("process", i) for i in range(len(process_work)) for _ in range(3)]
+    jobs += [("legacy", i) for i in range(len(legacy_work)) for _ in range(2)]
+    random.Random(1).shuffle(jobs)
+
+    def run(job):
+        kind, index = job
+        if kind == "process":
+            return _send_process(server_url, process_work[index])
+        return _send(server_url, legacy_work[index])
+
+    with ThreadPoolExecutor(48) as pool:
+        results = list(pool.map(run, jobs))
+
+    mismatches = []
+    for (kind, index), got in zip(jobs, results, strict=True):
+        if kind == "process" and not _process_responses_equal(process_work[index], got, process_alone[index]):
+            mismatches.append(("process", json.dumps(process_work[index][1])[:100], got[0], str(got[1])[:300]))
+        if kind == "legacy" and not _responses_equal(legacy_work[index], got, legacy_alone[index]):
+            mismatches.append(("legacy", json.dumps(legacy_work[index])[:100], got[0], str(got[1])[:200]))
+    assert not mismatches, mismatches[:5]
+    statuses = {status for status, _ in process_alone}
+    assert {200, 404, 422} <= statuses
+
+
+def test_process_and_legacy_agree_on_the_same_question(server_url):
+    """Multi-label scores are the same sigmoid scores on both endpoints; single-label picks the same top label."""
+    for text in TEXTS:
+        legacy_multi = _send(server_url, {"text": text, "labels": LABELS, "threshold": 0.0, "prompt": "Topic:"})[1]
+        legacy_single = _send(server_url, {"text": text, "labels": LABELS, "multi_label": False})[1]
+        tasks = {
+            "multi": {
+                "type": "classify",
+                "labels": LABELS,
+                "multi_label": True,
+                "threshold": 0.0,
+                "instruction": "Topic:",
+            },
+            "single": {"type": "classify", "labels": LABELS},
+        }
+        results = _post(_v1(server_url, "/process"), {"model": MODEL, "input": text, "tasks": tasks})[1]["results"]
+        legacy_scores = {p["label"]: p["score"] for p in legacy_multi}
+        assert all(_close(results["multi"]["scores"][label], legacy_scores[label]) for label in LABELS)
+        assert results["single"]["value"] == legacy_single[0]["label"]
+
+
+def test_many_task_process_requests_run_in_gpu_batches_of_bounded_size(server_url):
+    handle = _SERVED["handle"]
+    work = [
+        {
+            "model": MODEL,
+            "input": text,
+            "tasks": {
+                f"t{i}": {"type": "classify", "labels": LABELS[: 1 + i % 5], "instruction": f"Task {i}:"}
+                for i in range(20)
+            },
+        }
+        for text in TEXTS
+    ]
+    alone = [_post(_v1(server_url, "/process"), body) for body in work]
+
+    handle.batch_stats.remote(reset=True).result()
+    with ThreadPoolExecutor(len(work)) as pool:
+        concurrent = list(pool.map(lambda body: _post(_v1(server_url, "/process"), body), work))
+    stats = handle.batch_stats.remote().result()
+
+    for body, got, ref in zip(work, concurrent, alone, strict=True):
+        assert _process_responses_equal(("process", body), got, ref)
+    assert stats["rows"] == len(TEXTS) * 20
+    assert stats["max_rows"] <= MAX_BATCH
+    assert stats["forward_passes"] < len(TEXTS) * -(-20 // MAX_BATCH)  # rows of different requests merged
+
+
+def test_v1_info_routes_and_http_errors(server_url):
+    status, models = _get(_v1(server_url, "/models"))
+    assert (status, models["data"][0]["id"]) == (200, MODEL)
+    status, capabilities = _get(_v1(server_url, f"/models/{MODEL}/capabilities"))
+    assert status == 200 and capabilities["task_types"] == ["classify", "boolean", "score"]
+    assert capabilities["extensions"]["examples"] in (True, False)
+    assert _get(_v1(server_url, "/health"))[1]["status"] == "ok"
+    assert _get(_v1(server_url, "/ready"))[0] == 200
+    assert _get(_v1(server_url, "/models/nope/capabilities"))[1]["error"]["code"] == "MODEL_NOT_FOUND"
+    assert _get(_v1(server_url, "/nope"))[0] == 404
+    assert _get(_v1(server_url, "/process"))[0] == 422  # GET on a POST route
+    status, body = _post(_v1(server_url, "/process"), raw=b"x" * 10_000_001)
+    assert (status, body["error"]["code"]) == (413, "PAYLOAD_TOO_LARGE")
