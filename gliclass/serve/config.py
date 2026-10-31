@@ -17,6 +17,8 @@ class GLiClassServeConfig:
     device: str = "cuda"
     dtype: str = "bfloat16"
 
+    # "fp8": FP8 linear layers in the encoder, plus FP8 Q·Kᵀ attention with FlashDeBERTa
+    # (compute capability 8.9+, torchao; best with enable_compilation).
     quantization: str | None = None
 
     max_model_len: int = 2048
@@ -37,9 +39,21 @@ class GLiClassServeConfig:
 
     route_prefix: str = "/gliclass"
 
+    # Process API (``{route_prefix}/v1/process``).
+    model_id: str | None = None  # public model id; defaults to ``model``
+    model_aliases: list[str] = field(default_factory=list)
+    label_template: str = "{title}"  # label text shown to the model; may use {id}, {title}, {description}
+    max_tasks: int = 32
+    max_batch_items: int = 256
+    max_input_chars: int = 1_000_000
+    max_request_bytes: int = 10_000_000
+    max_scale_steps: int = 21  # ``score`` tasks with a ``scale`` run one label per step
+
     tokenizer_threads: int = 4
 
     enable_compilation: bool = False
+    # Use FlashDeBERTa kernels for DeBERTa-v2/v3 encoders (needs the flashdeberta package).
+    enable_flashdeberta: bool = False
     calibrate_on_startup: bool = False
     precompile_on_startup: bool = False
     use_memory_aware_batching: bool = False
@@ -72,6 +86,9 @@ class GLiClassServeConfig:
     polylora_adapter_id_pattern: str = r"^[A-Za-z0-9_.-]{1,128}$"
 
     def __post_init__(self):
+        from .api.labels import validate_template
+
+        validate_template(self.label_template)
         if self.max_batch_size not in self.precompiled_batch_sizes:
             self.precompiled_batch_sizes = sorted(set(self.precompiled_batch_sizes) | {self.max_batch_size})
         self.precompiled_batch_sizes = sorted(self.precompiled_batch_sizes)
@@ -81,6 +98,8 @@ class GLiClassServeConfig:
         env = {}
         if self.tokenizer_threads > 0:
             env["TOKENIZERS_PARALLELISM"] = "true"
+        if self.enable_flashdeberta:
+            env["USE_FLASHDEBERTA"] = "1"
         return env
 
     @classmethod

@@ -201,6 +201,10 @@ class BaseZeroShotClassificationPipeline(ABC):
         self.progress_bar = progress_bar
         self.label_separator = label_separator
         self._max_labels_alloc = getattr(model.config, "max_labels_alloc", "dynamic")
+        # Optional callable mapping one adapter id per batch row to model keyword arguments,
+        # called right before each forward pass (e.g. PolyLoRA cache slots as ``weight_indices``).
+        # By default the ids are passed as ``adapter_ids``.
+        self.adapter_model_kwargs = None
 
         self.example_token = "<<EXAMPLE>>"
         self.label_token = "<<LABEL>>"
@@ -273,6 +277,14 @@ class BaseZeroShotClassificationPipeline(ABC):
         if len(adapter_ids) != num_texts:
             raise ValueError("Length of adapter_ids list must match number of texts.")
         return adapter_ids
+
+    def _adapter_kwargs(self, adapter_ids: List[str] | None) -> Dict[str, Any]:
+        """Model keyword arguments selecting one adapter per batch row."""
+        if adapter_ids is None:
+            return {}
+        if self.adapter_model_kwargs is not None:
+            return self.adapter_model_kwargs(adapter_ids)
+        return {"adapter_ids": adapter_ids}
 
     @staticmethod
     def _postprocess_logits(
@@ -541,7 +553,7 @@ class BaseZeroShotClassificationPipeline(ABC):
             model_output = self.model(
                 **tokenized_inputs,
                 max_num_classes=max_num_classes,
-                adapter_ids=batch_adapter_ids,
+                **self._adapter_kwargs(batch_adapter_ids),
             )
             logits = model_output.logits
             initial_logits = getattr(model_output, "uncalibrated_logits", None)

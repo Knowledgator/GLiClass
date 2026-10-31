@@ -57,6 +57,15 @@ from transformers import DebertaV2Model
 if IS_PEFT:
     from peft import LoraConfig, get_peft_model
 
+# Keyword arguments that select one LoRA adapter per batch row when the text encoder is
+# wrapped by PolyLoRA. They go to the text encoder only, never to a separate label encoder.
+ADAPTER_KWARGS = ("adapter_ids", "weight_indices")
+
+
+def _adapter_kwargs(**kwargs) -> dict:
+    """The adapter-selecting entries of ``kwargs`` that are set."""
+    return {key: kwargs[key] for key in ADAPTER_KWARGS if kwargs.get(key) is not None}
+
 
 @dataclass
 class GLiClassOutput(SequenceClassifierOutput):
@@ -821,10 +830,8 @@ class GLiClassBiEncoder(GLiClassBaseModel):
             text_embeddings = nn.functional.normalize(text_embeddings, p=2, dim=-1, eps=self.epsilon)
         return text_embeddings
 
-    def encode_text(self, input_ids, attention_mask, adapter_ids=None):
-        encoder_kwargs = {}
-        if adapter_ids is not None:
-            encoder_kwargs["adapter_ids"] = adapter_ids
+    def encode_text(self, input_ids, attention_mask, adapter_ids=None, weight_indices=None):
+        encoder_kwargs = _adapter_kwargs(adapter_ids=adapter_ids, weight_indices=weight_indices)
         outputs = self.encoder_model(
             input_ids.squeeze(1),
             attention_mask=attention_mask.squeeze(1),
@@ -877,11 +884,14 @@ class GLiClassBiEncoder(GLiClassBaseModel):
         output_class_embeddings: bool | None = None,
         return_dict: bool | None = None,
         adapter_ids: list[str] | None = None,
+        weight_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> Tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        text_embeddings = self.encode_text(input_ids, attention_mask, adapter_ids=adapter_ids)
+        text_embeddings = self.encode_text(
+            input_ids, attention_mask, adapter_ids=adapter_ids, weight_indices=weight_indices
+        )
         class_embeddings = self.encode_classes(class_input_ids, class_attention_mask, labels_mask)
         logits = self.scorer(text_embeddings, class_embeddings) * self.logit_scale.to(class_embeddings.device)
 
@@ -907,7 +917,9 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
     def __init__(self, config: GLiClassModelConfig, from_pretrained=False):
         super().__init__(config, from_pretrained)
 
-    def encode_text(self, input_ids, attention_mask, class_embeddings, labels_mask, adapter_ids=None):
+    def encode_text(
+        self, input_ids, attention_mask, class_embeddings, labels_mask, adapter_ids=None, weight_indices=None
+    ):
         embedding_layer = self.encoder_model.get_input_embeddings()
         inputs_embeds = embedding_layer(input_ids)
 
@@ -919,9 +931,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         selected_class_embeddings = class_embeddings[labels_batch_indices, labels_indices]
 
         inputs_embeds[batch_indices, class_token_indices] = selected_class_embeddings
-        encoder_kwargs = {}
-        if adapter_ids is not None:
-            encoder_kwargs["adapter_ids"] = adapter_ids
+        encoder_kwargs = _adapter_kwargs(adapter_ids=adapter_ids, weight_indices=weight_indices)
         encoder_outputs = self.encoder_model(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask.squeeze(1),
@@ -946,6 +956,7 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         output_class_embeddings: bool | None = None,
         return_dict: bool | None = None,
         adapter_ids: list[str] | None = None,
+        weight_indices: torch.Tensor | None = None,
         **kwargs,
     ) -> Tuple | SequenceClassifierOutput:
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
@@ -953,7 +964,12 @@ class GLiClassBiEncoderFused(GLiClassBiEncoder):
         raw_class_embeddings = self.encode_classes(class_input_ids, class_attention_mask, labels_mask)
 
         encoder_outputs, class_embeddings = self.encode_text(
-            input_ids, attention_mask, raw_class_embeddings, labels_mask, adapter_ids=adapter_ids
+            input_ids,
+            attention_mask,
+            raw_class_embeddings,
+            labels_mask,
+            adapter_ids=adapter_ids,
+            weight_indices=weight_indices,
         )
 
         text_embeddings = self.pool_outputs(encoder_outputs)
@@ -1527,6 +1543,87 @@ class GLiClassModel(GLiClassPreTrainedModel):
             outputs.class_embeddings = None
         return outputs
 
+    def encoder_modules(self) -> dict[str, nn.Module]:
+        """The transformer backbone(s) of the model, by attribute name on ``self.model``."""
+        names = {
+            "uni-encoder": ("encoder_model",),
+            "bi-encoder": ("encoder_model", "label_encoder"),
+            "bi-encoder-fused": ("encoder_model", "label_encoder"),
+            "encoder-decoder": ("encoder_decoder_model",),
+            "encoder-decoder-cls": ("encoder_decoder_model",),
+            "decoder-kv": ("decoder_model",),
+        }.get(self.config.architecture_type, ())
+        return {name: getattr(self.model, name) for name in names if hasattr(self.model, name)}
+
+    def compile(self, *args, **kwargs) -> None:
+        """Compile the model in place with ``torch.compile`` (see ``nn.Module.compile``).
+
+        Defaults to ``dynamic=True`` so that varying batch sizes, sequence lengths and label
+        counts reuse the same graphs. FlashDeBERTa versions that register their kernels as
+        ``torch.library`` custom ops (``flashdeberta.ops.library``) are compiled with the rest
+        of the model; older versions cannot be traced, so their forward is left uncompiled.
+        """
+        torch._dynamo.config.capture_scalar_outputs = True
+        if not (IS_FLASHDEBERTA and is_module_available("flashdeberta.ops.library")):
+            for encoder in self.encoder_modules().values():
+                # Look through wrappers such as PolyLoRA (``base_model``).
+                inner = getattr(encoder, "base_model", encoder)
+                if type(inner).__name__ == "FlashDebertaV2Model":
+                    encoder.forward = torch.compiler.disable(encoder.forward)
+        kwargs.setdefault("dynamic", True)
+        super().compile(*args, **kwargs)
+
+    _FP8_SKIP_MARKERS = ("lora_A", "lora_B", "lora_embedding", "lora_magnitude")
+
+    @classmethod
+    def _fp8_module_filter(cls, module: nn.Module, fqn: str) -> bool:
+        """Linear layers with FP8-friendly sizes; no LoRA adapter matrices."""
+        if not isinstance(module, nn.Linear):
+            return False
+        if any(marker in fqn for marker in cls._FP8_SKIP_MARKERS):
+            return False
+        return module.in_features % 16 == 0 and module.out_features % 16 == 0
+
+    def quantize(self, dtype: str = "fp8") -> None:
+        """Quantize the transformer backbone(s) for inference, in place.
+
+        Only ``"fp8"`` is supported: rowwise-scaled FP8 linear layers via ``torchao``
+        (per-token activation and per-channel weight scales), plus FP8 Q·Kᵀ attention when
+        the encoder is FlashDeBERTa. The GLiClass heads stay in high precision. Works on
+        PolyLoRA-wrapped encoders: the base layers are converted, the adapters are not.
+        Needs a GPU with FP8 tensor cores (compute capability 8.9+) and is meant to run
+        under :meth:`compile`; eager FP8 is slower than eager bf16.
+        """
+        if not isinstance(dtype, str) or dtype.lower() != "fp8":
+            raise ValueError(f"Unsupported quantization {dtype!r}; only 'fp8' is supported.")
+        if self.device.type != "cuda":
+            raise RuntimeError("fp8 quantization requires a CUDA device.")
+        if torch.cuda.get_device_capability(self.device) < (8, 9):
+            raise RuntimeError("fp8 quantization requires a GPU with compute capability 8.9+ (Ada, Hopper or newer).")
+        if not is_module_available("torchao"):
+            raise ImportError("fp8 quantization requires the 'torchao' package. Install it with: pip install torchao")
+        from torchao.quantization import PerRow, Float8DynamicActivationFloat8WeightConfig, quantize_
+
+        encoders = self.encoder_modules()
+        if not encoders:
+            raise RuntimeError("fp8 quantization needs a transformer encoder; none was found on this model.")
+
+        # Padded tokens can be all zeros: a lower bound on the activation amax keeps
+        # their rowwise scale finite instead of 0 / 0.
+        config = Float8DynamicActivationFloat8WeightConfig(
+            granularity=PerRow(), activation_value_lb=1e-12, set_inductor_config=False
+        )
+        for name, encoder in encoders.items():
+            quantize_(encoder, config, filter_fn=self._fp8_module_filter)
+            logger.info("Applied fp8 rowwise quantization to %s linear layers via torchao.", name)
+            if IS_FLASHDEBERTA:
+                from flashdeberta import FlashDisentangledSelfAttention
+                from flashdeberta.quantization import set_attention_precision
+
+                if any(isinstance(module, FlashDisentangledSelfAttention) for module in encoder.modules()):
+                    set_attention_precision(encoder, "fp8_qk")
+                    logger.info("Enabled fp8 Q·Kᵀ attention in the FlashDeBERTa %s.", name)
+
     def get_input_embeddings(self):
         if self.config.architecture_type in {"uni-encoder"}:
             return self.model.encoder_model.get_input_embeddings()
@@ -1619,8 +1716,9 @@ class GLiClassModel(GLiClassPreTrainedModel):
         return model_embeds
 
     def forward(self, *args, **kwargs):
-        if kwargs.get("adapter_ids") is None:
-            kwargs.pop("adapter_ids", None)
+        for key in ADAPTER_KWARGS:
+            if kwargs.get(key) is None:
+                kwargs.pop(key, None)
         if self.calibrator is None:
             return self.model(*args, **kwargs)
 

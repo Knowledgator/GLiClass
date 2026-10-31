@@ -2,23 +2,30 @@
 
 import os
 import re
+import json
+import math
+import asyncio
 import logging
+import functools
 from typing import Any
 
 import torch
-from ray import serve
 from transformers import AutoTokenizer
-from ray.serve._private import api as serve_private_api
-from starlette.responses import JSONResponse
-from ray.serve._private.build_app import build_app
 
 from gliclass.model import GLiClassModel
-from gliclass.pipeline import ZeroShotClassificationPipeline
+from gliclass.pipeline import ZeroShotClassificationPipeline, flatten_hierarchical_labels
 
+from .api import APIError, ProcessEngine, capabilities_from_config
+from .stats import BatchStats
 from .config import GLiClassServeConfig
 from .memory import GLiClassMemoryEstimator
+from .api.errors import is_error_payload
 
 logger = logging.getLogger("ray.serve")
+
+# Process rows run as multi-label rows with this threshold, so every label comes back with
+# its independent score; each task applies its own selection afterwards.
+PROCESS_ALL_SCORES = -1.0
 
 
 class GLiClassServer:
@@ -32,6 +39,7 @@ class GLiClassServer:
         """
         self.config = config
         self._polylora_model = None
+        self._polylora_mixes_adapters = True
         self._adapter_id_re = re.compile(config.polylora_adapter_id_pattern)
 
         env_vars = config.to_env_vars()
@@ -64,13 +72,16 @@ class GLiClassServer:
             self.memory_estimator.measure_cuda_context()
 
         logger.info("Loading model: %s", config.model)
+        if config.enable_flashdeberta:
+            logger.info("FlashDeBERTa enabled")
 
         self.model = GLiClassModel.from_pretrained(config.model)
-        if config.enable_polylora:
-            self._initialize_polylora()
         self.model.config.max_labels_alloc = config.max_labels_alloc
+        # Before PolyLoRA: its GPU adapter cache is allocated on the base model's device and dtype.
         self.model.to(device=self.device, dtype=self.torch_dtype)
         self.model.eval()
+        if config.enable_polylora:
+            self._initialize_polylora()
 
         if config.quantization:
             if not hasattr(self.model, "quantize"):
@@ -91,21 +102,36 @@ class GLiClassServer:
             classification_type="multi-label",
             **pipeline_kwargs,
         )
+        self.pipeline.pipe.adapter_model_kwargs = self._adapter_run_kwargs
 
         if torch.cuda.is_available():
             self.memory_estimator.measure_model_memory()
 
-        if config.enable_compilation and hasattr(self.model, "compile"):
+        if config.enable_compilation:
             logger.info("Compiling GLiClass model")
+            # Warmup compiles a few graphs per precompiled batch size (see _precompile). Past
+            # the limit torch silently runs uncompiled, so leave room for all of them.
+            torch._dynamo.config.recompile_limit = max(
+                torch._dynamo.config.recompile_limit, 2 * len(config.precompiled_batch_sizes)
+            )
             self.model.compile()
 
-        if config.precompile_on_startup:
+        if config.precompile_on_startup or config.enable_compilation:
             self._precompile()
 
         if config.calibrate_on_startup and torch.cuda.is_available():
             self._calibrate_memory()
 
+        self.batch_stats.reset()  # count request traffic only, not warmup and calibration
         logger.info("GLiClass server initialized successfully")
+
+    @property
+    def batch_stats(self) -> BatchStats:
+        """Forward passes by batch size since start-up (or the last reset)."""
+        stats = self.__dict__.get("_batch_stats")
+        if stats is None:
+            stats = self.__dict__["_batch_stats"] = BatchStats()
+        return stats
 
     def _initialize_polylora(self) -> None:
         try:
@@ -126,6 +152,14 @@ class GLiClassServer:
         )
         self._polylora_model = PolyLoraModel(target_model, polylora_config)
         self._set_polylora_target_model(self._polylora_model)
+        # Stock HF DeBERTa projects its relative position embeddings once for the whole batch,
+        # so one forward can carry only one adapter on those layers. FlashDeBERTa projects them
+        # once per adapter (MultiLoraLinear.project_shared). Other encoders share no inputs.
+        self._polylora_mixes_adapters = not any(
+            type(module).__name__ == "DisentangledSelfAttention" for module in target_model.modules()
+        )
+        if not self._polylora_mixes_adapters:
+            logger.info("PolyLoRA on HF DeBERTa: batches with mixed adapters run one adapter at a time")
 
         logger.info(
             "PolyLoRA enabled with %d GPU slots, max rank %d, disk cache %s",
@@ -197,21 +231,55 @@ class GLiClassServer:
             return adapter_id
         raise KeyError(f"Unknown LoRA adapter id: {adapter_id}")
 
+    def _resolve_adapter_ids(self, adapter_ids: str | list[str | None] | None, num_texts: int) -> list[str] | None:
+        """One loaded adapter id per text, or None when adapters are off.
+
+        With PolyLoRA every row gets an id (the base adapter id for none), so all batches
+        reach the model with the same arguments.
+        """
+        if isinstance(adapter_ids, list):
+            if len(adapter_ids) != num_texts:
+                raise ValueError(f"Expected {num_texts} adapter ids, got {len(adapter_ids)}")
+            resolved = [self.ensure_adapter_loaded(adapter_id) for adapter_id in adapter_ids]
+        else:
+            resolved = [self.ensure_adapter_loaded(adapter_ids)] * num_texts
+        if all(adapter_id is None for adapter_id in resolved):
+            return None
+        return resolved
+
+    def _adapter_run_kwargs(self, adapter_ids: list[str] | None) -> dict[str, Any]:
+        """Model kwargs selecting one adapter per batch row.
+
+        With PolyLoRA the ids are resolved to GPU cache slots here, right before the
+        forward pass, and passed as the ``weight_indices`` tensor. Passing the id strings
+        into a compiled model would make torch.compile guard on them and recompile for
+        new adapter mixes.
+        """
+        if adapter_ids is None:
+            return {}
+        if self._polylora_model is None:
+            return {"adapter_ids": adapter_ids}
+        return {"weight_indices": self._polylora_model.resolve_adapters(adapter_ids)}
+
     def _precompile(self) -> None:
         logger.info("Precompiling model for batch sizes: %s", self.config.precompiled_batch_sizes)
 
-        dummy_labels = ["person", "organization", "location"]
+        # torch.compile(dynamic=True) specialises sizes 0 and 1, so a batch of one text and a
+        # request with one label each get their own graph; larger sizes share one graph, so
+        # request batches of any size and label count reuse the warmed-up graphs.
+        label_sets = [["person", "organization", "location"], ["person"]]
 
         for batch_size in self.config.precompiled_batch_sizes:
             dummy_texts = [f"Sample text number {i} for precompilation warmup." for i in range(batch_size)]
 
             for _ in range(self.config.warmup_iterations):
-                self._run_batch_internal(
-                    dummy_texts,
-                    dummy_labels,
-                    threshold=0.5,
-                    multi_label=True,
-                )
+                for dummy_labels in label_sets:
+                    self._run_batch_internal(
+                        dummy_texts,
+                        dummy_labels,
+                        threshold=0.5,
+                        multi_label=True,
+                    )
 
             logger.info("  Batch size %d: compiled", batch_size)
 
@@ -313,16 +381,16 @@ class GLiClassServer:
         Returns:
             List of prediction dicts
         """
+        adapter_ids = self._resolve_adapter_ids(adapter_ids, len(texts))
+        if not self._polylora_mixes_adapters and adapter_ids is not None and len(set(adapter_ids)) > 1:
+            return self._run_batch_per_adapter(texts, labels, threshold, multi_label, examples, prompt, adapter_ids)
+
         if isinstance(multi_label, list):
             classification_type = ["multi-label" if item else "single-label" for item in multi_label]
         else:
             classification_type = "multi-label" if multi_label else "single-label"
 
-        if isinstance(adapter_ids, list):
-            adapter_ids = [self.ensure_adapter_loaded(adapter_id) for adapter_id in adapter_ids]
-        elif adapter_ids is not None:
-            adapter_ids = self.ensure_adapter_loaded(adapter_ids)
-
+        self.batch_stats.record(len(texts))
         return self.pipeline(
             texts,
             labels,
@@ -333,6 +401,39 @@ class GLiClassServer:
             prompt=prompt,
             adapter_ids=adapter_ids,
         )
+
+    def _run_batch_per_adapter(self, texts, labels, threshold, multi_label, examples, prompt, adapter_ids):
+        """Run a mixed-adapter batch as one sub-batch per adapter, in the original order.
+
+        Per-text arguments (lists with one value per text) are split with the texts; shared
+        ones (one label list, one threshold, shared examples) go to every sub-batch.
+        """
+        num_texts = len(texts)
+
+        def is_per_text(value) -> bool:
+            return isinstance(value, list) and len(value) == num_texts
+
+        per_text = {
+            "labels": bool(labels) and isinstance(labels[0], (list, dict)),
+            "threshold": is_per_text(threshold),
+            "multi_label": is_per_text(multi_label),
+            "examples": self.pipeline.pipe._examples_are_per_text(examples),
+            "prompt": is_per_text(prompt),
+        }
+        values = {"labels": labels, "threshold": threshold, "multi_label": multi_label}
+        values.update(examples=examples, prompt=prompt)
+
+        groups: dict[str, list[int]] = {}
+        for index, adapter_id in enumerate(adapter_ids):
+            groups.setdefault(adapter_id, []).append(index)
+
+        results: list[Any] = [None] * num_texts
+        for adapter_id, indices in groups.items():
+            kwargs = {key: [value[i] for i in indices] if per_text[key] else value for key, value in values.items()}
+            group_results = self._run_batch_internal([texts[i] for i in indices], adapter_ids=adapter_id, **kwargs)
+            for position, index in enumerate(indices):
+                results[index] = group_results[position]
+        return results
 
     def predict(
         self,
@@ -364,8 +465,188 @@ class GLiClassServer:
 
         return results
 
+    # -- process API -------------------------------------------------------------
+
+    def _examples_supported(self) -> bool:
+        """Whether the tokenizer knows the few-shot example token the checkpoint was trained with."""
+        tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+        try:
+            return self.pipeline.pipe.example_token in tokenizer.get_vocab()
+        except Exception:
+            return False
+
+    def _label_capacity(self) -> int | None:
+        """Most labels the model can score at once, when it allocates a fixed number of label slots."""
+        alloc = self.config.max_labels_alloc
+        if isinstance(alloc, int) or (isinstance(alloc, str) and alloc.isdigit()):
+            return int(alloc)
+        if alloc == "fixed":
+            return int(getattr(self.model.config, "max_num_classes", 0)) or None
+        return None
+
+    @property
+    def process_engine(self) -> ProcessEngine:
+        """Request planner and result assembler of ``/v1/process``."""
+        engine = self.__dict__.get("_process_engine")
+        if engine is None:
+            tokenizer = getattr(self.tokenizer, "tokenizer", self.tokenizer)
+
+            @functools.lru_cache(maxsize=4096)
+            def count_tokens(text: str) -> int:
+                return len(tokenizer(text, add_special_tokens=False)["input_ids"])
+
+            engine = self.__dict__["_process_engine"] = ProcessEngine(
+                capabilities_from_config(
+                    self.config,
+                    examples_supported=self._examples_supported(),
+                    max_num_classes=self._label_capacity(),
+                ),
+                max_tokens=self.config.max_model_len,
+                count_tokens=count_tokens,
+                resolve_adapter=self.ensure_adapter_loaded,
+            )
+        return engine
+
+    def run_rows(self, rows: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+        """Score process rows in-process, in chunks of ``max_batch_size``: every label of every row."""
+        outputs: list[list[dict[str, Any]]] = []
+        chunk = max(1, self.config.max_batch_size)
+        for start in range(0, len(rows), chunk):
+            part = rows[start : start + chunk]
+            examples = [row["examples"] for row in part]
+            outputs.extend(
+                self._run_batch_internal(
+                    [row["text"] for row in part],
+                    [row["labels"] for row in part],
+                    threshold=PROCESS_ALL_SCORES,
+                    multi_label=True,
+                    examples=examples if any(examples) else None,
+                    prompt=[row["prompt"] for row in part],
+                    adapter_ids=[row["adapter_id"] for row in part],
+                )
+            )
+        return outputs
+
+    def process(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/process`` in-process. Raises ``APIError`` for a rejected request."""
+        return self.process_engine.process(body, self.run_rows)
+
+    def process_batch(self, body: Any) -> dict[str, Any]:
+        """``POST /v1/process/batch`` in-process. Raises ``APIError`` for a bad envelope."""
+        return self.process_engine.process_batch(body, self.run_rows)
+
+    def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+        info = self.process_engine.capabilities
+        if model_id is not None and model_id not in info.model_ids():
+            raise APIError("MODEL_NOT_FOUND", f"Model {model_id!r} is not served here", "/model")
+        return info.to_dict()
+
+    def models(self) -> dict[str, Any]:
+        info = self.process_engine.capabilities
+        return {"data": [{"id": info.model, "aliases": list(info.aliases)}]}
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "model": self.process_engine.capabilities.model,
+            "device": self.config.device,
+            "cuda_available": torch.cuda.is_available(),
+            "polylora": self.config.enable_polylora,
+            "max_batch_size": self.batch_size_fn(),
+            "task_types": list(self.process_engine.capabilities.task_types),
+        }
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _is_string_list(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _is_label_tree(node: Any) -> bool:
+    if isinstance(node, dict):
+        return all(isinstance(key, str) and _is_label_tree(value) for key, value in node.items())
+    return isinstance(node, str) or _is_string_list(node)
+
+
+def _check_labels(labels: Any, separator: str) -> list[str]:
+    """Labels of one text as a flat list; hierarchical dicts become dotted labels."""
+    if isinstance(labels, dict):
+        if not _is_label_tree(labels):
+            raise ValueError("hierarchical labels must nest dicts whose leaves are strings or lists of strings")
+        labels = flatten_hierarchical_labels(labels, separator=separator)
+    if not _is_string_list(labels):
+        raise ValueError("'labels' must be a list of strings or a hierarchical dict of them")
+    return labels
+
+
+def _check_examples(examples: Any) -> None:
+    if examples is None:
+        return
+    if not isinstance(examples, list) or not all(isinstance(example, dict) for example in examples):
+        raise ValueError("'examples' must be a list of {'text', 'labels'} objects")
+    for example in examples:
+        labels = example.get("labels", example.get("true_labels", []))
+        if not isinstance(example.get("text", ""), str) or not (isinstance(labels, str) or _is_string_list(labels)):
+            raise ValueError("each example needs a string 'text' and a list of string 'labels'")
+
+
+def check_row(
+    text: Any,
+    labels: Any,
+    threshold: Any,
+    multi_label: Any,
+    examples: Any,
+    prompt: Any,
+    adapter_id: Any,
+    separator: str = ".",
+) -> list[str]:
+    """Validate one text's request before it joins a batch; return its flat labels.
+
+    Anything that would fail inside the batch must be rejected here: a failing batch fails
+    every request batched with it.
+    """
+    if not isinstance(text, str):
+        raise ValueError("'text' must be a string")
+    if threshold is not None and not _is_number(threshold):
+        raise ValueError("'threshold' must be a number")
+    if not isinstance(multi_label, bool):
+        raise ValueError("'multi_label' must be a boolean")
+    if prompt is not None and not isinstance(prompt, str):
+        raise ValueError("'prompt' must be a string, or one string per text")
+    if adapter_id is not None and not isinstance(adapter_id, str):
+        raise ValueError("'adapter_id' must be a string")
+    _check_examples(examples)
+    return _check_labels(labels, separator)
+
+
+def _per_text(value: Any, num_texts: int, is_item) -> bool:
+    """Whether ``value`` holds one item per text (a list of items) rather than one shared item."""
+    return isinstance(value, list) and bool(value) and all(is_item(item) for item in value) and len(value) == num_texts
+
+
+async def _read_json_body(request, max_bytes: int) -> Any:
+    """Parse a JSON request body, refusing bodies over ``max_bytes`` (``PAYLOAD_TOO_LARGE``)."""
+    content_length = request.headers.get("content-length")
+    if max_bytes > 0 and content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise APIError("PAYLOAD_TOO_LARGE", f"Request body exceeds {max_bytes} bytes")
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if 0 < max_bytes < len(body):
+            raise APIError("PAYLOAD_TOO_LARGE", f"Request body exceeds {max_bytes} bytes")
+    try:
+        return json.loads(bytes(body))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise APIError("INVALID_REQUEST", f"Request body is not valid JSON: {exc}", "") from exc
+
 
 def _build_deployment(config: GLiClassServeConfig):
+    from ray import serve
+    from starlette.responses import JSONResponse
+
     batch_wait_s = max(config.batch_wait_timeout_ms, 0.0) / 1000.0
     initial_max_batch_size = config.max_batch_size
 
@@ -446,8 +727,21 @@ def _build_deployment(config: GLiClassServeConfig):
             adapter_id: str | None = None,
         ) -> list[dict[str, Any]]:
             """Single prediction endpoint - one text per request."""
+            # Reject bad input and unknown adapters here: inside the batch, the error would
+            # fail every request batched with this one.
+            labels = check_row(
+                text,
+                labels,
+                threshold,
+                multi_label,
+                examples,
+                prompt,
+                adapter_id,
+                separator=getattr(self.server.pipeline, "label_separator", "."),
+            )
             if threshold is None:
                 threshold = self.server.config.default_threshold
+            self.server.ensure_adapter_loaded(adapter_id)
 
             # Call batched method - Ray will accumulate these
             results = await self._infer_batch(
@@ -461,9 +755,94 @@ def _build_deployment(config: GLiClassServeConfig):
             )
             return results
 
-        async def __call__(self, request) -> list[dict[str, Any]]:
-            """HTTP endpoint - accepts single text per request."""
+        def batch_stats(self, reset: bool = False) -> dict[str, Any]:
+            """Forward passes by batch size; ``reset`` starts a new count."""
+            stats = self.server.batch_stats.to_dict()
+            if reset:
+                self.server.batch_stats.reset()
+            return stats
+
+        # -- process API -----------------------------------------------------------
+
+        async def _run_process_row(self, row: dict[str, Any]) -> list[dict[str, Any]]:
+            """One process row through the dynamic batcher, shared with ``predict``: every label's score."""
+            return await self._infer_batch(
+                row["text"],
+                row["labels"],
+                PROCESS_ALL_SCORES,
+                True,
+                row["examples"],
+                row["prompt"],
+                row["adapter_id"],
+            )
+
+        async def process(self, body: Any) -> dict[str, Any]:
+            """``/v1/process``: the response, or an ``{"error": ...}`` object."""
+            engine = self.server.process_engine
+            outcome = (await engine.process_many_async([body], self._run_process_row))[0]
+            return outcome.to_dict() if isinstance(outcome, APIError) else outcome
+
+        async def process_batch(self, body: Any) -> dict[str, Any]:
+            """``/v1/process/batch``: the response, or an ``{"error": ...}`` object."""
+            try:
+                return await self.server.process_engine.process_batch_async(body, self._run_process_row)
+            except APIError as exc:
+                return exc.to_dict()
+
+        def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+            try:
+                return self.server.capabilities(model_id)
+            except APIError as exc:
+                return exc.to_dict()
+
+        def models(self) -> dict[str, Any]:
+            return self.server.models()
+
+        def health(self) -> dict[str, Any]:
+            return self.server.health()
+
+        async def _handle_v1(self, request, path: str):  # noqa: PLR0911
+            """Routes of the process API (``{route_prefix}/v1/...``)."""
+
+            def respond(payload: dict[str, Any]) -> JSONResponse:
+                status = APIError.from_dict(payload).status if is_error_payload(payload) else 200
+                return JSONResponse(payload, status_code=status)
+
+            route = path[path.find("/v1/") :]
+            method = request.method
+            if route in ("/v1/process", "/v1/process/batch"):
+                if method != "POST":
+                    return respond(APIError("INVALID_REQUEST", f"Use POST for {route}").to_dict())
+                try:
+                    body = await _read_json_body(request, self.server.config.max_request_bytes)
+                except APIError as exc:
+                    return respond(exc.to_dict())
+                if route == "/v1/process":
+                    return respond(await self.process(body))
+                return respond(await self.process_batch(body))
+            capabilities_match = re.fullmatch(r"/v1/models/(.+)/capabilities", route)
+            if route not in ("/v1/health", "/v1/ready", "/v1/models", "/v1/adapter-cache") and not capabilities_match:
+                return JSONResponse(
+                    {"error": {"code": "INVALID_REQUEST", "message": f"Unknown route {route}"}}, status_code=404
+                )
+            if method != "GET":
+                return respond(APIError("INVALID_REQUEST", f"Use GET for {route}").to_dict())
+            if route in ("/v1/health", "/v1/ready"):
+                return respond(self.health())
+            if route == "/v1/models":
+                return respond(self.models())
+            if route == "/v1/adapter-cache":
+                try:
+                    return respond(self.server.adapter_cache_status(request.query_params.get("adapter_id")))
+                except ValueError as exc:
+                    return respond(APIError("INVALID_REQUEST", str(exc), "/adapter_id").to_dict())
+            return respond(self.capabilities(capabilities_match.group(1)))
+
+        async def __call__(self, request) -> list[dict[str, Any]]:  # noqa: PLR0911
+            """HTTP endpoint: classify ``text`` or every text in ``texts``; ``/v1/...`` is the process API."""
             path = request.url.path.rstrip("/")
+            if "/v1/" in path:
+                return await self._handle_v1(request, path)
             if path.endswith("/adapter-cache"):
                 adapter_id = request.query_params.get("adapter_id")
                 try:
@@ -471,25 +850,50 @@ def _build_deployment(config: GLiClassServeConfig):
                 except ValueError as exc:
                     return JSONResponse({"error": str(exc)}, status_code=400)
 
-            payload = await request.json()
-            text = payload.get("text") or payload.get("texts")
-            if isinstance(text, list):
-                # If list provided, take first element for compatibility
-                text = text[0] if text else ""
             try:
-                return await self.predict(
-                    text=text,
-                    labels=payload["labels"],
-                    threshold=payload.get("threshold"),
-                    multi_label=payload.get("multi_label", True),
-                    examples=payload.get("examples"),
-                    prompt=payload.get("prompt"),
-                    adapter_id=payload.get("adapter_id"),
+                payload = json.loads(await request.body())
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                return JSONResponse({"error": f"request body is not valid JSON: {exc}"}, status_code=400)
+            if not isinstance(payload, dict):
+                return JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+            if "labels" not in payload:
+                return JSONResponse({"error": "missing 'labels'"}, status_code=400)
+            # {"text": "..."} returns that text's predictions; {"texts": [...]} returns one
+            # result per text. Every text goes through the batcher as its own request.
+            texts = payload.get("texts", payload.get("text", ""))
+            single = isinstance(texts, str) and "texts" not in payload
+            if isinstance(texts, str):
+                texts = [texts]
+            if not isinstance(texts, list) or not texts:
+                return JSONResponse({"error": "'texts' must be a non-empty list of strings"}, status_code=400)
+            labels = payload["labels"]
+            per_text_labels = isinstance(labels, list) and bool(labels) and isinstance(labels[0], (list, dict))
+            prompt = payload.get("prompt")
+            per_text_prompt = isinstance(prompt, list)
+            examples = payload.get("examples")
+            per_text_examples = _per_text(examples, len(texts), lambda item: item is None or isinstance(item, list))
+            if (per_text_labels and len(labels) != len(texts)) or (per_text_prompt and len(prompt) != len(texts)):
+                return JSONResponse({"error": "per-text labels/prompt must match the texts"}, status_code=400)
+            try:
+                results = await asyncio.gather(
+                    *(
+                        self.predict(
+                            text=text,
+                            labels=labels[index] if per_text_labels else labels,
+                            threshold=payload.get("threshold"),
+                            multi_label=payload.get("multi_label", True),
+                            examples=examples[index] if per_text_examples else examples,
+                            prompt=prompt[index] if per_text_prompt else prompt,
+                            adapter_id=payload.get("adapter_id"),
+                        )
+                        for index, text in enumerate(texts)
+                    )
                 )
             except KeyError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=404)
             except ValueError as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
+            return results[0] if single else results
 
     return GLiClassDeployment.bind(config)
 
@@ -500,6 +904,7 @@ def serve_gliclass(
     host: str = "127.0.0.1",
 ) -> Any:
     import ray
+    from ray import serve
 
     if not ray.is_initialized():
         ray.init(address=config.ray_address, ignore_reinit_error=True)
@@ -508,17 +913,8 @@ def serve_gliclass(
         detached=True,
         http_options={"host": host, "port": config.http_port},
     )
-    serve_client = serve_private_api._get_global_client(_health_check_controller=True)
-
-    app = _build_deployment(config)
-    built_app = build_app(
-        app,
-        name="gliclass",
-        route_prefix=config.route_prefix,
-        default_runtime_env=ray.get_runtime_context().runtime_env,
-    )
-    handle = serve_client.deploy_applications([built_app])[0]
-    serve_client.wait_for_proxies_serving()
+    # Deployments inherit the job's runtime environment; serve.run waits until they are ready.
+    handle = serve.run(_build_deployment(config), name="gliclass", route_prefix=config.route_prefix)
 
     logger.info(
         "GLiClass server running at http://%s:%d%s",
@@ -549,6 +945,8 @@ def serve_gliclass(
 
 
 def shutdown() -> None:
+    from ray import serve
+
     serve.shutdown()
 
 
@@ -657,6 +1055,94 @@ class GLiClassFactory:
         results = list(await asyncio.gather(*refs))
         return results[0] if single else results
 
+    # -- process API -------------------------------------------------------------
+
+    @property
+    def model_id(self) -> str:
+        return self.config.model_id or self.config.model
+
+    def _process_body(self, input, tasks, defaults, options, model, body) -> dict[str, Any]:
+        if body is not None:
+            return body
+        request: dict[str, Any] = {"model": model or self.model_id, "input": input, "tasks": tasks}
+        if defaults is not None:
+            request["defaults"] = defaults
+        if options is not None:
+            request["options"] = options
+        return request
+
+    def _batch_body(self, items, defaults, options, model) -> dict[str, Any]:
+        body: dict[str, Any] = {"model": model or self.model_id, "items": items}
+        if defaults is not None:
+            body["defaults"] = defaults
+        if options is not None:
+            body["options"] = options
+        return body
+
+    @staticmethod
+    def _unwrap(payload: dict[str, Any]) -> dict[str, Any]:
+        if is_error_payload(payload):
+            raise APIError.from_dict(payload)
+        return payload
+
+    def process(
+        self,
+        input: Any = None,
+        tasks: dict[str, Any] | None = None,
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Run one ``/v1/process`` request; raises ``APIError`` when it is rejected.
+
+        Pass ``input`` and ``tasks`` (``model`` defaults to the served model), or a
+        complete request as ``body``. ``defaults`` holds settings shared by the tasks.
+        """
+        request = self._process_body(input, tasks, defaults, options, model, body)
+        return self._unwrap(self._handle.process.remote(request).result())
+
+    def process_batch(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Run a ``/v1/process/batch`` request; item errors are returned per item."""
+        request = self._batch_body(items, defaults, options, model)
+        return self._unwrap(self._handle.process_batch.remote(request).result())
+
+    async def process_async(
+        self,
+        input: Any = None,
+        tasks: dict[str, Any] | None = None,
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+        body: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Async ``process``. Concurrent calls share model batches."""
+        request = self._process_body(input, tasks, defaults, options, model, body)
+        return self._unwrap(await self._handle.process.remote(request))
+
+    async def process_batch_async(
+        self,
+        items: list[dict[str, Any]],
+        *,
+        defaults: dict[str, Any] | None = None,
+        options: dict[str, Any] | None = None,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        request = self._batch_body(items, defaults, options, model)
+        return self._unwrap(await self._handle.process_batch.remote(request))
+
+    def capabilities(self, model_id: str | None = None) -> dict[str, Any]:
+        return self._unwrap(self._handle.capabilities.remote(model_id).result())
+
     def shutdown(self) -> None:
         """Tear down Ray Serve deployment and Ray runtime.
 
@@ -666,6 +1152,7 @@ class GLiClassFactory:
         if self._closed:
             return
         import ray
+        from ray import serve
 
         serve.shutdown()
         if ray.is_initialized():

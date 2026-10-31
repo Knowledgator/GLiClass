@@ -53,7 +53,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--quantization",
         type=str,
         default=None,
-        help="Model quantization mode, if supported by the GLiClass model",
+        choices=["fp8"],
+        help="Quantization to apply: 'fp8' (FP8 linear layers, plus FP8 attention with FlashDeBERTa; "
+        "needs compute capability 8.9+ and torchao, best with --enable-compilation). "
+        "For precision changes (fp16/bf16) use --dtype instead.",
+    )
+    model_group.add_argument(
+        "--enable-flashdeberta",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Use FlashDeBERTa kernels for DeBERTa-v2/v3 encoders",
     )
 
     limits_group = parser.add_argument_group("Model Limits")
@@ -149,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-compilation",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Enable torch.compile",
+        help="Enable torch.compile (also runs warmup for the precompiled batch sizes)",
     )
     perf_group.add_argument(
         "--precompile-on-startup",
@@ -212,6 +221,31 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Probe batch size for memory calibration",
+    )
+
+    process_group = parser.add_argument_group("Process API (/v1/process)")
+    process_group.add_argument("--model-id", type=str, default=None, help="Public model id (default: --model)")
+    process_group.add_argument(
+        "--model-aliases", type=_parse_str_list, default=None, help="Comma-separated extra accepted model ids"
+    )
+    process_group.add_argument(
+        "--label-template",
+        type=str,
+        default=None,
+        help="Label text shown to the model; may use {id}, {title}, {description} (default: {title})",
+    )
+    process_group.add_argument("--max-tasks", type=int, default=None, help="Maximum tasks per request (default: 32)")
+    process_group.add_argument(
+        "--max-batch-items", type=int, default=None, help="Maximum items per batch request (default: 256)"
+    )
+    process_group.add_argument(
+        "--max-input-chars", type=int, default=None, help="Maximum rendered input characters (default: 1000000)"
+    )
+    process_group.add_argument(
+        "--max-request-bytes", type=int, default=None, help="Maximum request body bytes (default: 10000000)"
+    )
+    process_group.add_argument(
+        "--max-scale-steps", type=int, default=None, help="Maximum steps of a score task's scale (default: 21)"
     )
 
     polylora_group = parser.add_argument_group("PolyLoRA Configuration")
@@ -308,6 +342,7 @@ def config_from_args(args: argparse.Namespace) -> GLiClassServeConfig:
         "ray_address": args.ray_address,
         "tokenizer_threads": args.tokenizer_threads,
         "enable_compilation": args.enable_compilation,
+        "enable_flashdeberta": args.enable_flashdeberta,
         "precompile_on_startup": args.precompile_on_startup,
         "calibrate_on_startup": args.calibrate_on_startup,
         "use_memory_aware_batching": args.use_memory_aware_batching,
@@ -328,6 +363,14 @@ def config_from_args(args: argparse.Namespace) -> GLiClassServeConfig:
         "polylora_base_adapter_id": args.polylora_base_adapter_id,
         "polylora_use_triton_kernels": args.polylora_use_triton_kernels,
         "polylora_adapter_id_pattern": args.polylora_adapter_id_pattern,
+        "model_id": args.model_id,
+        "model_aliases": args.model_aliases,
+        "label_template": args.label_template,
+        "max_tasks": args.max_tasks,
+        "max_batch_items": args.max_batch_items,
+        "max_input_chars": args.max_input_chars,
+        "max_request_bytes": args.max_request_bytes,
+        "max_scale_steps": args.max_scale_steps,
     }
     config.update(**cli_overrides)
     config.__post_init__()
@@ -357,6 +400,7 @@ def main():
     logger.info("  GPUs per replica: %s", config.num_gpus_per_replica)
     logger.info("  CPUs per replica: %s", config.num_cpus_per_replica)
     logger.info("  Compile: %s", config.enable_compilation)
+    logger.info("  FlashDeBERTa: %s", config.enable_flashdeberta)
     logger.info("  Precompile on startup: %s", config.precompile_on_startup)
     logger.info("  Calibrate on startup: %s", config.calibrate_on_startup)
     logger.info("  Memory-aware batching: %s", config.use_memory_aware_batching)
