@@ -7,7 +7,7 @@ from .pipeline import (
 )
 from .streaming import StreamingZeroShotClassificationPipeline
 
-__version__ = "0.1.21"
+__version__ = "0.1.22"
 
 # Serve module (optional import)
 try:
